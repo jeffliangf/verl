@@ -20,6 +20,7 @@ from .config import (
     DEFAULT_DATASET,
     DEFAULT_EVAL_REPO,
     DEFAULT_REFERENCES,
+    DEFAULT_REWRITE_INSTRUCTION,
     DEFAULT_SYSTEM_PROMPT,
     H3_CONCURRENCY,
     H3_SETTINGS,
@@ -74,6 +75,7 @@ class EvaluationRun:
         references: Path = DEFAULT_REFERENCES,
         eval_repo: Path = DEFAULT_EVAL_REPO,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        rewrite_instruction: str = DEFAULT_REWRITE_INSTRUCTION,
         limit: int | None = None,
     ):
         """Inspect and freeze real reference videos; no inference or network requests."""
@@ -100,6 +102,7 @@ class EvaluationRun:
                 "samples": samples,
                 "rewriter": asdict(config),
                 "system_prompt": system_prompt,
+                "rewrite_instruction": rewrite_instruction,
                 "chat_template_kwargs": {"enable_thinking": False},
                 "h3": H3_SETTINGS,
                 "h3_host": host,
@@ -113,6 +116,7 @@ class EvaluationRun:
             freeze_json(run_dir / "protocol.json", protocol)
             freeze_json(run_dir / "protocol-sha256.json", fingerprint(protocol))
             atomic_text(run_dir / "system_prompt.txt", system_prompt + "\n")
+            atomic_text(run_dir / "rewrite_instruction.txt", rewrite_instruction + "\n")
         return cls(run_dir)
 
     @classmethod
@@ -130,7 +134,7 @@ class EvaluationRun:
         protocol = {
             key: value
             for key, value in source.protocol.items()
-            if key not in {"rewriter", "system_prompt", "chat_template_kwargs"}
+            if key not in {"rewriter", "system_prompt", "rewrite_instruction", "chat_template_kwargs"}
         }
         protocol.update(
             name=name,
@@ -193,7 +197,9 @@ class EvaluationRun:
                     "rewriter": self.protocol["rewriter"],
                     "chat_template_kwargs": {"enable_thinking": False},
                     "example_messages": build_messages(
-                        self.protocol["samples"][0]["prompt"], self.protocol["system_prompt"]
+                        self.protocol["samples"][0]["prompt"],
+                        self.protocol["system_prompt"],
+                        self.protocol.get("rewrite_instruction", ""),
                     ),
                     **self.status(),
                 }

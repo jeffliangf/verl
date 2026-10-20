@@ -1,0 +1,49 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - sft_trainer_engine
+  - _self_
+
+data:
+  train_files: data/prompt_rewrite_sft/train.parquet
+
+  # The same 200 prompts used by examples.prompt_rewrite video evaluation.
+  val_files: data/prompt_rewrite_sft/val.parquet
+
+  messages_key: messages
+
+  enable_thinking_default: false
+
+  # Also controls generation-prefix extraction for the assistant loss mask.
+  apply_chat_template_kwargs:
+    enable_thinking: false
+
+  # Count the complete conversation, including chat-template tokens.
+  max_length: 8192
+
+  # Reject overlong examples instead of cutting off a target.
+  truncation: error
+
+  # Short examples retain their actual length.
+  pad_mode: no_padding
+
+  use_dynamic_bsz: true
+
+  # Total tokens in a dynamic microbatch; accommodate one full-length example.
+  max_token_len_per_gpu: ${data.max_length}
+
+  ignore_input_ids_mismatch: false
+
+model:
+  path: Qwen/Qwen3.8-27B
+
+trainer:
+  project_name: prompt-rewrite-sft
+
+  experiment_name: qwen38-27b
+
+  test_freq: after_each_epoch
+
+  save_freq: after_each_epoch

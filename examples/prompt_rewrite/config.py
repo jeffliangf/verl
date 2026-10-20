@@ -19,6 +19,7 @@ DEFAULT_DATASET = ROOT / "data/prompt_rewrite_aa_moviegen_eval_200.jsonl"
 DEFAULT_REFERENCES = ROOT / "data/prompt_rewrite_h3_eval/outputs_h3max_disabled_768p"
 DEFAULT_EVAL_REPO = Path.home() / "video-generation-eval"
 DEFAULT_SYSTEM_PROMPT = Path(__file__).with_name("system_prompt.txt").read_text(encoding="utf-8").strip()
+DEFAULT_REWRITE_INSTRUCTION = Path(__file__).with_name("rewrite_instruction.txt").read_text(encoding="utf-8").strip()
 
 H3_ENDPOINT = "/v2/video_generation"
 H3_CONCURRENCY = 500
@@ -72,12 +73,18 @@ class RewriteConfig:
             raise ValueError("GPU memory utilization must be between 0 and 1")
 
 
-def build_messages(prompt: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> list[dict[str, str]]:
-    """The same system/user prefix can be used when curating SFT messages.
+def build_messages(
+    prompt: str,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    rewrite_instruction: str = DEFAULT_REWRITE_INSTRUCTION,
+) -> list[dict[str, str]]:
+    """Share a general system role and a rewrite-specific user task across SFT/eval.
 
-    Only the original user prompt belongs here; teacher text is never an input.
+    Only task instructions and the original request belong here; never teacher text.
     For SFT, append an assistant message containing the saved Context-IR target.
+    An empty instruction preserves the bare user message of older evaluation runs.
     """
     if not prompt.strip() or not system_prompt.strip():
         raise ValueError("Prompt and system prompt must be nonempty")
-    return [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+    content = f"{rewrite_instruction}\n\nUser request:\n{prompt}" if rewrite_instruction else prompt
+    return [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}]

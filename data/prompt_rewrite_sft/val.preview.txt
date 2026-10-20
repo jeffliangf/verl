@@ -1,0 +1,102 @@
+val: first 3 of 200 examples
+
+Full message text, without truncation.
+
+================================================================================
+Example 1
+id: movie_gen_video_bench:0829
+source: movie_gen_video_bench
+enable_thinking: false
+
+[system]
+You are a helpful assistant for creating and improving videos.
+
+Understand the user's goal and preserve their intent and constraints. Develop clear, coherent plans and instructions. Use the tools available for the current task when appropriate, and ground observations in provided content and actual tool results.
+
+Use feedback to identify problems and make targeted improvements while preserving what already works. Follow the current task's requirements and requested output format.
+
+[user]
+For this task, rewrite the user's request into clear, concrete directions for a coherent video of about 10 seconds.
+
+Preserve the core subjects, actions, relationships, setting, style, and any explicit constraints. Clarify motion, timing, composition, camera movement, lighting, and relevant visible details. Add only compatible details that help realize the user's intent. Avoid unnecessary new events, characters, dialogue, or cuts. Describe plausible synchronized sound and suitable music; respect requests for silence or no music.
+
+Return only the rewritten prompt, using these three sections in order:
+integrated_multimodal_description: The visual scene and how it unfolds over time.
+overall_soundscape: Relevant ambient sound, sound effects, and explicitly requested speech.
+non_diegetic_music: Suitable background music, or none when appropriate.
+
+Do not include analysis, an introduction, Markdown fences, or an explanation of your edits.
+
+User request:
+A zoom-in on a person's eye, revealing the intricate details of the iris and the reflections in their gaze.
+
+[assistant]
+integrated_multimodal_description: [Shot 1] Cinematic, extreme close-up, the camera executes a slow, continuous zoom in on the right eye of a young woman. The woman has smooth, fair skin with visible micro-texture and long, fine black eyelashes framing the eye. As the zoom in progresses, the lens transitions into a macro perspective, revealing the staggering, intricate details of her hazel iris: an expanse of radiating golden crypts, deep green furrows, and a stark black, perfectly round pupil. A soft, warm-toned directional light strikes the glossy, convex surface of the cornea, casting a curved, brilliant highlight. As the iris expands to fill the entire frame, the reflections caught in her gaze become sharply defined, unveiling a miniature, vivid glowing neon cityscape with tiny, shimmering streaks of amber and magenta light. The woman's pupil subtly dilates, and a single, slow blink momentarily sweeps across the frame, leaving the sclera gleaming with fresh moisture as the camera continues to magnify the deep, organic textures of her eye.
+overall_soundscape: A low-frequency ambient drone of distant, muffled city traffic hums continuously in the background, layered with the faint, rhythmic whoosh of steady breathing, while a pronounced, soft wet click is clearly heard when the eyelid blinks.
+non_diegetic_music: Ambient electronic synthesizer pad, very slow tempo, featuring a sustained, deep bass drone intertwined with ethereal, shimmering high-frequency tones that gradually build in intensity.
+
+================================================================================
+Example 2
+id: movie_gen_video_bench:0433
+source: movie_gen_video_bench
+enable_thinking: false
+
+[system]
+You are a helpful assistant for creating and improving videos.
+
+Understand the user's goal and preserve their intent and constraints. Develop clear, coherent plans and instructions. Use the tools available for the current task when appropriate, and ground observations in provided content and actual tool results.
+
+Use feedback to identify problems and make targeted improvements while preserving what already works. Follow the current task's requirements and requested output format.
+
+[user]
+For this task, rewrite the user's request into clear, concrete directions for a coherent video of about 10 seconds.
+
+Preserve the core subjects, actions, relationships, setting, style, and any explicit constraints. Clarify motion, timing, composition, camera movement, lighting, and relevant visible details. Add only compatible details that help realize the user's intent. Avoid unnecessary new events, characters, dialogue, or cuts. Describe plausible synchronized sound and suitable music; respect requests for silence or no music.
+
+Return only the rewritten prompt, using these three sections in order:
+integrated_multimodal_description: The visual scene and how it unfolds over time.
+overall_soundscape: Relevant ambient sound, sound effects, and explicitly requested speech.
+non_diegetic_music: Suitable background music, or none when appropriate.
+
+Do not include analysis, an introduction, Markdown fences, or an explanation of your edits.
+
+User request:
+A green monster made of leaves walks through the airport, carrying a suitcase.
+
+[assistant]
+integrated_multimodal_description: [Shot 1] Cinematic, medium wide shot from a front-left angle, employing a smooth tracking shot alongside a towering humanoid monster made entirely of vibrant green overlapping leaves, ferns, and vines. The creature strides deliberately through a spacious, modern airport terminal, swinging a weathered brown leather suitcase in its right hand. The bright setting features massive floor-to-ceiling glass windows on the left that cast cool, diffused daylight across the highly polished white tile floor, reflecting the creature's green silhouette. In the background, softly blurred travelers in casual clothing wheel their luggage through the concourse. As the monster walks, the foliage making up its chest and limbs shifts and bounces with organic weight. [Shot 2] At 00:05.450, the camera cuts to a medium low angle, pedestaling up smoothly as the leaf monster from Shot 1 walks past a row of metal waiting benches. On the right side of the frame, a seated traveler—a middle-aged man with short gray hair wearing a tailored charcoal suit—is looking at a silver tablet. As the intricate, broad Monstera leaves of the creature's back and the brass clasps of its suitcase pass closely through the left and center of the frame, the seated man slowly lowers his tablet, his eyes widening and mouth opening slightly in visible bewilderment. The leafy monster continues its steady march out of frame to the right, entirely ignoring the staring traveler under the bright overhead fluorescent lights.
+overall_soundscape: A constant, echoing hum of ambient airport chatter and the low rumble of distant rolling luggage fill the background. In the foreground, each heavy thud of the monster's footsteps on the tile floor is accompanied by a loud, distinct rustling and crunching of dense foliage. A rhythmic, pronounced squeaking from the metal hinges of the leather suitcase is clearly heard with every swing of the creature's arm. Towards the end of the clip, a crisp, two-note electronic chime from an overhead PA system softly rings out over the concourse.
+non_diegetic_music: Solo pizzicato strings playing a staccato ascending melody at a moderate tempo, accompanied by short, bouncy bassoon notes on the downbeats, with no swelling dynamics and a sparse, dry acoustic presence.
+
+================================================================================
+Example 3
+id: movie_gen_video_bench:0983
+source: movie_gen_video_bench
+enable_thinking: false
+
+[system]
+You are a helpful assistant for creating and improving videos.
+
+Understand the user's goal and preserve their intent and constraints. Develop clear, coherent plans and instructions. Use the tools available for the current task when appropriate, and ground observations in provided content and actual tool results.
+
+Use feedback to identify problems and make targeted improvements while preserving what already works. Follow the current task's requirements and requested output format.
+
+[user]
+For this task, rewrite the user's request into clear, concrete directions for a coherent video of about 10 seconds.
+
+Preserve the core subjects, actions, relationships, setting, style, and any explicit constraints. Clarify motion, timing, composition, camera movement, lighting, and relevant visible details. Add only compatible details that help realize the user's intent. Avoid unnecessary new events, characters, dialogue, or cuts. Describe plausible synchronized sound and suitable music; respect requests for silence or no music.
+
+Return only the rewritten prompt, using these three sections in order:
+integrated_multimodal_description: The visual scene and how it unfolds over time.
+overall_soundscape: Relevant ambient sound, sound effects, and explicitly requested speech.
+non_diegetic_music: Suitable background music, or none when appropriate.
+
+Do not include analysis, an introduction, Markdown fences, or an explanation of your edits.
+
+User request:
+an old man wearing blue jeans and a white t shirt taking a pleasant stroll in Antarctica during a beautiful sunset
+
+[assistant]
+integrated_multimodal_description: [Shot 1] Cinematic, Wide Shot, a tracking shot moving right alongside the subject. An elderly on-screen man with a slender build, deeply weathered skin, and thinning white hair walks into the left side of the frame, wearing a crisp, lightweight white cotton T-shirt and faded blue denim jeans. He takes a pleasant, leisurely stroll across a vast, flat expanse of packed white Antarctic snow, with massive, jagged icy-blue glaciers towering in the deep background. A beautiful sunset sits low on the horizon, casting dramatic, deep orange, magenta, and purple lighting across the frozen terrain and stretching long, dark shadows behind the man. He swings his arms loosely at his sides, stepping casually toward the center of the frame, seemingly entirely unaffected by the freezing environment. He briefly turns his head to his right, tilting his chin upward to admire the glowing ice formations, causing the warm sunlight to catch the side of his face. [Shot 2] At 00:05.500, the camera cuts to a Medium Shot, executing a steady pull out as it tracks backward, framing the subject from the front. The elderly man from Shot 1 continues his unhurried stroll directly toward the center of the frame. The vibrant sunset now backlights him, creating a bright, glowing amber rim-light along the edges of his white hair and the shoulders of his T-shirt. A serene, relaxed smile forms on his face as he looks straight ahead into the distance. He smoothly slides his right hand into the front pocket of his denim jeans, his left arm continuing to swing rhythmically in time with his steady, comfortable pace.
+overall_soundscape: A continuous, gentle howling wind sweeps across the open, icy landscape, layered with the distinct, clearly audible rhythmic crunching of heavy footsteps pressing firmly into hard-packed snow and solid ice. The faint, soft swishing of denim fabric brushing together is heard in the foreground with each step the man takes.
+non_diegetic_music: A slow-tempo, sparse acoustic guitar melody playing single, resonant notes, underpinned by a warm, sustained cello drone that holds a calm, unchanging dynamic throughout.

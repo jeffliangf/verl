@@ -1,0 +1,112 @@
+train: first 3 of 3000 examples
+
+Full message text, without truncation.
+
+================================================================================
+Example 1
+id: t2v-train-0913
+source: aa_synthesis
+enable_thinking: false
+
+[system]
+You are a helpful assistant for creating and improving videos.
+
+Understand the user's goal and preserve their intent and constraints. Develop clear, coherent plans and instructions. Use the tools available for the current task when appropriate, and ground observations in provided content and actual tool results.
+
+Use feedback to identify problems and make targeted improvements while preserving what already works. Follow the current task's requirements and requested output format.
+
+[user]
+For this task, rewrite the user's request into clear, concrete directions for a coherent video of about 10 seconds.
+
+Preserve the core subjects, actions, relationships, setting, style, and any explicit constraints. Clarify motion, timing, composition, camera movement, lighting, and relevant visible details. Add only compatible details that help realize the user's intent. Avoid unnecessary new events, characters, dialogue, or cuts. Describe plausible synchronized sound and suitable music; respect requests for silence or no music.
+
+Return only the rewritten prompt, using these three sections in order:
+integrated_multimodal_description: The visual scene and how it unfolds over time.
+overall_soundscape: Relevant ambient sound, sound effects, and explicitly requested speech.
+non_diegetic_music: Suitable background music, or none when appropriate.
+
+Do not include analysis, an introduction, Markdown fences, or an explanation of your edits.
+
+User request:
+00:00 - 00:04: Inside a rooftop timber shelter, a gardener wearing a canvas apron unlatches and opens an upper wall outlet vent. 00:04 - 00:09: Reaching overhead, they turn an internal handle to rotate the rooftop wind scoop toward the outdoor breeze. 00:09 - 00:14: As the camera glides close, the gardener adjusts a hinged baffle, with focus smoothly racking from their fingers to plain fabric airflow ribbons fluttering steadily down the newly ventilated planting aisle.
+
+[assistant]
+integrated_multimodal_description: [Shot 1] Cinematic, medium shot with a slow push in. Inside a rustic, sunlit rooftop timber shelter, a middle-aged male gardener wearing a thick olive-green canvas apron over a faded brown flannel shirt stands near the right frame. The walls are constructed of rough-hewn wooden planks. He reaches toward the wooden upper wall, grasps a tarnished metal latch, unfastens it, and pushes outward to open an upper wall outlet vent. A bright beam of warm, natural daylight immediately pours through the opening, casting deep shadows across the dusty timber floor. [Shot 2] At 00:03.500, the camera cuts to a low-angle shot, tilting up gently. The gardener from Shot 1 reaches his arms high overhead toward the ceiling beams. He tightly grips a large cast-iron internal handle, using his upper body strength to turn the wheel-like mechanism. This action slowly rotates a large, cylindrical rooftop wind scoop situated directly above him, aligning it with the unseen outdoor breeze. His shoulders shift beneath the thick canvas fabric as he exerts force. [Shot 3] At 00:06.500, the shot transitions to a close-up, the camera executing a smooth push in. The gardener's soil-stained fingers meticulously adjust a heavily rusted metal hinged baffle near the duct opening. As he shifts the angled metal plate, the lens focus smoothly racks from his textured fingertips in the sharp foreground to the previously blurred midground. The newly clear background reveals several plain white fabric airflow ribbons tied to small wooden stakes along a narrow, lush green planting aisle. The ribbons actively flutter and snap steadily downward, pushed by the freshly ventilated breeze.
+overall_soundscape: A low ambient outdoor wind whistles softly in the background. A sharp, metallic clank and scrape is clearly heard as the latch unfastens, followed by a dry wooden creak as the wall vent pushes open. A heavy, resonant metallic groan and the grinding of iron gears dominate the audio as the overhead handle is firmly turned, which transitions into a pronounced, rushing whoosh of incoming air. Rapid, crisp fluttering and snapping of the fabric ribbons become dominant in the foreground as the channeled breeze sweeps through the aisle.
+non_diegetic_music: A lone acoustic guitar, slow tempo, playing a gentle, earthy melody with rhythmic fingerpicking and no percussion.
+
+================================================================================
+Example 2
+id: t2v-train-0205
+source: aa_synthesis
+enable_thinking: false
+
+[system]
+You are a helpful assistant for creating and improving videos.
+
+Understand the user's goal and preserve their intent and constraints. Develop clear, coherent plans and instructions. Use the tools available for the current task when appropriate, and ground observations in provided content and actual tool results.
+
+Use feedback to identify problems and make targeted improvements while preserving what already works. Follow the current task's requirements and requested output format.
+
+[user]
+For this task, rewrite the user's request into clear, concrete directions for a coherent video of about 10 seconds.
+
+Preserve the core subjects, actions, relationships, setting, style, and any explicit constraints. Clarify motion, timing, composition, camera movement, lighting, and relevant visible details. Add only compatible details that help realize the user's intent. Avoid unnecessary new events, characters, dialogue, or cuts. Describe plausible synchronized sound and suitable music; respect requests for silence or no music.
+
+Return only the rewritten prompt, using these three sections in order:
+integrated_multimodal_description: The visual scene and how it unfolds over time.
+overall_soundscape: Relevant ambient sound, sound effects, and explicitly requested speech.
+non_diegetic_music: Suitable background music, or none when appropriate.
+
+Do not include analysis, an introduction, Markdown fences, or an explanation of your edits.
+
+User request:
+00:00 - 00:05
+A photorealistic close-up perspective showcases a mechanical four-bar linkage built from polished brass and stainless steel hardware, resting on a matte charcoal felt tabletop beneath a clean acrylic museum casing. As an integrated miniature electric motor turns the drive crank at a smooth, constant speed, a sharp, semi-transparent cyan 2D animated angle graphic overlays the mechanism. The graphic consists of two vector rays radiating from the central output pivot pin, perfectly tracking the physical rocker arm and drawing a faint cyan boundary arc that marks its narrow thirty-degree oscillation range.
+
+00:05 - 00:10
+The motorized crank gently decelerates to a complete stop at bottom-dead-center. Below the fixed pivot, an internal worm gear silently actuates, sliding the adjustable pivot carriage outwards along a grooved linear brass rail by fifteen millimeters. As the carriage slides, the overlaid cyan graphic contracts its tracking lines, remaining strictly pinned to the changing physical pivot coordinates without drifting or jittering.
+
+00:10 - 00:16
+The drive motor resumes rotation. With the altered pivot geometry, the brass rocker arm sweeps through a noticeably larger sixty-degree angular path. The animated cyan diagram tracks the accelerated sweep in real-time, fanning out across the dark felt background to trace an expanded, luminous sector that perfectly mirrors the mechanical linkage’s broadened reach.
+
+00:16 - 00:20
+At the far apex of the rocker arm’s forward throw, the animated overlay flashes a crisp, glowing pulse along its outer boundary arc. Precise, modern sans-serif cyan vector typography reading "WIDER SWEEP" materializes within the center of the expanded arc, holding stationary against the tabletop before softly pulsing once in brightness as the mechanism continues its rhythmic cycling. Throughout the sequence, the animation remains purely registered to the physical brass components, without any floating extraneous icons, disjointed geometry, or visible human hands touching the apparatus.
+
+[assistant]
+integrated_multimodal_description: [Shot 1] Cinematic, a close-up static shot focuses on a mechanical four-bar linkage built from polished brass and stainless steel hardware. The mechanism rests on a matte charcoal felt tabletop beneath the faint reflective sheen of a clean acrylic museum casing, illuminated by crisp, focused overhead spotlighting that highlights the metallic textures against the dark background. An integrated miniature electric motor turns the drive crank at a smooth, constant speed. Overlaying the physical mechanism is a sharp, semi-transparent cyan 2D animated angle graphic, consisting of two glowing vector rays radiating from the central output pivot pin. The rays perfectly track the physical brass rocker arm, drawing a faint cyan boundary arc that marks its narrow thirty-degree oscillation range. The motorized crank then gently decelerates to a complete stop at bottom-dead-center. Below the fixed pivot, an internal worm gear silently actuates, sliding an adjustable pivot carriage outwards by fifteen millimeters along a grooved linear brass rail. As the carriage shifts, the overlaid cyan graphic dynamically contracts its tracking lines, remaining strictly pinned to the changing physical coordinates without drifting or jittering. The drive motor quickly resumes rotation. With the altered pivot geometry, the brass rocker arm now sweeps through a noticeably larger sixty-degree angular path. The animated cyan diagram tracks this accelerated sweep in real-time, fanning out across the dark felt to trace an expanded, luminous sector that perfectly mirrors the linkage's broadened reach. As the rocker arm hits the far apex of its forward throw, the animated overlay flashes a crisp, glowing pulse along its outer boundary arc. Precise, modern sans-serif cyan vector typography reading "WIDER SWEEP" materializes within the center of the expanded arc, holding stationary against the tabletop before softly pulsing once in brightness as the mechanism continues its rhythmic, untouched cycling.
+overall_soundscape: A subtle, continuous ambient room tone establishes a quiet interior space. In the foreground, a distinct, smooth mechanical whirring of the miniature electric motor is clearly heard, accompanied by the faint metallic clicking of the oscillating linkage. The motor's whir fades as it decelerates, giving way to a crisp, metallic sliding scrape and a pronounced mechanical click as the worm gear actuates the brass carriage. The motor's hum quickly resumes with a slightly deeper, accelerated pitch. As the cyan typography appears, a synthesized, crystalline digital ping rings out, syncing perfectly with the visual pulse, while the rhythmic mechanical whirring continues without interruption.
+non_diegetic_music: Minimalist ambient electronic music, slow tempo, featuring a sustained low synthesized drone and subtle, rhythmic synthesizer pulses that add a clean, clinical atmosphere to the technical demonstration.
+
+================================================================================
+Example 3
+id: vbench:0254
+source: vbench
+enable_thinking: false
+
+[system]
+You are a helpful assistant for creating and improving videos.
+
+Understand the user's goal and preserve their intent and constraints. Develop clear, coherent plans and instructions. Use the tools available for the current task when appropriate, and ground observations in provided content and actual tool results.
+
+Use feedback to identify problems and make targeted improvements while preserving what already works. Follow the current task's requirements and requested output format.
+
+[user]
+For this task, rewrite the user's request into clear, concrete directions for a coherent video of about 10 seconds.
+
+Preserve the core subjects, actions, relationships, setting, style, and any explicit constraints. Clarify motion, timing, composition, camera movement, lighting, and relevant visible details. Add only compatible details that help realize the user's intent. Avoid unnecessary new events, characters, dialogue, or cuts. Describe plausible synchronized sound and suitable music; respect requests for silence or no music.
+
+Return only the rewritten prompt, using these three sections in order:
+integrated_multimodal_description: The visual scene and how it unfolds over time.
+overall_soundscape: Relevant ambient sound, sound effects, and explicitly requested speech.
+non_diegetic_music: Suitable background music, or none when appropriate.
+
+Do not include analysis, an introduction, Markdown fences, or an explanation of your edits.
+
+User request:
+A person is milking cow
+
+[assistant]
+integrated_multimodal_description: [Shot 1] Cinematic, medium shot, the camera slowly pushes in. Inside a rustic wooden barn illuminated by warm morning sunlight streaming diagonally through gaps in the rough plank walls, a middle-aged male farmer sits on a low, weathered wooden stool in the center frame. He has a rugged face, a short grey beard, and wears a faded red-and-black plaid flannel shirt under worn blue denim overalls. He is positioned next to a large black-and-white Holstein cow that occupies the right side of the frame. The farmer leans in, his weathered hands rhythmically squeezing the cow's udders. A dented, galvanized metal pail rests on the golden straw directly beneath the udder. The cow stands placidly, its tail swishing once lazily. [Shot 2] At 00:04.500, the camera cuts to a close-up, holding a static shot. The frame focuses tightly on the hands of the farmer from Shot 1 as they expertly manipulate the pink udders. Twin streams of opaque white milk shoot out in alternating, forceful squirts. Below, the galvanized metal pail from Shot 1 catches the liquid, its inner surface already covered in a thick, bubbling layer of white froth. [Shot 3] At 00:08.000, the camera cuts to a medium-wide shot, and the camera slowly pans left. The frame reveals the front half of the Holstein cow from Shot 1 on the right, its large brown eyes blinking slowly as its heavy jaws move side-to-side, chewing cud. In the softly out-of-focus background on the left, the farmer from Shot 1 remains seated, his shoulders bobbing slightly as he continues the unseen milking motion. Fine dust motes dance in the prominent shafts of golden sunlight cutting across the dimly lit barn interior.
+overall_soundscape: A resonant, rhythmic metallic pinging is clearly heard in the foreground as the milk hits the metal pail, which gradually transitions into a softer, frothy sloshing and splashing sound. Beneath this, a pronounced, steady squelching noise accompanies the hand movements squeezing the udders. In the background, the deep breathing of the cow, occasional heavy hooves snapping dry straw, and a faint ambient breeze whistling through the wooden barn provide a continuous rustic atmosphere.
+non_diegetic_music: Acoustic guitar, slow tempo, featuring a sparse, rustic fingerpicked melody with sustained underlying bass notes, maintaining a steady and quiet dynamic level.

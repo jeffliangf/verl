@@ -21,6 +21,7 @@ from examples.prompt_rewrite import evaluation, h3, judge, rewrite, scoring
 from examples.prompt_rewrite.__main__ import main
 from examples.prompt_rewrite.config import (
     CANDIDATE,
+    DEFAULT_REWRITE_INSTRUCTION,
     H3_ENDPOINT,
     H3_SETTINGS,
     JUDGE_SETTINGS,
@@ -355,7 +356,44 @@ def test_rewriter_receives_no_teacher_and_resumes(prepared):
     assert len(calls) == 3
     run.rewrite(execute=True, rewriter=policy)
     assert len(calls) == 3
-    assert build_messages("original")[-1] == {"role": "user", "content": "original"}
+    assert build_messages("original")[-1] == {
+        "role": "user",
+        "content": DEFAULT_REWRITE_INSTRUCTION + "\n\nUser request:\noriginal",
+    }
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_saved_prompt_contract_controls_preview_identity_and_resumed_inference(prepared, legacy):
+    run, _, _ = prepared
+    protocol = run.protocol
+    protocol["system_prompt"] = "Saved system role"
+    if legacy:
+        protocol.pop("rewrite_instruction")
+    else:
+        protocol["rewrite_instruction"] = "Saved task instruction"
+    write_json(run.path / "protocol.json", protocol)
+    write_json(run.path / "protocol-sha256.json", fingerprint(protocol))
+    run = EvaluationRun(run.path)
+    expected = []
+    for sample in protocol["samples"]:
+        content = sample["prompt"] if legacy else f"Saved task instruction\n\nUser request:\n{sample['prompt']}"
+        expected.append([{"role": "system", "content": "Saved system role"}, {"role": "user", "content": content}])
+    assert run.rewrite()["example_messages"] == expected[0]
+    first = protocol["samples"][0]
+    rewrite.save_rewrite(run.path, protocol, first, rewrite.RewriteResult("Saved rewrite"))
+    record = read_json(rewrite.record_path(run.path, first["id"]))
+    assert record["request_sha256"] == fingerprint(
+        {"id": first["id"], "messages": expected[0], "rewriter": protocol["rewriter"]}
+    )
+    calls = []
+
+    def policy(messages):
+        calls.extend(messages)
+        return [rewrite.RewriteResult("New rewrite") for _ in messages]
+
+    run.rewrite(execute=True, rewriter=policy)
+    assert calls == expected[1:]
+    assert run.status()["rewrites_complete"] == len(protocol["samples"])
 
 
 @pytest.mark.parametrize("bad", ["empty", "duplicate", "unknown", "wrong_prompt", "truncated", "aborted"])
@@ -525,6 +563,7 @@ def test_two_training_checkpoints_share_references_not_candidate_artifacts(prepa
     )
     assert sft.protocol["samples"] == run.protocol["samples"]
     assert sft.protocol["system_prompt"] == run.protocol["system_prompt"]
+    assert sft.protocol["rewrite_instruction"] == run.protocol["rewrite_instruction"]
     import_outputs(sft)
     assert sft.status()["rewrites_complete"] == 3
     assert run.status()["rewrites_complete"] == 0

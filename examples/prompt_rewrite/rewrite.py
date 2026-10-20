@@ -102,7 +102,9 @@ def rewrite_identity(sample: dict, protocol: dict) -> str:
     return fingerprint(
         {
             "id": sample["id"],
-            "messages": build_messages(sample["prompt"], protocol["system_prompt"]),
+            "messages": build_messages(
+                sample["prompt"], protocol["system_prompt"], protocol.get("rewrite_instruction", "")
+            ),
             "rewriter": protocol["rewriter"],
         }
     )
@@ -172,7 +174,10 @@ def run_rewrites(
     pending = [sample for sample in protocol["samples"] if sample["id"] not in completed]
     for offset in range(0, len(pending), batch_size):
         batch = pending[offset : offset + batch_size]
-        messages = [build_messages(sample["prompt"], protocol["system_prompt"]) for sample in batch]
+        messages = [
+            build_messages(sample["prompt"], protocol["system_prompt"], protocol.get("rewrite_instruction", ""))
+            for sample in batch
+        ]
         results = rewriter(messages)
         if len(results) != len(batch):
             raise ValueError("Rewriter returned a different number of outputs than inputs")

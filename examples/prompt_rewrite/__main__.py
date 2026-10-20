@@ -19,6 +19,7 @@ from .config import (
     DEFAULT_DATASET,
     DEFAULT_EVAL_REPO,
     DEFAULT_REFERENCES,
+    DEFAULT_REWRITE_INSTRUCTION,
     DEFAULT_SYSTEM_PROMPT,
     H3_CONCURRENCY,
     JUDGE_CONCURRENCY,
@@ -40,6 +41,7 @@ def parse_args(argv=None):
     prepare.add_argument("--references", type=Path, default=DEFAULT_REFERENCES)
     prepare.add_argument("--eval-repo", type=Path, default=DEFAULT_EVAL_REPO)
     prepare.add_argument("--system-prompt-file", type=Path)
+    prepare.add_argument("--rewrite-instruction-file", type=Path)
     prepare.add_argument("--limit", type=int, help="Freeze a small cohort for a smoke run in its own directory")
     for field in (
         "model",
@@ -94,6 +96,11 @@ def main(argv=None) -> int:
                 if args.system_prompt_file
                 else DEFAULT_SYSTEM_PROMPT
             )
+            instruction = (
+                args.rewrite_instruction_file.read_text(encoding="utf-8").strip()
+                if args.rewrite_instruction_file
+                else DEFAULT_REWRITE_INSTRUCTION
+            )
             run = EvaluationRun.prepare(
                 args.run_dir,
                 name=args.name,
@@ -102,6 +109,7 @@ def main(argv=None) -> int:
                 references=args.references,
                 eval_repo=args.eval_repo,
                 system_prompt=system,
+                rewrite_instruction=instruction,
                 limit=args.limit,
             )
             result = run.status()

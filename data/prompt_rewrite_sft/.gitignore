@@ -1,0 +1,4 @@
+# Keep full generated exports local; the small text previews are tracked.
+/train.jsonl
+/val.jsonl
+/manifest.json

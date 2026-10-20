@@ -12,16 +12,16 @@ original prompt → rewriter → rewritten_prompt → H3 → candidate video
                                   scores vs prompt and vs h3_context_ir
 ```
 
-The rewriter sees the system instruction and original prompt only. The teacher
-Context-IR is never included in its input. Gemini also receives the original
-prompt; model identities, teacher text, and rewritten text are excluded from its
-request by the existing evaluator.
+The rewriter sees a shared system role, the rewrite task instruction, and the
+original prompt. The teacher Context-IR is never included in its input. Gemini
+also receives the original prompt; model identities, teacher text, and rewritten
+text are excluded from its request by the existing evaluator.
 
 ## Components
 
 | Module | Responsibility |
 |---|---|
-| `config.py`, `system_prompt.txt` | Shared message prefix and explicit experiment settings |
+| `config.py`, `system_prompt.txt`, `rewrite_instruction.txt` | Shared system role, task instruction, and experiment settings |
 | `dataset.py` | Eval schema and reference-video provenance checks |
 | `rewrite.py` | Lazy vLLM adapter, injectable policy callable, imported rollout outputs |
 | `h3.py` | Direct generation, persistent task IDs, resumable polling/downloads |
@@ -37,6 +37,29 @@ TensorBoard logging uses the lightweight `tensorboard` package, already included
 in the verl runtime; reporting does not load PyTorch or a GPU.
 The H3 HTTP helpers, MP4 reader, v4 rubric, and Gemini runner come from
 `~/video-generation-eval`; their source hashes are frozen in each run.
+
+## Shared system role and task instructions
+
+`system_prompt.txt` defines a general video assistant: preserve user intent, use
+available tools, ground observations in actual results, and improve outputs from
+feedback. It does not prescribe a model/provider, duration, output schema, or
+fixed number of steps.
+
+For the current rewrite task, `rewrite_instruction.txt` specifies the 10-second
+target, three Context-IR sections, and returning only the rewritten prompt.
+`build_messages` places that instruction and the original request together in
+the user message. Both SFT preparation and new evaluations use this same builder.
+Future generation/inspection/revision tasks can supply their own task instructions
+and tool schemas while keeping the system role. Tool-call and revision behavior
+will also require suitable training trajectories and a tool-enabled rollout loop;
+the current examples supervise only the first rewrite.
+
+Each new evaluation freezes both texts in its protocol and run directory. Set
+`prepare --system-prompt-file` or `--rewrite-instruction-file` to override them for
+a new experiment. Existing saved runs retain their original system and user
+messages, including older runs without a separate task instruction. Regenerate
+the SFT Parquet files after editing either shared prompt file, and prepare a new
+zero-shot evaluation when comparing checkpoints under the new instructions.
 
 ## Required local inputs
 
@@ -55,8 +78,9 @@ A fresh checkout needs these assets supplied separately:
   H3 and Gemini credentials described below. Importing saved rewrites skips the
   GPU requirement.
 
-Datasets, videos, checkpoints, credentials, generated reports, and TensorBoard
+Full datasets, videos, checkpoints, credentials, generated reports, and TensorBoard
 event files are runtime inputs or outputs; they are not included with this code.
+Small SFT conversation previews are included in `data/prompt_rewrite_sft`.
 
 ## Zero-shot run
 
@@ -281,18 +305,72 @@ metrics = run.report()["comparisons"]
 # During training, use run.report(tensorboard_dir=trainer_log_dir, step=global_step).
 ```
 
-For later SFT curation, use `build_messages(row["prompt"])` and append
-`{"role": "assistant", "content": row["h3_context_ir"]}`. Apply the same
-`enable_thinking=False` chat-template setting and assistant-only training loss.
-The existing training file is `data/prompt_rewrite_sft.jsonl` (not `.json`). This
-module does not mutate that file or launch training. Use the 200 eval prompts
-only for evaluation, including after RL; they must not become RL training rows.
+### Prepare SFT data
+
+Export the existing training rows and the established 200-example evaluation
+cohort to the standard `MultiTurnSFTDataset` format:
+
+```bash
+uv run --no-project --python 3.12 --with pyarrow python -m examples.prompt_rewrite.prepare_sft
+```
+
+This writes `data/prompt_rewrite_sft/train.parquet` from
+`data/prompt_rewrite_sft.jsonl` and `data/prompt_rewrite_sft/val.parquet` from
+`data/prompt_rewrite_aa_moviegen_eval_200.jsonl`. Source JSONL files are preserved.
+The converter repairs the known `"h3_context_ir, "` field-name typo in the export,
+checks nonempty inputs/targets and unique IDs, and rejects train/validation
+overlap by ID or stripped prompt text. It preserves training row order and
+duplicates; `manifest.json` records input hashes, counts, and repaired keys.
+Use `--train-file`, `--val-file`, or `--output-dir` to override these paths.
+
+The same directory also contains `train.jsonl` and `val.jsonl` with every
+converted row, plus `train.preview.txt` and `val.preview.txt` showing the first
+three examples with full system/user/assistant messages and readable line breaks.
+These inspection files are refreshed whenever the converter runs.
+
+Every Parquet row has `id`, `source`, `split`, `enable_thinking=false`, and
+`messages`: the shared system prompt, the rewrite task instruction and original
+request in one user message, then the assistant's `h3_context_ir` target. Teacher
+text appears only in the assistant turn. The standard dataset applies the chat
+template and assistant-only loss.
+Reference video paths remain in the evaluation JSONL and are not SFT inputs.
+
+The `configs/sft.yaml` preset inherits verl's standard SFT trainer and sets both
+thinking controls to false, `data.max_length=8192`, `data.truncation=error`, and
+`data.pad_mode=no_padding`. From the repository root, in the training environment,
+select it with:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=<GPU_COUNT> \
+  -m verl.trainer.sft_trainer \
+  --config-path=../../examples/prompt_rewrite/configs --config-name=sft \
+  trainer.n_gpus_per_node=<GPU_COUNT>
+```
+
+Choose the engine, batch size, optimizer, and any LoRA settings for your hardware;
+the preset supplies the data/template settings and Qwen3.8-27B model path.
+SFT validation computes teacher-forced loss on the same 200 examples after each
+epoch. Continue using the existing rewrite → H3 → judge → report workflow to
+measure video quality; the SFT trainer does not invoke that pipeline itself.
+These 200 prompts stay out of both SFT and RL training.
+
+`data.max_length` limits the **complete tokenized conversation**, including the
+system/user messages, assistant target, and template tokens. It is not the output
+generation budget. `no_padding` keeps shorter sequences at their actual lengths.
+With dynamic batching, `data.max_token_len_per_gpu` controls the microbatch token
+budget; the preset defaults it to `${data.max_length}` so one full-length example
+fits that budget. Actual GPU memory capacity still determines viable batch sizes.
+Override `data.max_length=8192` on a training command to set this limit normally;
+in this preset the microbatch token budget follows it unless separately overridden.
+The existing evaluation keeps its 8,192-token context and 2,048-token generation
+budget. Tokenize with the exact training tokenizer before launching a GPU job,
+and inspect assistant loss masks and the chat-template consistency check.
 
 ## Local verification
 
 ```bash
-uv run --no-project --python 3.12 --with pytest --with tensorboard==2.20.0 python -m pytest \
-  tests/special_standalone/prompt_rewrite/test_evaluation_on_cpu.py -q
+uv run --no-project --python 3.12 --with pytest --with tensorboard==2.20.0 \
+  --with pandas --with pyarrow python -m pytest tests/special_standalone/prompt_rewrite -q
 
 uv run --no-project --python 3.12 --with ruff==0.12.2 ruff check \
   examples/prompt_rewrite tests/special_standalone/prompt_rewrite
