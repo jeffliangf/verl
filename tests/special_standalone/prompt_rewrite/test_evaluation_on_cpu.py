@@ -1,0 +1,623 @@
+# Copyright 2026 verl contributors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Exercise the full workflow without GPUs, credentials, or network calls."""
+
+import copy
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from examples.prompt_rewrite import evaluation, h3, judge, rewrite, scoring
+from examples.prompt_rewrite.__main__ import main
+from examples.prompt_rewrite.config import (
+    CANDIDATE,
+    H3_ENDPOINT,
+    H3_SETTINGS,
+    JUDGE_SETTINGS,
+    REFERENCE_VIDEO_FIELDS,
+    build_messages,
+)
+from examples.prompt_rewrite.evaluation import EXTERNAL_FILES, EvaluationRun
+from examples.prompt_rewrite.storage import file_sha256, fingerprint, read_json, write_json, write_jsonl
+
+MEDIA = {
+    "duration_s": 10.125,
+    "video": {"width": 1344, "height": 768, "fps": 24.0, "codec": "avc1"},
+    "audio": {"sample_rate": 32000, "channels": 2, "codec": "mp4a"},
+}
+HOST = "https://h3.invalid"
+
+
+class FakeH3:
+    def __init__(self):
+        self.posts = []
+        self.queries = []
+        self.fail_post = False
+        self.fail_query = False
+
+    def load_env(self):
+        pass
+
+    def auth_headers(self, token):
+        return {}
+
+    def post_json(self, url, headers, request):
+        self.posts.append((url, request))
+        if self.fail_post:
+            raise TimeoutError("ambiguous submission")
+        return {"task_id": str(len(self.posts))}
+
+    def get_json(self, url, headers):
+        self.queries.append(url)
+        if self.fail_query:
+            raise OSError("temporary polling failure")
+        return {"task": {"status": "succeeded", "content": {"url": "https://video.invalid/output.mp4"}}}
+
+    def download_video(self, url, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"candidate clip")
+
+
+@pytest.fixture
+def prepared(tmp_path, monkeypatch):
+    repo, references = tmp_path / "eval-repo", tmp_path / "references"
+    for relative in EXTERNAL_FILES:
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# fake integration module\n")
+    rows, tasks = [], []
+    for i in range(3):
+        row = {
+            "id": f"sample:{i}",
+            "prompt": f"Original prompt {i}",
+            "h3_context_ir": f"SECRET teacher target {i}",
+            "source": "aa_eval" if i < 2 else "movie_gen_video_bench",
+        }
+        for field in ("prompt", "h3_context_ir"):
+            video = references / "videos" / str(i) / (field + ".mp4")
+            video.parent.mkdir(parents=True, exist_ok=True)
+            video.write_bytes(f"reference {i}/{field}".encode())
+            request = h3.request_body(row[field])
+            state = video.with_suffix(".state.json")
+            write_json(
+                state,
+                {
+                    "status": "succeeded",
+                    "request_sha256": fingerprint(request),
+                    "endpoint": H3_ENDPOINT,
+                    "host": HOST,
+                    "sha256": file_sha256(video),
+                    "bytes": video.stat().st_size,
+                    "media": MEDIA,
+                },
+            )
+            tasks.append(
+                {
+                    "item_id": row["id"],
+                    "field": field,
+                    "request": request,
+                    "request_sha256": fingerprint(request),
+                    "state": str(state.relative_to(references)),
+                    "output": str(video.relative_to(references)),
+                }
+            )
+            row[REFERENCE_VIDEO_FIELDS[field]] = str(video)
+            # Legacy video fields coexist, but must never be used for this run.
+            row[field + "_h3_video"] = str(tmp_path / "legacy" / (field + ".mp4"))
+        rows.append(row)
+    dataset = tmp_path / "eval.jsonl"
+    write_jsonl(dataset, rows)
+    write_json(
+        references / "manifest.json",
+        {"settings": H3_SETTINGS, "endpoint": H3_ENDPOINT, "context_ir_rewriter_enabled": False, "tasks": tasks},
+    )
+    client = FakeH3()
+
+    def external(path):
+        if path.name == "build_pairwise_manifest.py":
+            return SimpleNamespace(INSTRUCTIONS_VERSION=4, INSTRUCTIONS="Frozen comparison rubric")
+        if path.name == "normalize.py":
+            return SimpleNamespace(probe=lambda _: MEDIA)
+        if path.name == "generate_h3_repeats.py":
+            return client
+        raise AssertionError(f"Unexpected module: {path}")
+
+    monkeypatch.setattr(evaluation, "load_external", external)
+    monkeypatch.setenv("H3_HOST", HOST)
+    monkeypatch.setenv("H3_TOKEN", "test-token")
+    monkeypatch.setenv("TENSORBOARD_DIR", str(tmp_path / "tensorboard"))
+    run = EvaluationRun.prepare(tmp_path / "run", dataset=dataset, references=references, eval_repo=repo)
+    return run, client, rows
+
+
+def import_outputs(run):
+    run.import_rewrites(
+        [
+            {"id": sample["id"], "rewritten_prompt": f"Rewrite for {sample['prompt']}"}
+            for sample in run.protocol["samples"]
+        ]
+    )
+
+
+def add_judgments(run, manifests, *, omit=None):
+    """Three prompts score 1, 0.5, 0 against each reference, independent of displayed side."""
+    candidate = run.protocol.get("candidate_field", CANDIDATE)
+    for order in judge.ORDERS:
+        rows = []
+        path = run.path / "judge" / f"manifest-{order}.json"
+        for pair_id, pair in manifests[order]["pairs"].items():
+            if (order, pair_id) == omit:
+                continue
+            i = int(pair["prompt_id"].split(":")[-1])
+            candidate_wins = i == 0 or (i == 1 and order == "original")
+            winner = candidate if candidate_wins else pair["reference"]
+            preferred = "A" if pair["model_A"] == winner else "B"
+            rows.append(
+                {
+                    "status": "completed",
+                    "pair_id": pair_id,
+                    "prompt_id": pair["prompt_id"],
+                    "model_A": pair["model_A"],
+                    "model_B": pair["model_B"],
+                    "preferred_video": preferred,
+                    "preferred_model": winner,
+                    "reason": "Visible evidence",
+                    "manifest_sha256": file_sha256(path),
+                    "evaluation_signature": judge.evaluation_signature(pair, run.protocol["rubric"]),
+                    **JUDGE_SETTINGS,
+                }
+            )
+        write_jsonl(run.path / "judge" / f"judgments-{order}.jsonl", rows)
+
+
+def test_full_pipeline_and_repeated_resume(prepared):
+    run, client, _ = prepared
+    import_outputs(run)
+    assert run.generate()["planned_judgments"] == 12
+    assert client.posts == []
+    assert run.generate(execute=True, concurrency=1)["video_statuses"] == {"succeeded": 3}
+    assert len(client.posts) == 3
+    assert all(url == HOST + H3_ENDPOINT for url, _ in client.posts)
+    assert all("SECRET" not in json.dumps(body) for _, body in client.posts)
+    assert all(body["model"] == "MiniMax-H3-Max" for _, body in client.posts)
+    assert all(body["extra"] == {"prompt_expansion_mode": "disabled"} for _, body in client.posts)
+    run.generate(execute=True, concurrency=1)
+    assert len(client.posts) == 3
+    manifests = run.comparison_inputs()
+    for pair_id, pair in manifests["original"]["pairs"].items():
+        assert manifests["swapped"]["pairs"][pair_id] == judge.swap_pair(pair)
+        assert pair["prompt"].startswith("Original prompt")
+    add_judgments(run, manifests)
+    report = run.report()
+    assert report["complete"]
+    for reference in ("prompt", "h3_context_ir"):
+        overall = report["comparisons"][reference]["overall"]
+        assert overall["points"] == 1.5
+        assert overall["win_rate_half_split"] == 0.5
+        assert (overall["wins"], overall["splits"], overall["losses"]) == (1, 1, 1)
+        assert overall["coverage"] == 1
+        assert report["comparisons"][reference]["by_source"]["aa_eval"]["win_rate_half_split"] == 0.75
+        # Two AA prompts and one MovieGen prompt distinguish the equally
+        # weighted dataset average (0.375) from the pooled score (0.5).
+        assert report["comparisons"][reference]["scores"] == {"moviegen": 0.0, "aa_eval": 0.75, "average": 0.375}
+    assert report["tensorboard"]["step"] == 0
+    assert list(Path(report["tensorboard"]["log_dir"]).glob("events.out.tfevents.*"))
+
+
+def test_reference_benchmark_reuses_exact_clips_and_scores_teacher(prepared, tmp_path):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    source, client, rows = prepared
+    benchmark = EvaluationRun.prepare_reference_benchmark(tmp_path / "benchmark", source_run=source.path)
+    assert benchmark.status()["planned_new_videos"] == 0
+    assert benchmark.status()["planned_judgments"] == 6
+    assert "rewriter" not in benchmark.protocol
+    manifests = benchmark.comparison_inputs()
+    samples = {row["id"]: row for row in rows}
+    for pair_id, pair in manifests["original"]["pairs"].items():
+        assert pair["prompt"] == samples[pair["prompt_id"]]["prompt"]
+        assert {pair["model_A"], pair["model_B"]} == {"prompt", "h3_context_ir"}
+        for side in ("A", "B"):
+            field = REFERENCE_VIDEO_FIELDS[pair["model_" + side]]
+            assert pair["video_path_" + side] == samples[pair["prompt_id"]][field]
+        assert manifests["swapped"]["pairs"][pair_id] == judge.swap_pair(pair)
+    add_judgments(benchmark, manifests)
+    report = benchmark.report()
+    assert list(report["comparisons"]) == ["prompt"]
+    assert report["comparisons"]["prompt"]["scores"] == {"moviegen": 0.0, "aa_eval": 0.75, "average": 0.375}
+    events = EventAccumulator(report["tensorboard"]["log_dir"]).Reload()
+    assert events.Scalars("eval/prompt_rewrite/vs_prompt/average")[0].value == 0.375
+    with pytest.raises(ValueError, match="existing videos"):
+        benchmark.generate(execute=True)
+    with pytest.raises(ValueError, match="existing videos"):
+        benchmark.rewrite(execute=True)
+    assert client.posts == []
+    assert not (benchmark.path / "videos").exists()
+
+
+def test_reference_benchmark_cli_defaults_to_dry_run(prepared, tmp_path, monkeypatch):
+    source, client, _ = prepared
+    commands = []
+
+    def invoke(command, *, check):
+        commands.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(judge.subprocess, "run", invoke)
+    assert (
+        main(["benchmark-references", "--run-dir", str(tmp_path / "benchmark"), "--source-run", str(source.path)]) == 0
+    )
+    assert len(commands) == 2
+    assert all("--dry-run" in command and "--execute" not in command for command in commands)
+    assert all(command[command.index("--concurrency") + 1] == "500" for command in commands)
+    assert client.posts == []
+
+
+@pytest.mark.parametrize("invalid", ["missing", "legacy_path"])
+def test_max_references_must_match_dataset_fields(prepared, tmp_path, invalid):
+    run, client, rows = prepared
+    field = "prompt_h3_max_video"
+    if invalid == "missing":
+        del rows[0][field]
+    else:
+        rows[0][field] = rows[0]["prompt_h3_video"]
+    dataset = tmp_path / "wrong-references.jsonl"
+    write_jsonl(dataset, rows)
+    with pytest.raises(ValueError, match="Missing reference video field|Dataset video path differs"):
+        EvaluationRun.prepare(
+            tmp_path / "invalid",
+            dataset=dataset,
+            references=Path(run.protocol["reference_manifest"]).parent,
+            eval_repo=Path(run.protocol["eval_repo"]),
+        )
+    assert client.posts == []
+
+
+def test_saved_run_uses_frozen_generation_settings(prepared, monkeypatch):
+    run, client, _ = prepared
+    import_outputs(run)
+    original_requests = run.generation_tasks()
+    monkeypatch.setattr(h3, "H3_SETTINGS", {"model": "a-future-default"})
+    monkeypatch.setattr(evaluation, "H3_SETTINGS", {"model": "a-future-default"})
+    run = EvaluationRun(run.path)
+    assert run.generation_tasks() == original_requests
+    run.generate(execute=True, concurrency=1)
+    assert all(body["model"] == "MiniMax-H3-Max" for _, body in client.posts)
+    assert all(body["extra"]["prompt_expansion_mode"] == "disabled" for _, body in client.posts)
+
+
+def test_tensorboard_scores_round_trip_at_training_step(prepared, tmp_path):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    run, _, _ = prepared
+    import_outputs(run)
+    run.generate(execute=True, concurrency=1)
+    add_judgments(run, run.comparison_inputs())
+    log_dir = tmp_path / "training-run"
+    report = run.report(tensorboard_dir=log_dir, step=250)
+    events = EventAccumulator(str(log_dir)).Reload()
+    assert report["tensorboard"]["log_dir"] == str(log_dir)
+    assert report["tensorboard"]["step"] == 250
+    for reference in ("prompt", "h3_context_ir"):
+        prefix = f"eval/prompt_rewrite/vs_{reference}"
+        for name, expected in (("moviegen", 0.0), ("aa_eval", 0.75), ("average", 0.375)):
+            points = events.Scalars(f"{prefix}/{name}")
+            assert len(points) == 1 and points[0].step == 250
+            assert points[0].value == pytest.approx(expected)
+        assert events.Scalars(f"{prefix}/coverage/moviegen")[0].value == 1
+    assert events.Scalars("eval/prompt_rewrite/complete")[0].value == 1
+
+
+def test_unscored_dataset_has_no_average_or_tensorboard_score(prepared):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    run, _, _ = prepared
+    import_outputs(run)
+    run.generate(execute=True, concurrency=1)
+    manifests = run.comparison_inputs()
+    pair_id = next(
+        key
+        for key, pair in manifests["original"]["pairs"].items()
+        if pair["prompt_id"] == "sample:2" and pair["reference"] == "prompt"
+    )
+    add_judgments(run, manifests, omit=("swapped", pair_id))
+    report = run.report(allow_partial=True)
+    assert report["comparisons"]["prompt"]["scores"] == {"moviegen": None, "aa_eval": 0.75, "average": None}
+    events = EventAccumulator(report["tensorboard"]["log_dir"]).Reload()
+    tags = events.Tags()["scalars"]
+    assert "eval/prompt_rewrite/vs_prompt/moviegen" not in tags
+    assert "eval/prompt_rewrite/vs_prompt/average" not in tags
+    assert events.Scalars("eval/prompt_rewrite/vs_prompt/coverage/moviegen")[0].value == 0
+    assert events.Scalars("eval/prompt_rewrite/complete")[0].value == 0
+
+
+def test_rewriter_receives_no_teacher_and_resumes(prepared):
+    run, _, _ = prepared
+    calls = []
+
+    def policy(messages):
+        calls.extend(messages)
+        assert "SECRET" not in json.dumps(messages)
+        assert all([m["role"] for m in conversation] == ["system", "user"] for conversation in messages)
+        return [rewrite.RewriteResult("Some visual directions.") for _ in messages]
+
+    run.rewrite(execute=True, rewriter=policy, batch_size=2)
+    assert len(calls) == 3
+    run.rewrite(execute=True, rewriter=policy)
+    assert len(calls) == 3
+    assert build_messages("original")[-1] == {"role": "user", "content": "original"}
+
+
+@pytest.mark.parametrize("bad", ["empty", "duplicate", "unknown", "wrong_prompt", "truncated", "aborted"])
+def test_import_validation_before_any_generation(prepared, bad):
+    run, client, _ = prepared
+    rows = [{"id": sample["id"], "rewritten_prompt": "rewrite"} for sample in run.protocol["samples"]]
+    if bad == "empty":
+        rows[0]["rewritten_prompt"] = " "
+    elif bad == "duplicate":
+        rows.append(rows[0])
+    elif bad == "unknown":
+        rows[0]["id"] = "wrong-id"
+    elif bad == "wrong_prompt":
+        rows[0]["prompt"] = "different original"
+    elif bad == "truncated":
+        rows[0]["finish_reason"] = "length"
+    else:
+        rows[0]["finish_reason"] = "abort"
+    with pytest.raises(ValueError):
+        run.import_rewrites(rows)
+    assert client.posts == []
+    assert run.status()["rewrites_complete"] == 0
+
+
+def test_unknown_submission_is_never_reposted(prepared):
+    run, client, _ = prepared
+    import_outputs(run)
+    task = run.generation_tasks()[0]
+    client.fail_post = True
+    args = (task, client, HOST, {}, lambda _: MEDIA, h3.media_profile(MEDIA))
+    assert not h3.generate_one(*args)
+    assert read_json(Path(task["state"]))["status"] == "submit_unknown"
+    client.fail_post = False
+    assert not h3.generate_one(*args)
+    assert len(client.posts) == 1
+
+
+def test_poll_failure_resumes_accepted_task_and_missing_download(prepared):
+    run, client, _ = prepared
+    import_outputs(run)
+    task = run.generation_tasks()[0]
+    args = (task, client, HOST, {}, lambda _: MEDIA, h3.media_profile(MEDIA))
+    client.fail_query = True
+    assert not h3.generate_one(*args)
+    assert read_json(Path(task["state"]))["task_id"] == "1"
+    client.fail_query = False
+    assert h3.generate_one(*args)
+    Path(task["output"]).unlink()
+    assert h3.generate_one(*args)
+    assert len(client.posts) == 1
+
+
+def test_process_death_during_submission_is_not_reposted(prepared, monkeypatch):
+    run, client, _ = prepared
+    import_outputs(run)
+    task = run.generation_tasks()[0]
+
+    def die(*args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(client, "post_json", die)
+    args = (task, client, HOST, {}, lambda _: MEDIA, h3.media_profile(MEDIA))
+    with pytest.raises(KeyboardInterrupt):
+        h3.generate_one(*args)
+    assert read_json(Path(task["state"]))["status"] == "submitting"
+    assert not h3.generate_one(*args)
+
+
+def test_partial_report_does_not_turn_missing_votes_into_half_points(prepared):
+    run, _, _ = prepared
+    import_outputs(run)
+    run.generate(execute=True, concurrency=1)
+    manifests = run.comparison_inputs()
+    pair_id = next(iter(manifests["original"]["pairs"]))
+    add_judgments(run, manifests, omit=("swapped", pair_id))
+    with pytest.raises(ValueError, match="lack both judgments"):
+        run.report()
+    partial = run.report(allow_partial=True)
+    assert partial["complete"] is False
+    assert len(partial["incomplete"]) == 1
+    reference = manifests["original"]["pairs"][pair_id]["reference"]
+    assert partial["comparisons"][reference]["overall"]["scored_prompts"] == 2
+
+
+@pytest.mark.parametrize("fragment", [b'{"status":"completed",', b'{"reason":"\xe2\x82'])
+def test_interrupted_judge_ledger_can_resume_without_losing_coverage(prepared, fragment):
+    run, _, _ = prepared
+    import_outputs(run)
+    run.generate(execute=True, concurrency=1)
+    manifests = run.comparison_inputs()
+    add_judgments(run, manifests)
+    path = run.path / "judge/judgments-swapped.jsonl"
+    rows = [json.loads(line) for line in path.read_bytes().splitlines()]
+    interrupted = rows.pop()
+    write_jsonl(path, rows)
+    with path.open("ab") as handle:
+        handle.write(fragment)
+    incomplete_bytes = path.read_bytes()
+    with pytest.raises(ValueError, match="lack both judgments"):
+        run.report(log_tensorboard=False)
+    partial = run.report(allow_partial=True, log_tensorboard=False)
+    assert partial["complete"] is False
+    assert len(partial["incomplete"]) == 1
+    assert partial["ledger_counts"]["swapped"]["malformed_lines"] == 1
+    assert path.read_bytes() == incomplete_bytes
+
+    # The upstream runner keeps the fragment, starts a new line, and retries
+    # the missing comparison. Reporting must accept the recovered judgment.
+    with path.open("ab") as handle:
+        handle.write(b"\n" + json.dumps(interrupted).encode() + b"\n")
+    resumed = run.report(log_tensorboard=False)
+    assert resumed["complete"] is True
+    assert resumed["ledger_counts"]["swapped"] == {"completed": 6, "malformed_lines": 1}
+    assert resumed["comparisons"]["prompt"]["scores"] == {"moviegen": 0.0, "aa_eval": 0.75, "average": 0.375}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("judge_model", "wrong-model"),
+        ("video_processing", "agentic"),
+        ("seed", 9),
+        ("manifest_sha256", "stale"),
+        ("preferred_model", "unknown"),
+    ],
+)
+def test_stale_or_mixed_judgments_are_rejected(prepared, field, value):
+    run, _, _ = prepared
+    import_outputs(run)
+    run.generate(execute=True, concurrency=1)
+    manifests = run.comparison_inputs()
+    add_judgments(run, manifests)
+    path = run.path / "judge/judgments-original.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0][field] = value
+    write_jsonl(path, rows)
+    with pytest.raises(ValueError):
+        run.report()
+
+
+def test_changed_reference_or_dependency_stops_before_api_calls(prepared):
+    run, client, _ = prepared
+    import_outputs(run)
+    dependency = Path(run.protocol["eval_repo"]) / EXTERNAL_FILES[0]
+    old = dependency.read_text()
+    dependency.write_text("changed implementation")
+    with pytest.raises(ValueError, match="External evaluator changed"):
+        run.generate(execute=True)
+    dependency.write_text(old)
+    reference = Path(run.protocol["samples"][0]["references"]["prompt"]["path"])
+    reference.write_bytes(b"changed clip")
+    with pytest.raises(ValueError, match="Frozen reference video changed"):
+        run.generate(execute=True)
+    assert client.posts == []
+
+
+def test_two_training_checkpoints_share_references_not_candidate_artifacts(prepared, tmp_path):
+    run, _, _ = prepared
+    config = evaluation.RewriteConfig(model="/checkpoints/sft/epoch-1")
+    sft = EvaluationRun.prepare(
+        tmp_path / "sft",
+        name="sft-epoch-1",
+        config=config,
+        dataset=Path(run.protocol["dataset"]),
+        references=Path(run.protocol["reference_manifest"]).parent,
+        eval_repo=Path(run.protocol["eval_repo"]),
+    )
+    assert sft.protocol["samples"] == run.protocol["samples"]
+    assert sft.protocol["system_prompt"] == run.protocol["system_prompt"]
+    import_outputs(sft)
+    assert sft.status()["rewrites_complete"] == 3
+    assert run.status()["rewrites_complete"] == 0
+
+
+def test_cli_and_judge_command_are_dry_by_default(prepared):
+    run, client, _ = prepared
+    assert main(["rewrite", "--run-dir", str(run.path)]) == 0
+    assert run.status()["rewrites_complete"] == 0
+    import_outputs(run)
+    assert main(["generate", "--run-dir", str(run.path)]) == 0
+    assert client.posts == []
+    command = judge.command(run.path, run.protocol, "original", False, 8)
+    assert "--dry-run" in command and "--execute" not in command
+    assert command[command.index("--model") + 1] == "gemini-3.7-flash"
+    assert command[command.index("--thinking-level") + 1] == "high"
+    assert command[command.index("--video-processing") + 1] == "standard"
+    assert "--max-output-tokens" not in command
+
+
+def test_judge_attempts_swapped_order_after_original_errors(prepared, monkeypatch):
+    run, _, _ = prepared
+    attempted = []
+
+    def invoke(command, *, check):
+        manifest = Path(command[command.index("--manifest") + 1]).name
+        attempted.append(manifest)
+        return SimpleNamespace(returncode=1 if manifest == "manifest-original.json" else 0)
+
+    monkeypatch.setattr(judge.subprocess, "run", invoke)
+    with pytest.raises(RuntimeError, match="Incomplete judge passes: original"):
+        judge.run_judge(run.path, run.protocol, execute=True)
+    assert attempted == ["manifest-original.json", "manifest-swapped.json"]
+
+
+def test_score_is_invariant_to_display_order():
+    pair = {
+        "prompt_id": "sample",
+        "source": "aa_eval",
+        "reference": "prompt",
+        "model_A": CANDIDATE,
+        "model_B": "prompt",
+        "video_path_A": "a",
+        "video_path_B": "b",
+    }
+    a, b = {"preferred_model": CANDIDATE}, {"preferred_model": "prompt"}
+    first = scoring.score_pair(pair, a, b)
+    reversed_result = scoring.score_pair(judge.swap_pair(pair), b, a)
+    assert first["score"] == reversed_result["score"] == 0.5
+    assert first["candidate_first_win"] == reversed_result["candidate_first_win"]
+    assert first["candidate_second_win"] == reversed_result["candidate_second_win"]
+
+
+def test_vllm_adapter_uses_token_ids_and_disabled_thinking(monkeypatch):
+    """Check the inference seam without importing a GPU runtime."""
+    captured = {}
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            captured["template"] = kwargs
+            return [1, 2, 3]
+
+    class Engine:
+        def __init__(self, **kwargs):
+            captured["engine"] = kwargs
+
+        def get_tokenizer(self):
+            return Tokenizer()
+
+        def generate(self, prompts, params, **kwargs):
+            captured["prompts"] = prompts
+            return [SimpleNamespace(outputs=[SimpleNamespace(text="rewrite", finish_reason="stop", token_ids=[4, 5])])]
+
+    monkeypatch.setitem(__import__("sys").modules, "vllm", SimpleNamespace(LLM=Engine, SamplingParams=lambda **kw: kw))
+    output = rewrite.VLLMRewriter(evaluation.RewriteConfig())([build_messages("original")])
+    assert output == [rewrite.RewriteResult("rewrite", "stop", 2)]
+    assert captured["template"] == {
+        "tokenize": True,
+        "return_dict": False,
+        "add_generation_prompt": True,
+        "enable_thinking": False,
+    }
+    assert captured["prompts"] == [{"prompt_token_ids": [1, 2, 3]}]
+
+
+def test_duplicate_votes_cannot_inflate_score(prepared):
+    run, _, _ = prepared
+    import_outputs(run)
+    run.generate(execute=True, concurrency=1)
+    manifests = run.comparison_inputs()
+    add_judgments(run, manifests)
+    path = run.path / "judge/judgments-original.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    write_jsonl(path, rows + [copy.deepcopy(rows[0])])
+    with pytest.raises(ValueError, match="duplicate completed pair"):
+        run.report()
