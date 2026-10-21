@@ -299,10 +299,26 @@ class EvaluationRun:
         judge.freeze_manifests(self.path, manifests)
         return manifests
 
-    def judge(self, *, execute: bool = False, concurrency: int = JUDGE_CONCURRENCY):
+    def judge(
+        self,
+        *,
+        execute: bool = False,
+        concurrency: int = JUDGE_CONCURRENCY,
+        neutral_on_failure: bool = False,
+        request_timeout_seconds: float = judge.REQUEST_TIMEOUT_SECONDS,
+        pass_timeout_seconds: float = judge.PASS_TIMEOUT_SECONDS,
+    ):
         with run_lock(self.path):
             self.comparison_inputs()
-            judge.run_judge(self.path, self.protocol, execute, concurrency)
+            judge.run_judge(
+                self.path,
+                self.protocol,
+                execute,
+                concurrency,
+                neutral_on_failure=neutral_on_failure,
+                request_timeout_seconds=request_timeout_seconds,
+                pass_timeout_seconds=pass_timeout_seconds,
+            )
 
     def report(
         self,

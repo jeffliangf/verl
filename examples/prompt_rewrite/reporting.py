@@ -28,7 +28,10 @@ def print_report(report: dict):
         coverage = []
         for name, source in SCORE_SOURCES.items():
             group = groups["by_source"].get(source, {})
-            coverage.append(f"{name} {group.get('scored_prompts', 0)}/{group.get('expected_prompts', 0)}")
+            coverage.append(
+                f"{name} {group.get('scored_prompts', 0)}/{group.get('expected_prompts', 0)}"
+                f" ({group.get('fallback_prompts', 0)} neutral fallbacks)"
+            )
         print(f"Scored vs {reference}: {', '.join(coverage)}")
 
 
@@ -39,13 +42,18 @@ def tensorboard_scalars(report: dict) -> dict[str, float]:
     unavailable scores are omitted rather than logged as zero.
     """
     metrics = {"eval/prompt_rewrite/complete": float(report["complete"])}
+    metrics["eval/prompt_rewrite/judging_complete"] = float(report.get("judging_complete", report["complete"]))
     for reference, groups in report["comparisons"].items():
         prefix = f"eval/prompt_rewrite/vs_{reference}"
         for name, value in groups["scores"].items():
             if value is not None:
                 metrics[f"{prefix}/{name}"] = value
         for name, source in SCORE_SOURCES.items():
-            metrics[f"{prefix}/coverage/{name}"] = groups["by_source"].get(source, {}).get("coverage", 0.0)
+            group = groups["by_source"].get(source, {})
+            metrics[f"{prefix}/coverage/{name}"] = group.get("coverage", 0.0)
+            metrics[f"{prefix}/judged_coverage/{name}"] = group.get("judged_coverage", group.get("coverage", 0.0))
+            metrics[f"{prefix}/fallback_prompts/{name}"] = group.get("fallback_prompts", 0)
+            metrics[f"{prefix}/fallback_judgments/{name}"] = group.get("fallback_judgments", 0)
     return metrics
 
 

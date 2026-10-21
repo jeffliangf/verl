@@ -52,6 +52,7 @@ def parse_args(argv=None):
         "tensor_parallel_size",
         "max_model_len",
         "gpu_memory_utilization",
+        "backend",
     ):
         default = getattr(RewriteConfig(), field)
         prepare.add_argument(
@@ -70,6 +71,10 @@ def parse_args(argv=None):
             )
         if stage == "generate":
             command.add_argument("--poll-interval", type=float, default=20)
+        if stage == "judge":
+            command.add_argument("--neutral-on-failure", action="store_true")
+            command.add_argument("--request-timeout-seconds", type=float, default=300)
+            command.add_argument("--pass-timeout-seconds", type=float, default=1800)
         if stage == "benchmark-references":
             command.add_argument("--source-run", type=Path, required=True, help="Run whose reference videos to compare")
             command.add_argument("--name", default="h3-context-ir-vs-prompt")
@@ -131,7 +136,13 @@ def main(argv=None) -> int:
                 print(json.dumps(result, indent=2))
                 return int(args.execute and result["video_statuses"].get("succeeded", 0) != result["prompts"])
             elif args.stage == "judge":
-                run.judge(execute=args.execute, concurrency=args.concurrency)
+                run.judge(
+                    execute=args.execute,
+                    concurrency=args.concurrency,
+                    neutral_on_failure=args.neutral_on_failure,
+                    request_timeout_seconds=args.request_timeout_seconds,
+                    pass_timeout_seconds=args.pass_timeout_seconds,
+                )
                 return 0
             elif args.stage == "report":
                 result = run.report(

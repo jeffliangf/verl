@@ -150,6 +150,86 @@ def import_outputs(run):
     )
 
 
+def test_prepare_cli_keeps_vllm_as_default_backend(prepared, tmp_path):
+    run, _, _ = prepared
+    destination = tmp_path / "cli-run"
+    assert (
+        main(
+            [
+                "prepare",
+                "--run-dir",
+                str(destination),
+                "--dataset",
+                run.protocol["dataset"],
+                "--references",
+                str(Path(run.protocol["reference_manifest"]).parent),
+                "--eval-repo",
+                run.protocol["eval_repo"],
+            ]
+        )
+        == 0
+    )
+    assert EvaluationRun(destination).protocol["rewriter"]["backend"] == "vllm"
+
+
+def test_resident_epoch_pipeline_reuses_model_and_completed_work(prepared, monkeypatch, tmp_path):
+    from contextlib import nullcontext
+
+    from examples.prompt_rewrite import resident
+
+    torch = pytest.importorskip("torch")
+    original, client, _ = prepared
+    model = torch.nn.Linear(1, 1)
+    calls = []
+    settings = SimpleNamespace(
+        run_dir=str(tmp_path / "sft"),
+        dataset=original.protocol["dataset"],
+        references=str(Path(original.protocol["reference_manifest"]).parent),
+        eval_repo=original.protocol["eval_repo"],
+        batch_size=1,
+        max_new_tokens=20,
+        max_model_len=128,
+        h3_concurrency=1,
+        judge_concurrency=1,
+    )
+    evaluator = resident.ResidentEvaluator.__new__(resident.ResidentEvaluator)
+    evaluator.trainer = SimpleNamespace(
+        engine=SimpleNamespace(module=model, eval_mode=nullcontext),
+        model_config=SimpleNamespace(tokenizer=SimpleNamespace(apply_chat_template=lambda *a, **k: [1, 2, 3])),
+        config=SimpleNamespace(video_eval=settings, trainer=SimpleNamespace(default_local_dir=str(tmp_path / "ckpt"))),
+    )
+    evaluator.settings, evaluator.native_forwards = settings, {}
+    evaluator.rank, evaluator.world, evaluator.control = 0, 1, None
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", lambda *a, **k: None)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", lambda output, local, **k: output.__setitem__(0, local))
+
+    def generate(loaded, tokenizer, conversations, config, **kwargs):
+        assert loaded is model and not loaded.training and not torch.is_grad_enabled()
+        assert config.backend == "hf_fsdp2"
+        assert all("SECRET teacher" not in m["content"] for c in conversations for m in c)
+        calls.append(conversations)
+        return [rewrite.RewriteResult("A complete rewritten prompt") for _ in conversations]
+
+    def judge_epoch(path, protocol, execute, concurrency, **kwargs):
+        assert kwargs["neutral_on_failure"]
+        if not (path / "judge/judgments-original.jsonl").exists():
+            run = EvaluationRun(path)
+            add_judgments(run, run.comparison_inputs())
+
+    monkeypatch.setattr(resident, "generate_batch", generate)
+    monkeypatch.setattr(judge, "run_judge", judge_epoch)
+    evaluator.evaluate(2)
+    evaluator.evaluate(2)
+    assert len(calls) == len(client.posts) == 3
+    assert model.training
+    evaluator.evaluate(4)
+    assert len(calls) == len(client.posts) == 6
+    first = read_json(tmp_path / "sft/eval/global_step_2/report.json")
+    second = read_json(tmp_path / "sft/eval/global_step_4/report.json")
+    assert first["tensorboard"]["step"] == 2 and second["tensorboard"]["step"] == 4
+    assert first["comparisons"]["prompt"]["scores"]["average"] == 0.375
+
+
 def add_judgments(run, manifests, *, omit=None):
     """Three prompts score 1, 0.5, 0 against each reference, independent of displayed side."""
     candidate = run.protocol.get("candidate_field", CANDIDATE)
@@ -597,6 +677,102 @@ def test_judge_attempts_swapped_order_after_original_errors(prepared, monkeypatc
     with pytest.raises(RuntimeError, match="Incomplete judge passes: original"):
         judge.run_judge(run.path, run.protocol, execute=True)
     assert attempted == ["manifest-original.json", "manifest-swapped.json"]
+
+
+def test_blocked_judgments_become_explicit_neutral_fallbacks_without_reposting(prepared, monkeypatch):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    run, _, _ = prepared
+    import_outputs(run)
+    run.generate(execute=True, concurrency=1)
+    manifests = run.comparison_inputs()
+    add_judgments(run, manifests)
+    originals = {}
+    for order in judge.ORDERS:
+        path = run.path / "judge" / f"judgments-{order}.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0].update(status="error", error_type="HttpFailure", error="HTTP 400: prohibited_content")
+        rows[0].pop("preferred_model")
+        rows[0].pop("preferred_video")
+        write_jsonl(path, rows)
+        originals[path] = path.read_bytes()
+    monkeypatch.setattr(judge.subprocess, "run", lambda *a, **k: pytest.fail("Completed work was reposted"))
+    run.judge(execute=True, neutral_on_failure=True)
+    run.judge(execute=True, neutral_on_failure=True)
+    report = run.report()
+    assert report["complete"] and not report["judging_complete"]
+    assert len(report["fallback_comparisons"]) == 1
+    overall = report["comparisons"]["prompt"]["overall"]
+    assert overall["points"] == 1.0
+    assert overall["fallback_prompts"] == 1 and overall["fallback_judgments"] == 2
+    assert overall["judged_coverage"] == pytest.approx(2 / 3)
+    assert all(path.read_bytes() == data for path, data in originals.items())
+    events = EventAccumulator(report["tensorboard"]["log_dir"]).Reload()
+    assert events.Scalars("eval/prompt_rewrite/vs_prompt/fallback_prompts/aa_eval")[0].value == 1
+
+
+def test_judge_hard_timeout_kills_hung_process_and_scores_neutral(prepared, monkeypatch):
+    import sys
+    import time
+
+    run, _, _ = prepared
+    import_outputs(run)
+    run.generate(execute=True, concurrency=1)
+    monkeypatch.setattr(judge, "command", lambda *a: [sys.executable, "-c", "import time; time.sleep(30)"])
+    started = time.monotonic()
+    run.judge(execute=True, neutral_on_failure=True, request_timeout_seconds=0.05, pass_timeout_seconds=0.1)
+    assert time.monotonic() - started < 5
+    report = run.report(log_tensorboard=False)
+    assert report["complete"] and not report["judging_complete"]
+    for group in report["comparisons"].values():
+        assert group["scores"] == {"moviegen": 0.5, "aa_eval": 0.5, "average": 0.5}
+        assert group["overall"]["fallback_prompts"] == 3
+        assert group["overall"]["judged_coverage"] == 0
+        assert group["overall"]["order_disagreement_rate"] is None
+
+
+def test_one_failed_order_scores_neutral_and_late_real_judgment_takes_precedence(prepared, monkeypatch):
+    run, _, _ = prepared
+    import_outputs(run)
+    run.generate(execute=True, concurrency=1)
+    manifests = run.comparison_inputs()
+    pair_id = next(iter(manifests["original"]["pairs"]))
+    add_judgments(run, manifests, omit=("swapped", pair_id))
+
+    def expire(args, *, check, timeout):
+        assert args[args.index("--request-timeout") + 1] == "300"
+        assert args[args.index("--file-timeout") + 1] == "300"
+        assert args[args.index("--max-attempts") + 1] == "1"
+        assert args[args.index("--pair-id") + 1] == pair_id
+        assert timeout == 1800
+        raise judge.subprocess.TimeoutExpired(args, timeout)
+
+    monkeypatch.setattr(judge.subprocess, "run", expire)
+    run.judge(execute=True, neutral_on_failure=True)
+    report = run.report(log_tensorboard=False)
+    assert report["comparisons"]["prompt"]["overall"]["points"] == 1.0
+    assert report["comparisons"]["prompt"]["overall"]["fallback_judgments"] == 1
+    add_judgments(run, manifests)
+    report = run.report(log_tensorboard=False)
+    assert report["judging_complete"] and not report["fallback_comparisons"]
+    assert report["comparisons"]["prompt"]["overall"]["points"] == 1.5
+
+
+def test_fatal_judge_setup_failure_is_not_replaced_with_neutral_scores(prepared, monkeypatch):
+    run, _, _ = prepared
+    import_outputs(run)
+    run.generate(execute=True, concurrency=1)
+    monkeypatch.setattr(judge.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
+    with pytest.raises(RuntimeError, match="Incomplete judge passes"):
+        run.judge(execute=True, neutral_on_failure=True)
+    assert not list((run.path / "judge").glob("fallbacks-*.json"))
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_judge_timeout_must_be_finite_and_positive(prepared, timeout):
+    run, _, _ = prepared
+    with pytest.raises(ValueError, match="timeouts must be positive"):
+        judge.run_judge(run.path, run.protocol, execute=True, neutral_on_failure=True, pass_timeout_seconds=timeout)
 
 
 def test_score_is_invariant_to_display_order():

@@ -33,6 +33,8 @@ class VLLMRewriter:
     """
 
     def __init__(self, config: RewriteConfig):
+        if config.backend != "vllm":
+            raise ValueError("This run uses resident FSDP2 inference; resume it through the SFT launcher")
         self.config = config
         self.engine = None
 

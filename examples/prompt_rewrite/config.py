@@ -62,6 +62,8 @@ class RewriteConfig:
     max_model_len: int = 8192
     gpu_memory_utilization: float = 0.85
 
+    backend: str = "vllm"
+
     def __post_init__(self):
         if not self.model.strip():
             raise ValueError("A model ID or checkpoint path is required")
@@ -71,6 +73,8 @@ class RewriteConfig:
             raise ValueError("Temperature must be nonnegative and tensor parallel size positive")
         if not 0 < self.gpu_memory_utilization < 1:
             raise ValueError("GPU memory utilization must be between 0 and 1")
+        if self.backend not in {"vllm", "hf_fsdp2"}:
+            raise ValueError("Unknown rewrite backend")
 
 
 def build_messages(

@@ -18,6 +18,24 @@ from .config import CANDIDATE, REFERENCE_FIELDS, SCORE_SOURCES
 
 def score_pair(pair: dict, original: dict, swapped: dict, *, candidate: str = CANDIDATE) -> dict:
     """Each order contributes half a point; disagreement is a split, not a judge tie."""
+    fallback_orders = [
+        order for order, row in (("original", original), ("swapped", swapped)) if row.get("status") == "fallback"
+    ]
+    if fallback_orders:
+        return {
+            "id": pair["prompt_id"],
+            "source": pair["source"],
+            "reference": pair["reference"],
+            "score": 0.5,
+            "outcome": "fallback",
+            "fallback_orders": fallback_orders,
+            "candidate_first_win": None,
+            "candidate_second_win": None,
+            "original_winner": original.get("preferred_model"),
+            "swapped_winner": swapped.get("preferred_model"),
+            "original_reason": original.get("reason"),
+            "swapped_reason": swapped.get("reason"),
+        }
     winners = [original["preferred_model"], swapped["preferred_model"]]
     if any(winner not in (candidate, pair["reference"]) for winner in winners):
         raise ValueError("Unexpected winner in a candidate/reference comparison")
@@ -49,6 +67,10 @@ def summarize(rows: list[dict], expected: int, bootstrap_rounds: int = 2000, see
         "scored_prompts": n,
         "incomplete_prompts": expected - n,
         "coverage": n / expected if expected else 0.0,
+        "judged_prompts": n - counts["fallback"],
+        "judged_coverage": (n - counts["fallback"]) / expected if expected else 0.0,
+        "fallback_prompts": counts["fallback"],
+        "fallback_judgments": sum(len(row.get("fallback_orders", [])) for row in rows),
         "wins": counts["win"],
         "splits": counts["split"],
         "losses": counts["loss"],
@@ -62,6 +84,7 @@ def summarize(rows: list[dict], expected: int, bootstrap_rounds: int = 2000, see
     if not n:
         return result
     scores = [row["score"] for row in rows]
+    judged = [row for row in rows if row["outcome"] != "fallback"]
     rng = random.Random(seed)
     bootstrap = sorted(sum(rng.choices(scores, k=n)) / n for _ in range(bootstrap_rounds))
     result.update(
@@ -70,9 +93,9 @@ def summarize(rows: list[dict], expected: int, bootstrap_rounds: int = 2000, see
             bootstrap[int(0.025 * (bootstrap_rounds - 1))],
             bootstrap[int(0.975 * (bootstrap_rounds - 1))],
         ],
-        order_disagreement_rate=counts["split"] / n,
-        candidate_first_win_rate=sum(row["candidate_first_win"] for row in rows) / n,
-        candidate_second_win_rate=sum(row["candidate_second_win"] for row in rows) / n,
+        order_disagreement_rate=counts["split"] / len(judged) if judged else None,
+        candidate_first_win_rate=sum(row["candidate_first_win"] for row in judged) / len(judged) if judged else None,
+        candidate_second_win_rate=sum(row["candidate_second_win"] for row in judged) / len(judged) if judged else None,
     )
     return result
 
@@ -124,8 +147,17 @@ def make_report(protocol: dict, manifests: dict, judgments: dict, allow_partial:
     return {
         "candidate": protocol["name"],
         "complete": not incomplete,
+        "judging_complete": not incomplete and all(row["outcome"] != "fallback" for row in rows),
         "judge": protocol["judge"],
-        "scoring": "1 for two wins, 0.5 for split orders, 0 for two losses; incomplete pairs unscored",
+        "scoring": (
+            "1 for two wins, 0.5 for split orders or an explicit failure fallback, "
+            "0 for two losses; missing pairs unscored"
+        ),
+        "fallback_comparisons": [
+            {key: row[key] for key in ("id", "reference", "fallback_orders")}
+            for row in rows
+            if row["outcome"] == "fallback"
+        ],
         "average_definition": "(moviegen + aa_eval) / 2; equal dataset weights",
         "comparisons": comparisons,
         "incomplete": incomplete,

@@ -31,6 +31,7 @@ text are excluded from its request by the existing evaluator.
 | `evaluation.py` | `EvaluationRun`, the reusable orchestration API |
 | `storage.py` | Atomic files, immutable inputs, and run locking |
 | `__main__.py` | Thin CLI for each stage |
+| `sft.py`, `train.py`, `resident.py` | SFT launcher and video evaluation using the resident model after every epoch |
 
 Video generation, judging, and scoring use the Python standard library.
 TensorBoard logging uses the lightweight `tensorboard` package, already included
@@ -162,6 +163,22 @@ Against **each** reference, each prompt contributes 1 point for two candidate
 wins, 0.5 for disagreement between orders, or 0 for two candidate losses. The
 dataset score is total points / completed prompts in that dataset. Split orders
 do not receive random tie breaking.
+
+SFT evaluation enables an explicit neutral fallback policy: if either presentation
+order fails or times out, that prompt/reference comparison scores **0.5**. Each
+request has a 300-second timeout, uploads/file processing use the same limit,
+and each presentation-order pass has a hard 1,800-second process deadline.
+There is one request attempt. A hung judging process is terminated before missing
+results are recorded. Standalone judging opts in with `judge --neutral-on-failure`;
+`--request-timeout-seconds` and `--pass-timeout-seconds` override these limits.
+
+Fallbacks are stored in separate `judge/fallbacks-<order>.json` files, with the
+policy in `judge/failure-policy.json`. Original Gemini ledgers remain unchanged.
+Completed judgments and recorded fallbacks are reused without repeating API calls.
+The report distinguishes `fallback_prompts`, `fallback_judgments`, and
+`judged_coverage` from score coverage. `complete` means every comparison is
+accounted for; `judging_complete` additionally requires no fallback scores.
+TensorBoard logs these counts and actual judging coverage alongside the scores.
 
 By default every evaluation reports **three scores against each reference**:
 MovieGen, AA eval, and **average = (MovieGen + AA eval) / 2**. The average gives
@@ -331,12 +348,14 @@ These inspection files are refreshed whenever the converter runs.
 Every Parquet row has `id`, `source`, `split`, `enable_thinking=false`, and
 `messages`: the shared system prompt, the rewrite task instruction and original
 request in one user message, then the assistant's `h3_context_ir` target. Teacher
-text appears only in the assistant turn. The standard dataset applies the chat
-template and assistant-only loss.
+text appears only in the assistant turn. The example's `PromptRewriteSFTDataset`
+renders the complete conversation with the training tokenizer, verifies that it
+starts with the exact inference prompt, and applies loss only after that prefix.
+This avoids rendering isolated system turns, which the Qwen template rejects.
 Reference video paths remain in the evaluation JSONL and are not SFT inputs.
 
 The `configs/sft.yaml` preset inherits verl's standard SFT trainer and sets both
-thinking controls to false, `data.max_length=8192`, `data.truncation=error`, and
+thinking controls to false, `data.max_length=4096`, `data.truncation=error`, and
 `data.pad_mode=no_padding`. From the repository root, in the training environment,
 select it with:
 
@@ -349,28 +368,104 @@ torchrun --standalone --nnodes=1 --nproc_per_node=<GPU_COUNT> \
 
 Choose the engine, batch size, optimizer, and any LoRA settings for your hardware;
 the preset supplies the data/template settings and Qwen3.8-27B model path.
-SFT validation computes teacher-forced loss on the same 200 examples after each
-epoch. Continue using the existing rewrite → H3 → judge → report workflow to
-measure video quality; the SFT trainer does not invoke that pipeline itself.
+SFT validation computes teacher-forced loss on 192 of the 200 examples after each
+epoch; the final incomplete batch is dropped. The plain verl trainer computes this loss only. Use the launcher below
+to also run rewrite → H3 → judge → report after every epoch.
 These 200 prompts stay out of both SFT and RL training.
 
 `data.max_length` limits the **complete tokenized conversation**, including the
 system/user messages, assistant target, and template tokens. It is not the output
 generation budget. `no_padding` keeps shorter sequences at their actual lengths.
-With dynamic batching, `data.max_token_len_per_gpu` controls the microbatch token
-budget; the preset defaults it to `${data.max_length}` so one full-length example
-fits that budget. Actual GPU memory capacity still determines viable batch sizes.
-Override `data.max_length=8192` on a training command to set this limit normally;
-in this preset the microbatch token budget follows it unless separately overridden.
+The preset uses fixed microbatches of one example per GPU, with dynamic batching
+disabled. On eight GPUs, eight microbatches accumulate into each global batch of 64.
+If enabled for a later run, `data.max_token_len_per_gpu` controls the dynamic
+microbatch token budget and defaults to `${data.max_length}`.
 The existing evaluation keeps its 8,192-token context and 2,048-token generation
 budget. Tokenize with the exact training tokenizer before launching a GPU job,
 and inspect assistant loss masks and the chat-template consistency check.
+
+### Train and evaluate after every epoch
+
+The launcher uses the prepared 3,000 training rows and 200 validation rows
+(100 AA eval, 100 MovieGen). Preview a three-epoch run without loading weights
+or calling either provider:
+
+```bash
+uv run --no-project --python 3.12 --with hydra-core --with pyarrow \
+  python -m examples.prompt_rewrite.sft \
+  --run-dir outputs/prompt_rewrite/qwen38-sft --nproc-per-node 8 --eval-before-training \
+  -- trainer.total_epochs=3
+```
+
+On the GPU worker, launch that run with:
+
+```bash
+uv run --frozen --extra fsdp python -m examples.prompt_rewrite.sft \
+  --run-dir outputs/prompt_rewrite/qwen38-sft --nproc-per-node 8 --eval-before-training --execute \
+  -- trainer.total_epochs=3
+```
+
+The preset uses full-model FSDP2, a global batch of 64, learning rate `2e-5`,
+10% warmup, cosine decay, and console/TensorBoard logging. Its default is one
+epoch; the commands above explicitly request three. The trainer's `drop_last=True`
+uses 2,944 training rows and 192 loss-validation rows: 46 updates per epoch,
+dropping 56 shuffled training rows and eight validation rows. The launcher reports
+these counts and requires at least one complete batch in each split. Override training
+settings after `--`; select a GPU count and memory settings suitable for the
+model. Resident generation currently supports FSDP2 with sequence parallel size 1.
+
+Before training, the launcher checks cohort separation and eval alignment, then
+tokenizes all conversations with the example's SFT reader to check length limits and
+assistant masks. Add `--check-tokens` to run this check during a preview in the
+training environment. Inputs and the resolved configuration are frozen in
+`<run-dir>/sft-inputs.json` so a restart cannot silently change the experiment.
+
+`--eval-before-training` (or `trainer.eval_before_training=true`) runs the full
+200-prompt video baseline immediately after loading the initial model, before any
+optimizer update. `--no-eval-before-training` disables it. A fresh run records the
+baseline at step 0 without exporting another copy of the base weights. On resume
+from a training checkpoint, evaluation uses that checkpoint's saved step instead
+of treating the trained weights as a step-0 baseline.
+
+After each epoch, the trainer validates loss and saves a resumable checkpoint
+plus HF weights. It then switches the **same loaded model** into eval mode and
+greedily generates the 200 rewrites with gradients disabled. Each GPU handles
+one prompt at a time by default (`video_eval.batch_size=1`), with synchronized
+FSDP generation across ranks. No vLLM instance or second copy of model weights
+is loaded. During generation, native HF forward methods replace verl's training
+methods temporarily so the HF cache interface works; the training methods are
+restored afterward. The optimizer and full-run learning-rate schedule stay in
+memory throughout. Each protocol records `rewriter.backend=hf_fsdp2`, since
+numerical results can differ between HF and vLLM inference.
+
+Rank zero sends the rewrites to H3 Max with prompt expansion disabled, judges
+both orders against both stored references, and reports AA eval, MovieGen, and
+their equal-weight average **against each reference**. This requires 200 new
+videos and 800 Gemini judgments per evaluation, including the optional baseline.
+All 200 video prompts are evaluated independently of the SFT loader's drop-last policy.
+Other ranks wait while these CPU/API
+stages run; training continues after the complete report is written.
+
+Reports live in `<run-dir>/eval/global_step_0/report.json` for the baseline, then
+steps 46, 92, and 138 for the three-epoch example. The scores and training loss share
+`tensorboard_log/prompt-rewrite/<run-directory-name>` and the corresponding
+global training steps. `--tensorboard-dir` or `TENSORBOARD_DIR` overrides that
+location. Use `--references`, `--dataset`, or `--eval-repo` for other local inputs.
+
+Rerun the same command to resume. If generation or judging was interrupted, the
+trainer restores the saved epoch, completes its evaluation using existing
+artifacts, and then starts the next epoch. Incomplete comparisons stop the run;
+API errors and timeouts handled by the explicit neutral policy allow training
+to continue. Missing results without an error or timeout, invalid artifacts,
+and setup failures still stop the run. A changed training configuration requires
+a new run directory.
 
 ## Local verification
 
 ```bash
 uv run --no-project --python 3.12 --with pytest --with tensorboard==2.20.0 \
-  --with pandas --with pyarrow python -m pytest tests/special_standalone/prompt_rewrite -q
+  --with pandas --with pyarrow --with hydra-core \
+  python -m pytest tests/special_standalone/prompt_rewrite -q
 
 uv run --no-project --python 3.12 --with ruff==0.12.2 ruff check \
   examples/prompt_rewrite tests/special_standalone/prompt_rewrite
@@ -379,4 +474,8 @@ uv run --no-project --python 3.12 --with ruff==0.12.2 ruff check \
 The tests use fake inference and HTTP transports to check the complete workflow,
 teacher-input isolation, A/B reversal and scoring, missing/duplicate votes,
 checkpoint isolation, frozen-input validation, and H3 crash recovery. Actual
-Qwen inference and live provider calls require a separate smoke run.
+GPU training and live provider calls require a separate smoke run. In a verl
+environment with PyTorch/Transformers, `test_resident_on_cpu.py` additionally
+checks cached generation using a tiny random Qwen model, unchanged parameter
+storage, and restoration of the training forward methods. It skips in the
+lightweight environment above.

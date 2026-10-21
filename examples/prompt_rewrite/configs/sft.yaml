@@ -12,7 +12,19 @@ data:
   # The same 200 prompts used by examples.prompt_rewrite video evaluation.
   val_files: data/prompt_rewrite_sft/val.parquet
 
+  # Keep the trainer's drop_last behavior: 2,944 train and 192 validation rows.
+  # Video evaluation independently uses all 200 prompts.
+  train_batch_size: 64
+
+  micro_batch_size_per_gpu: 1
+
   messages_key: messages
+
+  # Render full conversations; Qwen's template rejects a standalone system turn.
+  custom_cls:
+    path: pkg://examples.prompt_rewrite.sft_dataset
+
+    name: PromptRewriteSFTDataset
 
   enable_thinking_default: false
 
@@ -21,7 +33,7 @@ data:
     enable_thinking: false
 
   # Count the complete conversation, including chat-template tokens.
-  max_length: 8192
+  max_length: 4096
 
   # Reject overlong examples instead of cutting off a target.
   truncation: error
@@ -29,9 +41,9 @@ data:
   # Short examples retain their actual length.
   pad_mode: no_padding
 
-  use_dynamic_bsz: true
+  use_dynamic_bsz: false
 
-  # Total tokens in a dynamic microbatch; accommodate one full-length example.
+  # Only used if dynamic microbatching is enabled in a future run.
   max_token_len_per_gpu: ${data.max_length}
 
   ignore_input_ids_mismatch: false
@@ -39,11 +51,57 @@ data:
 model:
   path: Qwen/Qwen3.8-27B
 
+engine:
+  strategy: fsdp2
+
+  use_torch_compile: false
+
+optim:
+  lr: 2.0e-5
+
+  lr_warmup_steps_ratio: 0.1
+
+  lr_scheduler_type: cosine
+
+checkpoint:
+  # Export HF weights as well as resumable training state.
+  save_contents: [model, optimizer, extra, hf_model]
+
+  load_contents: [model, optimizer, extra]
+
 trainer:
   project_name: prompt-rewrite-sft
 
   experiment_name: qwen38-27b
 
+  total_epochs: 1
+
+  # Evaluate the initially loaded model before its first optimizer update.
+  eval_before_training: false
+
+  logger: [console, tensorboard]
+
   test_freq: after_each_epoch
 
   save_freq: after_each_epoch
+
+# Consumed by examples.prompt_rewrite.train, after each epoch checkpoint.
+video_eval:
+  run_dir: outputs/prompt_rewrite/${trainer.experiment_name}
+
+  dataset: data/prompt_rewrite_aa_moviegen_eval_200.jsonl
+
+  references: data/prompt_rewrite_h3_eval/outputs_h3max_disabled_768p
+
+  eval_repo: ${oc.env:HOME}/video-generation-eval
+
+  # Resident FSDP2 generation uses this many prompts per GPU.
+  batch_size: 1
+
+  max_new_tokens: 2048
+
+  max_model_len: 8192
+
+  h3_concurrency: 500
+
+  judge_concurrency: 500
