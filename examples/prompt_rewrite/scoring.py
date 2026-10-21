@@ -14,6 +14,7 @@ import random
 from collections import Counter
 
 from .config import CANDIDATE, REFERENCE_FIELDS, SCORE_SOURCES
+from .storage import item_key
 
 
 def score_pair(pair: dict, original: dict, swapped: dict, *, candidate: str = CANDIDATE) -> dict:
@@ -28,6 +29,7 @@ def score_pair(pair: dict, original: dict, swapped: dict, *, candidate: str = CA
             "reference": pair["reference"],
             "score": 0.5,
             "outcome": "fallback",
+            "fallback_stage": "gemini",
             "fallback_orders": fallback_orders,
             "candidate_first_win": None,
             "candidate_second_win": None,
@@ -70,6 +72,8 @@ def summarize(rows: list[dict], expected: int, bootstrap_rounds: int = 2000, see
         "judged_prompts": n - counts["fallback"],
         "judged_coverage": (n - counts["fallback"]) / expected if expected else 0.0,
         "fallback_prompts": counts["fallback"],
+        "h3_fallback_prompts": sum(row.get("fallback_stage") == "h3" for row in rows),
+        "gemini_fallback_prompts": sum(row.get("fallback_stage") == "gemini" for row in rows),
         "fallback_judgments": sum(len(row.get("fallback_orders", [])) for row in rows),
         "wins": counts["win"],
         "splits": counts["split"],
@@ -114,21 +118,55 @@ def dataset_scores(by_source: dict) -> dict[str, float | None]:
     return scores
 
 
-def make_report(protocol: dict, manifests: dict, judgments: dict, allow_partial: bool = False) -> tuple[dict, list]:
+def make_report(
+    protocol: dict,
+    manifests: dict,
+    judgments: dict,
+    allow_partial: bool = False,
+    *,
+    generation_fallbacks: dict | None = None,
+) -> tuple[dict, list]:
     """Report both references separately, overall and for each data source."""
     rows, incomplete = [], []
-    for pair_id, pair in manifests["original"]["pairs"].items():
-        if pair_id not in judgments["original"] or pair_id not in judgments["swapped"]:
-            incomplete.append({"id": pair["prompt_id"], "reference": pair["reference"]})
-            continue
-        rows.append(
-            score_pair(
-                pair,
-                judgments["original"][pair_id],
-                judgments["swapped"][pair_id],
-                candidate=protocol.get("candidate_field", CANDIDATE),
-            )
-        )
+    generation_fallbacks = generation_fallbacks or {}
+    if set(generation_fallbacks) - {sample["id"] for sample in protocol["samples"]}:
+        raise ValueError("Unknown H3 fallback prompt")
+    for sample in protocol["samples"]:
+        for reference in protocol.get("reference_fields", REFERENCE_FIELDS):
+            pair_id = item_key(sample["id"]) + "__vs_" + reference
+            pair = manifests["original"]["pairs"].get(pair_id)
+            if sample["id"] in generation_fallbacks:
+                fallback = generation_fallbacks[sample["id"]]
+                if pair is not None or fallback.get("score") != 0.5 or fallback.get("stage") != "h3":
+                    raise ValueError("H3 fallback conflicts with a candidate video or neutral policy")
+                rows.append(
+                    {
+                        "id": sample["id"],
+                        "source": sample["source"],
+                        "reference": reference,
+                        "score": 0.5,
+                        "outcome": "fallback",
+                        "fallback_stage": "h3",
+                        "fallback_orders": [],
+                        "candidate_first_win": None,
+                        "candidate_second_win": None,
+                        "original_winner": None,
+                        "swapped_winner": None,
+                        "original_reason": fallback["reason"],
+                        "swapped_reason": fallback["reason"],
+                    }
+                )
+            elif pair is None or pair_id not in judgments["original"] or pair_id not in judgments["swapped"]:
+                incomplete.append({"id": sample["id"], "reference": reference})
+            else:
+                rows.append(
+                    score_pair(
+                        pair,
+                        judgments["original"][pair_id],
+                        judgments["swapped"][pair_id],
+                        candidate=protocol.get("candidate_field", CANDIDATE),
+                    )
+                )
     if incomplete and not allow_partial:
         raise ValueError(f"{len(incomplete)} comparisons lack both judgments; resume judging or use --allow-partial")
     sources = Counter(sample["source"] for sample in protocol["samples"])
@@ -148,13 +186,17 @@ def make_report(protocol: dict, manifests: dict, judgments: dict, allow_partial:
         "candidate": protocol["name"],
         "complete": not incomplete,
         "judging_complete": not incomplete and all(row["outcome"] != "fallback" for row in rows),
+        "generation_complete": not generation_fallbacks,
+        "generation_fallbacks": [
+            {key: row[key] for key in ("id", "status", "reason")} for row in generation_fallbacks.values()
+        ],
         "judge": protocol["judge"],
         "scoring": (
             "1 for two wins, 0.5 for split orders or an explicit failure fallback, "
             "0 for two losses; missing pairs unscored"
         ),
         "fallback_comparisons": [
-            {key: row[key] for key in ("id", "reference", "fallback_orders")}
+            {key: row[key] for key in ("id", "reference", "fallback_orders", "fallback_stage")}
             for row in rows
             if row["outcome"] == "fallback"
         ],

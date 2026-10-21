@@ -216,7 +216,22 @@ def test_resident_epoch_pipeline_reuses_model_and_completed_work(prepared, monke
             run = EvaluationRun(path)
             add_judgments(run, run.comparison_inputs())
 
+    def h3_worker(args, *, check, timeout):
+        run = EvaluationRun(Path(args[args.index("--run-dir") + 1]))
+        results = h3.generate_tasks(
+            run.generation_tasks(),
+            client,
+            HOST,
+            {},
+            lambda _: MEDIA,
+            h3.media_profile(MEDIA),
+            concurrency=1,
+            timeout=timeout,
+        )
+        return SimpleNamespace(returncode=int(not all(results.values())))
+
     monkeypatch.setattr(resident, "generate_batch", generate)
+    monkeypatch.setattr(h3.subprocess, "run", h3_worker)
     monkeypatch.setattr(judge, "run_judge", judge_epoch)
     evaluator.evaluate(2)
     evaluator.evaluate(2)
@@ -773,6 +788,167 @@ def test_judge_timeout_must_be_finite_and_positive(prepared, timeout):
     run, _, _ = prepared
     with pytest.raises(ValueError, match="timeouts must be positive"):
         judge.run_judge(run.path, run.protocol, execute=True, neutral_on_failure=True, pass_timeout_seconds=timeout)
+
+
+def test_h3_rejection_scores_neutral_and_judges_only_existing_videos(prepared, monkeypatch):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    run, client, _ = prepared
+    import_outputs(run)
+    get = client.get_json
+
+    def query(url, headers):
+        if url.endswith("/3"):
+            return {"task": {"status": "failed", "error": {"code": "1027", "message": "output new_sensitive"}}}
+        return get(url, headers)
+
+    monkeypatch.setattr(client, "get_json", query)
+    assert run.generate(execute=True, concurrency=1)["video_statuses"] == {"succeeded": 2, "failed": 1}
+    task = run.generation_tasks()[-1]
+    original_state = Path(task["state"]).read_bytes()
+    monkeypatch.setattr(h3.subprocess, "run", lambda *a, **k: pytest.fail("Completed or rejected tasks were reposted"))
+    assert main(["generate", "--run-dir", str(run.path), "--execute", "--neutral-on-failure"]) == 0
+    status = run.generate(execute=True, neutral_on_failure=True)
+    assert status["video_fallbacks"] == 1 and status["videos_accounted_for"] == 3
+    assert len(client.posts) == 3 and Path(task["state"]).read_bytes() == original_state
+    assert not Path(task["output"]).exists()
+    manifests = run.comparison_inputs()
+    assert manifests["original"]["metadata"]["prompt_count"] == 2
+    assert all(len(manifest["pairs"]) == 4 for manifest in manifests.values())
+    assert all(pair["prompt_id"] != task["id"] for pair in manifests["original"]["pairs"].values())
+    add_judgments(run, manifests)
+    report = run.report(step=138)
+    assert report["complete"] and not report["generation_complete"] and not report["judging_complete"]
+    assert len(report["generation_fallbacks"]) == 1 and len(report["fallback_comparisons"]) == 2
+    for groups in report["comparisons"].values():
+        assert groups["scores"] == {"moviegen": 0.5, "aa_eval": 0.75, "average": 0.625}
+        assert groups["overall"]["coverage"] == 1 and groups["overall"]["judged_coverage"] == pytest.approx(2 / 3)
+        assert groups["overall"]["h3_fallback_prompts"] == 1
+        assert groups["overall"]["fallback_judgments"] == 0
+    events = EventAccumulator(report["tensorboard"]["log_dir"]).Reload()
+    assert events.Scalars("eval/prompt_rewrite/vs_prompt/h3_fallback_prompts/moviegen")[0].value == 1
+    # A changed state cannot silently replace a frozen fallback/cohort.
+    state = read_json(Path(task["state"]))
+    state["task_id"] = "different-job"
+    write_json(Path(task["state"]), state)
+    with pytest.raises(ValueError, match="state changed"):
+        run.report(log_tensorboard=False)
+
+
+def test_h3_hard_timeout_terminates_hung_worker_and_never_calls_gemini(prepared, monkeypatch, tmp_path):
+    import os
+    import sys
+    import time
+
+    run, client, _ = prepared
+    import_outputs(run)
+    pid_file = tmp_path / "hung-worker.pid"
+    program = (
+        "import os,time; from pathlib import Path; Path("
+        + repr(str(pid_file))
+        + ").write_text(str(os.getpid())); time.sleep(30)"
+    )
+    monkeypatch.setattr(h3, "worker_command", lambda *a: [sys.executable, "-c", program])
+    started = time.monotonic()
+    status = run.generate(execute=True, neutral_on_failure=True, pass_timeout_seconds=0.5)
+    assert time.monotonic() - started < 5
+    assert status["video_fallbacks"] == status["videos_accounted_for"] == 3
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+    monkeypatch.setattr(h3.subprocess, "run", lambda *a, **k: pytest.fail("Timed-out work was restarted"))
+    run.generate(execute=True, neutral_on_failure=True, pass_timeout_seconds=0.5)
+    monkeypatch.setattr(judge, "run_judge", lambda *a, **k: pytest.fail("Missing videos were sent to Gemini"))
+    run.judge(execute=True, neutral_on_failure=True)
+    report = run.report(log_tensorboard=False)
+    assert report["complete"] and not report["generation_complete"]
+    assert client.posts == []
+    for groups in report["comparisons"].values():
+        assert groups["scores"] == {"moviegen": 0.5, "aa_eval": 0.5, "average": 0.5}
+        assert groups["overall"]["h3_fallback_prompts"] == 3
+        assert groups["overall"]["judged_coverage"] == 0
+
+
+def test_h3_worker_setup_failure_is_not_scored_neutral(prepared, monkeypatch):
+    run, _, _ = prepared
+    import_outputs(run)
+    monkeypatch.setattr(h3.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
+    with pytest.raises(RuntimeError, match="incomplete without a recorded"):
+        run.generate(execute=True, neutral_on_failure=True)
+    assert not (run.path / "videos/fallbacks.json").exists()
+
+
+def test_h3_provider_timeout_is_neutral_without_retry(prepared, monkeypatch):
+    run, client, _ = prepared
+    import_outputs(run)
+    tasks = run.generation_tasks()
+
+    def timeout(*args):
+        raise TimeoutError("H3 query timed out")
+
+    monkeypatch.setattr(client, "get_json", timeout)
+    run.generate(execute=True, concurrency=1)
+    assert all(read_json(Path(task["state"]))["error_stage"] == "provider" for task in tasks)
+    monkeypatch.setattr(h3.subprocess, "run", lambda *a, **k: pytest.fail("Timeout was retried"))
+    status = run.generate(execute=True, neutral_on_failure=True)
+    assert status["video_fallbacks"] == 3
+
+
+def test_h3_generation_worker_completes_and_resumes_in_a_real_subprocess(prepared, tmp_path):
+    source, _, _ = prepared
+    repo = Path(source.protocol["eval_repo"])
+    posts = repo / "worker-posts.jsonl"
+    (repo / "scripts/generate_h3_repeats.py").write_text(
+        "from pathlib import Path\n"
+        "def load_env(): pass\n"
+        "def auth_headers(token): return {}\n"
+        "def post_json(url, headers, body):\n"
+        f"    with Path({str(posts)!r}).open('a') as f: f.write('submitted\\n')\n"
+        "    return {'task_id': 'test-job'}\n"
+        "def get_json(url, headers):\n"
+        "    return {'task': {'status': 'succeeded', 'content': {'url': 'https://video.invalid/clip'}}}\n"
+        "def download_video(url, path):\n"
+        "    path.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    path.write_bytes(b'candidate clip')\n"
+    )
+    (repo / "bestofn/normalize.py").write_text(f"def probe(path): return {MEDIA!r}\n")
+    run = EvaluationRun.prepare(
+        tmp_path / "subprocess-run",
+        dataset=Path(source.protocol["dataset"]),
+        references=Path(source.protocol["reference_manifest"]).parent,
+        eval_repo=repo,
+    )
+    import_outputs(run)
+    status = run.generate(execute=True, concurrency=1, neutral_on_failure=True, pass_timeout_seconds=15)
+    assert status["video_statuses"] == {"succeeded": 3} and status["video_fallbacks"] == 0
+    run.generate(execute=True, concurrency=1, neutral_on_failure=True, pass_timeout_seconds=15)
+    # Recover a missing local clip by querying its saved task ID, never by reposting.
+    Path(run.generation_tasks()[0]["output"]).unlink()
+    run.generate(execute=True, concurrency=1, neutral_on_failure=True, pass_timeout_seconds=15)
+    assert posts.read_text().splitlines() == ["submitted"] * 3
+    assert len(run.comparison_inputs()["original"]["pairs"]) == 6
+
+
+def test_h3_invalid_artifact_is_not_hidden_by_fallback(prepared):
+    run, client, _ = prepared
+    import_outputs(run)
+    task = run.generation_tasks()[0]
+
+    def invalid(_):
+        raise ValueError("invalid video container")
+
+    assert not h3.generate_one(task, client, HOST, {}, invalid, h3.media_profile(MEDIA))
+    assert read_json(Path(task["state"]))["error_stage"] == "artifact"
+    with pytest.raises(ValueError, match="Invalid H3 video artifact"):
+        run.generate(execute=True, neutral_on_failure=True)
+    assert not (run.path / "videos/fallbacks.json").exists()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_h3_timeout_must_be_finite_and_positive(prepared, timeout):
+    run, client, _ = prepared
+    with pytest.raises(ValueError, match="timeout must be positive and finite"):
+        run.generate(execute=True, neutral_on_failure=True, pass_timeout_seconds=timeout)
+    assert client.posts == []
 
 
 def test_score_is_invariant_to_display_order():

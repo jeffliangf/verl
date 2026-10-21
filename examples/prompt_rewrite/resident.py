@@ -244,8 +244,8 @@ class ResidentEvaluator:
             run = EvaluationRun(path)
             with run_lock(path):
                 export_rewrites(path, run.protocol)
-            status = run.generate(execute=True, concurrency=settings.h3_concurrency)
-            if status["video_statuses"].get("succeeded", 0) != status["prompts"]:
+            status = run.generate(execute=True, concurrency=settings.h3_concurrency, neutral_on_failure=True)
+            if status["videos_accounted_for"] != status["prompts"]:
                 raise RuntimeError("Candidate videos are incomplete; inspect state files and resume this run")
             run.judge(execute=True, concurrency=settings.judge_concurrency, neutral_on_failure=True)
             report = run.report(step=step)

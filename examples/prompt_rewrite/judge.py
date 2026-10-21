@@ -38,6 +38,8 @@ def build_manifests(protocol: dict, candidate_videos: dict[str, dict]) -> dict[s
     candidate = protocol.get("candidate_field", CANDIDATE)
     pairs = {}
     for sample in protocol["samples"]:
+        if sample["id"] not in candidate_videos:
+            continue
         for reference in protocol.get("reference_fields", REFERENCE_FIELDS):
             pair_id = item_key(sample["id"]) + "__vs_" + reference
             pair = {
@@ -59,7 +61,7 @@ def build_manifests(protocol: dict, candidate_videos: dict[str, dict]) -> dict[s
         "instructions_how_to_compare": protocol["rubric"],
         "metadata": {
             "pair_count": len(pairs),
-            "prompt_count": len(protocol["samples"]),
+            "prompt_count": len(candidate_videos),
             "excluded_models": [],
             "candidate_label": protocol["name"],
         },

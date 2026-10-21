@@ -71,10 +71,11 @@ def parse_args(argv=None):
             )
         if stage == "generate":
             command.add_argument("--poll-interval", type=float, default=20)
-        if stage == "judge":
+        if stage in ("generate", "judge"):
             command.add_argument("--neutral-on-failure", action="store_true")
-            command.add_argument("--request-timeout-seconds", type=float, default=300)
             command.add_argument("--pass-timeout-seconds", type=float, default=1800)
+        if stage == "judge":
+            command.add_argument("--request-timeout-seconds", type=float, default=300)
         if stage == "benchmark-references":
             command.add_argument("--source-run", type=Path, required=True, help="Run whose reference videos to compare")
             command.add_argument("--name", default="h3-context-ir-vs-prompt")
@@ -131,10 +132,14 @@ def main(argv=None) -> int:
                 result = run.import_rewrites(read_jsonl(args.input.expanduser()))
             elif args.stage == "generate":
                 result = run.generate(
-                    execute=args.execute, concurrency=args.concurrency, poll_interval=args.poll_interval
+                    execute=args.execute,
+                    concurrency=args.concurrency,
+                    poll_interval=args.poll_interval,
+                    neutral_on_failure=args.neutral_on_failure,
+                    pass_timeout_seconds=args.pass_timeout_seconds,
                 )
                 print(json.dumps(result, indent=2))
-                return int(args.execute and result["video_statuses"].get("succeeded", 0) != result["prompts"])
+                return int(args.execute and result["videos_accounted_for"] != result["prompts"])
             elif args.stage == "judge":
                 run.judge(
                     execute=args.execute,

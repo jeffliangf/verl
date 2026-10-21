@@ -13,6 +13,7 @@
 import os
 from collections import Counter
 from dataclasses import asdict
+from math import isfinite
 from pathlib import Path
 
 from . import h3, judge, reporting, rewrite, scoring
@@ -180,6 +181,8 @@ class EvaluationRun:
             **summary,
             "rewrites_complete": len(records),
             "video_statuses": dict(statuses),
+            "video_fallbacks": len(h3.read_fallbacks(self.path, self.protocol)),
+            "videos_accounted_for": statuses["succeeded"] + len(h3.read_fallbacks(self.path, self.protocol)),
             "planned_new_videos": n,
             "planned_judgments": 4 * n,
         }
@@ -233,7 +236,17 @@ class EvaluationRun:
         freeze_json(self.path / "generation.json", tasks)
         return tasks
 
-    def generate(self, *, execute: bool = False, concurrency: int = H3_CONCURRENCY, poll_interval: float = 20):
+    def generate(
+        self,
+        *,
+        execute: bool = False,
+        concurrency: int = H3_CONCURRENCY,
+        poll_interval: float = 20,
+        neutral_on_failure: bool = False,
+        pass_timeout_seconds: float = h3.PASS_TIMEOUT_SECONDS,
+    ):
+        if not isfinite(pass_timeout_seconds) or pass_timeout_seconds <= 0:
+            raise ValueError("H3 timeout must be positive and finite")
         with run_lock(self.path):
             self.check_dependencies()
             verify_references(self.protocol["samples"])
@@ -248,22 +261,33 @@ class EvaluationRun:
                     raise ValueError("Set H3_HOST/H3_TOKEN in the environment or eval repo's arena/.env")
                 if host != self.protocol["h3_host"]:
                     raise ValueError("H3 host differs from the frozen reference generation host")
-                h3.generate_tasks(
-                    tasks,
-                    client,
-                    host,
-                    client.auth_headers(token),
-                    load_external(repo / "bestofn/normalize.py").probe,
-                    self.protocol["media_profile"],
-                    concurrency,
-                    poll_interval,
-                )
+                if neutral_on_failure:
+                    h3.run_with_fallbacks(
+                        self.path, self.protocol, tasks, concurrency, poll_interval, pass_timeout_seconds
+                    )
+                else:
+                    fallbacks = h3.read_fallbacks(self.path, self.protocol, tasks)
+                    h3.generate_tasks(
+                        [task for task in tasks if task["id"] not in fallbacks],
+                        client,
+                        host,
+                        client.auth_headers(token),
+                        load_external(repo / "bestofn/normalize.py").probe,
+                        self.protocol["media_profile"],
+                        concurrency,
+                        poll_interval,
+                        pass_timeout_seconds,
+                    )
             return self.status()
 
     def _generated_candidates(self) -> dict:
         """Validate the candidate generation states and their downloaded clips."""
         candidates = {}
-        for task in self.generation_tasks():
+        tasks = self.generation_tasks()
+        fallbacks = h3.read_fallbacks(self.path, self.protocol, tasks)
+        for task in tasks:
+            if task["id"] in fallbacks:
+                continue
             state_path, video_path = Path(task["state"]), Path(task["output"])
             if not state_path.exists():
                 raise ValueError(f"Candidate video has not been generated: {task['id']}")
@@ -309,16 +333,17 @@ class EvaluationRun:
         pass_timeout_seconds: float = judge.PASS_TIMEOUT_SECONDS,
     ):
         with run_lock(self.path):
-            self.comparison_inputs()
-            judge.run_judge(
-                self.path,
-                self.protocol,
-                execute,
-                concurrency,
-                neutral_on_failure=neutral_on_failure,
-                request_timeout_seconds=request_timeout_seconds,
-                pass_timeout_seconds=pass_timeout_seconds,
-            )
+            manifests = self.comparison_inputs()
+            if manifests["original"]["pairs"]:
+                judge.run_judge(
+                    self.path,
+                    self.protocol,
+                    execute,
+                    concurrency,
+                    neutral_on_failure=neutral_on_failure,
+                    request_timeout_seconds=request_timeout_seconds,
+                    pass_timeout_seconds=pass_timeout_seconds,
+                )
 
     def report(
         self,
@@ -345,7 +370,13 @@ class EvaluationRun:
                     self.path / "judge" / f"manifest-{order}.json",
                     self.protocol["judge"],
                 )
-            report, rows = scoring.make_report(self.protocol, manifests, judgments, allow_partial)
+            report, rows = scoring.make_report(
+                self.protocol,
+                manifests,
+                judgments,
+                allow_partial,
+                generation_fallbacks=h3.read_fallbacks(self.path, self.protocol),
+            )
             report.update(protocol_sha256=fingerprint(self.protocol), ledger_counts=counts)
             if log_tensorboard:
                 log_dir = (

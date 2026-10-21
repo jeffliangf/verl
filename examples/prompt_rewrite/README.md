@@ -180,6 +180,34 @@ The report distinguishes `fallback_prompts`, `fallback_judgments`, and
 accounted for; `judging_complete` additionally requires no fallback scores.
 TensorBoard logs these counts and actual judging coverage alongside the scores.
 
+SFT also enables neutral handling of H3 rejections, provider errors, uncertain
+submissions, and timeouts. The entire H3 generation pass has a **1,800-second hard
+deadline**, including submission, polling, and downloading. A timed-out worker
+is terminated before its missing results are recorded. Standalone generation
+opts in with `generate --neutral-on-failure --pass-timeout-seconds 1800`.
+
+An unavailable candidate video contributes **0.5 against each reference** and
+stays in the 200-prompt denominator. Only existing candidate videos are sent to
+Gemini. The original H3 state/task ID is preserved; separate
+`videos/fallbacks.json` and `videos/failure-policy.json` files record the decision
+and deadline. Resuming reuses both successful clips and explicit fallback scores
+without resubmitting failed or uncertain jobs. Invalid media, mismatched inputs,
+and worker setup failures still stop evaluation.
+
+Reports and TensorBoard distinguish `h3_fallback_prompts` from
+`gemini_fallback_prompts`. `generation_complete` indicates whether every candidate
+video exists, while `complete` indicates whether every comparison has a score.
+`fallback_judgments` counts only Gemini fallback decisions; H3 fallbacks do not
+pretend that a judge call was made. To recover an interrupted evaluation whose
+rewrites are already saved, no training process or GPU is required:
+
+```bash
+python -m examples.prompt_rewrite generate --run-dir <eval-directory> --execute --neutral-on-failure
+python -m examples.prompt_rewrite judge --run-dir <eval-directory> --execute --neutral-on-failure
+python -m examples.prompt_rewrite report --run-dir <eval-directory> --step <checkpoint-step> \
+  --tensorboard-dir <training-tensorboard-directory>
+```
+
 By default every evaluation reports **three scores against each reference**:
 MovieGen, AA eval, and **average = (MovieGen + AA eval) / 2**. The average gives
 each dataset equal weight, even when completed counts differ. If a dataset has
@@ -455,7 +483,7 @@ location. Use `--references`, `--dataset`, or `--eval-repo` for other local inpu
 Rerun the same command to resume. If generation or judging was interrupted, the
 trainer restores the saved epoch, completes its evaluation using existing
 artifacts, and then starts the next epoch. Incomplete comparisons stop the run;
-API errors and timeouts handled by the explicit neutral policy allow training
+H3 and Gemini provider errors and timeouts handled by the explicit neutral policy allow training
 to continue. Missing results without an error or timeout, invalid artifacts,
 and setup failures still stop the run. A changed training configuration requires
 a new run directory.

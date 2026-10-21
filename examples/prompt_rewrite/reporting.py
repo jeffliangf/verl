@@ -43,6 +43,7 @@ def tensorboard_scalars(report: dict) -> dict[str, float]:
     """
     metrics = {"eval/prompt_rewrite/complete": float(report["complete"])}
     metrics["eval/prompt_rewrite/judging_complete"] = float(report.get("judging_complete", report["complete"]))
+    metrics["eval/prompt_rewrite/generation_complete"] = float(report.get("generation_complete", True))
     for reference, groups in report["comparisons"].items():
         prefix = f"eval/prompt_rewrite/vs_{reference}"
         for name, value in groups["scores"].items():
@@ -54,6 +55,8 @@ def tensorboard_scalars(report: dict) -> dict[str, float]:
             metrics[f"{prefix}/judged_coverage/{name}"] = group.get("judged_coverage", group.get("coverage", 0.0))
             metrics[f"{prefix}/fallback_prompts/{name}"] = group.get("fallback_prompts", 0)
             metrics[f"{prefix}/fallback_judgments/{name}"] = group.get("fallback_judgments", 0)
+            metrics[f"{prefix}/h3_fallback_prompts/{name}"] = group.get("h3_fallback_prompts", 0)
+            metrics[f"{prefix}/gemini_fallback_prompts/{name}"] = group.get("gemini_fallback_prompts", 0)
     return metrics
 
 
