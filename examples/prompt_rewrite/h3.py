@@ -34,17 +34,17 @@ def request_body(rewritten_prompt: str, settings: dict | None = None) -> dict:
 
 
 def request_for_protocol(prompt: str, protocol: dict) -> dict:
-    """Use the frozen provider's wire format without changing the policy tool."""
+    """Build a standalone rewrite-evaluation request from frozen settings."""
     if protocol.get("h3_backend") == self_hosted_h3.BACKEND:
         return self_hosted_h3.request_body(prompt, protocol["h3"])
     return request_body(prompt, protocol["h3"])
 
 
-def media_profile(media: dict) -> dict:
+def media_profile(media: dict, *, duration: int = 10) -> dict:
     """Compare the native visual/audio formats without transcoding either side."""
     video, audio = media.get("video") or {}, media.get("audio") or {}
-    if not video or not audio or not 9 <= media.get("duration_s", 0) <= 11:
-        raise ValueError("Expected an approximately 10-second video with audio")
+    if not video or not audio or not duration - 1 <= media.get("duration_s", 0) <= duration + 1:
+        raise ValueError(f"Expected an approximately {duration}-second video with audio")
     return {
         "width": video.get("width"),
         "height": video.get("height"),

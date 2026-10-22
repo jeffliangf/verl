@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET = ROOT / "data/prompt_rewrite_aa_moviegen_eval_200.jsonl"
-# Training presets retain their historical defaults until those experiments migrate.
+# Historical SFT presets retain Max references; RL and standalone evaluation use self-hosted references.
 DEFAULT_REFERENCES = ROOT / "data/prompt_rewrite_h3_eval/outputs_h3max_disabled_768p"
 DEFAULT_SELF_HOSTED_REFERENCES = ROOT / "data/prompt_rewrite_h3_eval/outputs_self_hosted_gateway_768p"
 DEFAULT_EVAL_REPO = Path.home() / "video-generation-eval"
@@ -58,7 +58,7 @@ SCORE_SOURCES = {"moviegen": "movie_gen_video_bench", "aa_eval": "aa_eval"}
 
 @dataclass(frozen=True)
 class RewriteConfig:
-    """Use an HF model ID or an exported, immutable SFT/RL checkpoint directory."""
+    """Legacy rewrite provenance retained for importing and reading saved artifacts."""
 
     model: str = "Qwen/Qwen3.8-27B"
     revision: str | None = None

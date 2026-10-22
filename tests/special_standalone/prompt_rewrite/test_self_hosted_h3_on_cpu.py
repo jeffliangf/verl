@@ -80,6 +80,46 @@ class FakeClient:
         path.write_bytes(b"test video")
 
 
+@pytest.mark.parametrize("status", ["ready", "warming"])
+def test_public_status_distinguishes_health_from_model_provenance(job, status):
+    _, protocol = job
+    health = {"status": status, "queued": 0, "queue_capacity": 8, "width": 1344, "transformer_forwards": 4}
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.path, self.headers.get("Authorization")))
+            self.send_response(200 if health["status"] == "ready" else 503)
+            self.end_headers()
+            self.wfile.write(json.dumps(health).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        protocol["h3_endpoints"] = [f"http://127.0.0.1:{server.server_port}"]
+        result = hosted.server_status(protocol)
+        assert result["all_ready"] is (status == "ready")
+        check = result["endpoints"][0]["settings_check"]
+        assert check["status"] == "unverified"
+        assert "model_revision" in check["missing"] and "adapter_revision" in check["missing"]
+        assert "steps" not in check["missing"] and not check["mismatches"]
+        health.update(protocol["h3"])
+        assert hosted.server_status(protocol)["endpoints"][0]["settings_check"]["status"] == "reported_match"
+        health["model_revision"] = "different-model"
+        check = hosted.server_status(protocol)["endpoints"][0]["settings_check"]
+        assert check["status"] == "mismatch" and check["mismatches"]["model_revision"]["reported"] == "different-model"
+        assert requests == [("/healthz", None)] * 3
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    assert not hosted.server_status(protocol)["endpoints"][0]["reachable"]
+
+
 def test_resume_pins_worker_and_does_not_repost(job):
     task, protocol = job
     client = FakeClient()
@@ -152,6 +192,17 @@ def test_invalid_media_remains_an_artifact_error(job):
     task, protocol = job
     assert not hosted.generate_one(task, protocol, FakeClient(), lambda path: {**MEDIA, "duration_s": 5})
     assert read_json(Path(task["state"]))["error_stage"] == "artifact"
+
+
+@pytest.mark.parametrize("duration", [5, 10])
+def test_generated_media_must_match_the_requested_duration(job, duration):
+    task, protocol = job
+    task["request"].update(duration=duration, seed=7)
+    client = FakeClient()
+    media = {**MEDIA, "duration_s": duration + 0.125}
+    assert hosted.generate_one(task, protocol, client, lambda path: media)
+    assert client.posts[0][1] == {"prompt": "Exact video prompt", "duration": duration, "seed": 7}
+    assert read_json(Path(task["state"]))["media"] == media
 
 
 def test_http_client_authenticates_download_and_bypasses_proxies(job, monkeypatch):

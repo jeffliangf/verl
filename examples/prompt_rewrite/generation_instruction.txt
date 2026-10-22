@@ -1,0 +1,1 @@
+Generate a video of about 10 seconds of: {prompt}

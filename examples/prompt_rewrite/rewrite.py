@@ -8,13 +8,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared message construction, injectable inference, and durable rewrite records."""
+"""Read, import, and validate legacy rewrite artifacts; no policy inference."""
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import RewriteConfig, build_messages
+from .config import build_messages
 from .storage import fingerprint, freeze_json, item_key, read_json, write_jsonl
 
 
@@ -23,70 +22,6 @@ class RewriteResult:
     text: str
     finish_reason: str = "stop"
     output_tokens: int | None = None
-
-
-class VLLMRewriter:
-    """Lazy offline inference for the original model or exported HF checkpoints.
-
-    Importing this module and preparing/evaluating runs never loads CUDA or vLLM.
-    Trainers can instead pass their own callable to ``run_rewrites``.
-    """
-
-    def __init__(self, config: RewriteConfig):
-        if config.backend != "vllm":
-            raise ValueError("This run uses resident FSDP2 inference; resume it through the SFT launcher")
-        self.config = config
-        self.engine = None
-
-    def __call__(self, messages: list[list[dict[str, str]]]) -> list[RewriteResult]:
-        from vllm import LLM, SamplingParams
-
-        config = self.config
-        if self.engine is None:
-            self.engine = LLM(
-                model=config.model,
-                revision=config.revision,
-                tokenizer_revision=config.revision,
-                tensor_parallel_size=config.tensor_parallel_size,
-                dtype="bfloat16",
-                max_model_len=config.max_model_len,
-                # Bound hybrid-attention state for offline eval on a single H100.
-                # Larger input batches are scheduled in chunks by vLLM.
-                max_num_seqs=32,
-                gpu_memory_utilization=config.gpu_memory_utilization,
-                seed=config.seed,
-                generation_config="vllm",
-                limit_mm_per_prompt={"image": 0, "video": 0},
-            )
-        tokenizer = self.engine.get_tokenizer()
-        prompts = []
-        for conversation in messages:
-            tokens = tokenizer.apply_chat_template(
-                conversation,
-                tokenize=True,
-                return_dict=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-            if not isinstance(tokens, list) or not all(isinstance(token, int) for token in tokens):
-                raise ValueError("Chat template must return a flat list of token IDs")
-            if len(tokens) + config.max_new_tokens > config.max_model_len:
-                raise ValueError("Prompt and output budget exceed max_model_len; use a new run with a larger context")
-            prompts.append({"prompt_token_ids": tokens})
-        sampling = SamplingParams(
-            n=1,
-            temperature=config.temperature,
-            top_p=1.0,
-            top_k=-1,
-            repetition_penalty=1.0,
-            max_tokens=config.max_new_tokens,
-            seed=config.seed,
-        )
-        results = self.engine.generate(prompts, sampling, use_tqdm=False)
-        return [
-            RewriteResult(row.outputs[0].text, row.outputs[0].finish_reason, len(row.outputs[0].token_ids))
-            for row in results
-        ]
 
 
 def validate_rewrite(result: RewriteResult):
@@ -156,37 +91,6 @@ def export_rewrites(run_dir: Path, protocol: dict) -> dict[str, dict]:
     records = load_rewrites(run_dir, protocol)
     write_jsonl(run_dir / "rewrites.jsonl", records.values())
     return records
-
-
-def run_rewrites(
-    run_dir: Path,
-    protocol: dict,
-    rewriter: Callable[[list[list[dict[str, str]]]], list[RewriteResult]],
-    batch_size: int = 8,
-):
-    """Evaluate any policy callable, saving each completed batch for restart.
-
-    The caller holds the run lock. The callable sees system/user messages only.
-    Use this seam for SFT/RL inference that already owns a loaded policy.
-    """
-    if batch_size < 1:
-        raise ValueError("Batch size must be positive")
-    freeze_json(run_dir / "rewrite-source.json", {"mode": "policy", "rewriter": protocol["rewriter"]})
-    completed = load_rewrites(run_dir, protocol, require_complete=False)
-    pending = [sample for sample in protocol["samples"] if sample["id"] not in completed]
-    for offset in range(0, len(pending), batch_size):
-        batch = pending[offset : offset + batch_size]
-        messages = [
-            build_messages(sample["prompt"], protocol["system_prompt"], protocol.get("rewrite_instruction", ""))
-            for sample in batch
-        ]
-        results = rewriter(messages)
-        if len(results) != len(batch):
-            raise ValueError("Rewriter returned a different number of outputs than inputs")
-        for sample, result in zip(batch, results, strict=True):
-            save_rewrite(run_dir, protocol, sample, result)
-        print(f"Rewrites: {len(completed) + offset + len(batch)}/{len(protocol['samples'])}", flush=True)
-    return export_rewrites(run_dir, protocol)
 
 
 def import_rewrites(run_dir: Path, protocol: dict, rows: list[dict]):

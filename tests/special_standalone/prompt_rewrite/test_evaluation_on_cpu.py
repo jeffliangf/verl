@@ -25,13 +25,11 @@ from examples.prompt_rewrite import evaluation, h3, judge, rewrite, scoring, sel
 from examples.prompt_rewrite.__main__ import main
 from examples.prompt_rewrite.config import (
     CANDIDATE,
-    DEFAULT_REWRITE_INSTRUCTION,
     H3_ENDPOINT,
     H3_SETTINGS,
     JUDGE_SETTINGS,
     REFERENCE_VIDEO_FIELDS,
     SELF_HOSTED_REFERENCE_VIDEO_FIELDS,
-    build_messages,
 )
 from examples.prompt_rewrite.evaluation import EXTERNAL_FILES, EvaluationRun
 from examples.prompt_rewrite.storage import file_sha256, fingerprint, read_json, write_json, write_jsonl
@@ -352,77 +350,6 @@ def test_prepare_cli_keeps_vllm_as_default_backend(prepared, tmp_path):
     assert EvaluationRun(destination).protocol["rewriter"]["backend"] == "vllm"
 
 
-def test_resident_epoch_pipeline_reuses_model_and_completed_work(prepared, monkeypatch, tmp_path):
-    from contextlib import nullcontext
-
-    from examples.prompt_rewrite import resident
-
-    torch = pytest.importorskip("torch")
-    original, client, _ = prepared
-    model = torch.nn.Linear(1, 1)
-    calls = []
-    settings = SimpleNamespace(
-        run_dir=str(tmp_path / "sft"),
-        dataset=original.protocol["dataset"],
-        references=str(Path(original.protocol["reference_manifest"]).parent),
-        eval_repo=original.protocol["eval_repo"],
-        batch_size=1,
-        max_new_tokens=20,
-        max_model_len=128,
-        h3_concurrency=1,
-        judge_concurrency=1,
-    )
-    evaluator = resident.ResidentEvaluator.__new__(resident.ResidentEvaluator)
-    evaluator.trainer = SimpleNamespace(
-        engine=SimpleNamespace(module=model, eval_mode=nullcontext),
-        model_config=SimpleNamespace(tokenizer=SimpleNamespace(apply_chat_template=lambda *a, **k: [1, 2, 3])),
-        config=SimpleNamespace(video_eval=settings, trainer=SimpleNamespace(default_local_dir=str(tmp_path / "ckpt"))),
-    )
-    evaluator.settings, evaluator.native_forwards = settings, {}
-    evaluator.rank, evaluator.world, evaluator.control = 0, 1, None
-    monkeypatch.setattr(torch.distributed, "broadcast_object_list", lambda *a, **k: None)
-    monkeypatch.setattr(torch.distributed, "all_gather_object", lambda output, local, **k: output.__setitem__(0, local))
-
-    def generate(loaded, tokenizer, conversations, config, **kwargs):
-        assert loaded is model and not loaded.training and not torch.is_grad_enabled()
-        assert config.backend == "hf_fsdp2"
-        assert all("SECRET teacher" not in m["content"] for c in conversations for m in c)
-        calls.append(conversations)
-        return [rewrite.RewriteResult("A complete rewritten prompt") for _ in conversations]
-
-    def judge_epoch(path, protocol, execute, concurrency, **kwargs):
-        assert kwargs["neutral_on_failure"]
-        if not (path / "judge/judgments-original.jsonl").exists():
-            run = EvaluationRun(path)
-            add_judgments(run, run.comparison_inputs())
-
-    def h3_worker(args, *, check, timeout):
-        run = EvaluationRun(Path(args[args.index("--run-dir") + 1]))
-        results = self_hosted_h3.generate_tasks(
-            run.generation_tasks(),
-            run.protocol,
-            lambda _: MEDIA,
-            concurrency=1,
-            timeout=timeout,
-            client=client,
-        )
-        return SimpleNamespace(returncode=int(not all(results.values())))
-
-    monkeypatch.setattr(resident, "generate_batch", generate)
-    monkeypatch.setattr(h3.subprocess, "run", h3_worker)
-    monkeypatch.setattr(judge, "run_judge", judge_epoch)
-    evaluator.evaluate(2)
-    evaluator.evaluate(2)
-    assert len(calls) == len(client.posts) == 3
-    assert model.training
-    evaluator.evaluate(4)
-    assert len(calls) == len(client.posts) == 6
-    first = read_json(tmp_path / "sft/eval/global_step_2/report.json")
-    second = read_json(tmp_path / "sft/eval/global_step_4/report.json")
-    assert first["tensorboard"]["step"] == 2 and second["tensorboard"]["step"] == 4
-    assert first["comparisons"]["prompt"]["scores"]["average"] == 0.375
-
-
 def add_judgments(run, manifests, *, omit=None):
     """Three prompts score 1, 0.5, 0 against each reference, independent of displayed side."""
     candidate = run.protocol.get("candidate_field", CANDIDATE)
@@ -614,28 +541,8 @@ def test_unscored_dataset_has_no_average_or_tensorboard_score(prepared):
     assert events.Scalars("eval/prompt_rewrite/complete")[0].value == 0
 
 
-def test_rewriter_receives_no_teacher_and_resumes(prepared):
-    run, _, _ = prepared
-    calls = []
-
-    def policy(messages):
-        calls.extend(messages)
-        assert "SECRET" not in json.dumps(messages)
-        assert all([m["role"] for m in conversation] == ["system", "user"] for conversation in messages)
-        return [rewrite.RewriteResult("Some visual directions.") for _ in messages]
-
-    run.rewrite(execute=True, rewriter=policy, batch_size=2)
-    assert len(calls) == 3
-    run.rewrite(execute=True, rewriter=policy)
-    assert len(calls) == 3
-    assert build_messages("original")[-1] == {
-        "role": "user",
-        "content": DEFAULT_REWRITE_INSTRUCTION + "\n\nUser request:\noriginal",
-    }
-
-
 @pytest.mark.parametrize("legacy", [False, True])
-def test_saved_prompt_contract_controls_preview_identity_and_resumed_inference(prepared, legacy):
+def test_saved_prompt_contract_controls_legacy_artifact_identity(prepared, legacy):
     run, _, _ = prepared
     protocol = run.protocol
     protocol["system_prompt"] = "Saved system role"
@@ -650,22 +557,23 @@ def test_saved_prompt_contract_controls_preview_identity_and_resumed_inference(p
     for sample in protocol["samples"]:
         content = sample["prompt"] if legacy else f"Saved task instruction\n\nUser request:\n{sample['prompt']}"
         expected.append([{"role": "system", "content": "Saved system role"}, {"role": "user", "content": content}])
-    assert run.rewrite()["example_messages"] == expected[0]
     first = protocol["samples"][0]
     rewrite.save_rewrite(run.path, protocol, first, rewrite.RewriteResult("Saved rewrite"))
     record = read_json(rewrite.record_path(run.path, first["id"]))
     assert record["request_sha256"] == fingerprint(
         {"id": first["id"], "messages": expected[0], "rewriter": protocol["rewriter"]}
     )
-    calls = []
+    for sample in protocol["samples"][1:]:
+        rewrite.save_rewrite(run.path, protocol, sample, rewrite.RewriteResult("New rewrite"))
+    assert len(rewrite.load_rewrites(run.path, protocol)) == len(protocol["samples"])
 
-    def policy(messages):
-        calls.extend(messages)
-        return [rewrite.RewriteResult("New rewrite") for _ in messages]
 
-    run.rewrite(execute=True, rewriter=policy)
-    assert calls == expected[1:]
-    assert run.status()["rewrites_complete"] == len(protocol["samples"])
+def test_legacy_policy_inference_redirects_to_canonical_evaluation(prepared):
+    run, _, _ = prepared
+    with pytest.raises(ValueError, match="prompt_rewrite.rl evaluate"):
+        run.rewrite(execute=True)
+    assert not hasattr(rewrite, "VLLMRewriter")
+    assert not hasattr(rewrite, "run_rewrites")
 
 
 @pytest.mark.parametrize("bad", ["empty", "duplicate", "unknown", "wrong_prompt", "truncated", "aborted"])
@@ -843,7 +751,9 @@ def test_two_training_checkpoints_share_references_not_candidate_artifacts(prepa
 
 def test_cli_and_judge_command_are_dry_by_default(prepared):
     run, client, _ = prepared
-    assert main(["rewrite", "--run-dir", str(run.path)]) == 0
+    with pytest.raises(SystemExit) as error:
+        main(["rewrite", "--run-dir", str(run.path)])
+    assert error.value.code == 2
     assert run.status()["rewrites_complete"] == 0
     import_outputs(run)
     assert main(["generate", "--run-dir", str(run.path)]) == 0
@@ -1164,38 +1074,6 @@ def test_score_is_invariant_to_display_order():
     assert first["score"] == reversed_result["score"] == 0.5
     assert first["candidate_first_win"] == reversed_result["candidate_first_win"]
     assert first["candidate_second_win"] == reversed_result["candidate_second_win"]
-
-
-def test_vllm_adapter_uses_token_ids_and_disabled_thinking(monkeypatch):
-    """Check the inference seam without importing a GPU runtime."""
-    captured = {}
-
-    class Tokenizer:
-        def apply_chat_template(self, messages, **kwargs):
-            captured["template"] = kwargs
-            return [1, 2, 3]
-
-    class Engine:
-        def __init__(self, **kwargs):
-            captured["engine"] = kwargs
-
-        def get_tokenizer(self):
-            return Tokenizer()
-
-        def generate(self, prompts, params, **kwargs):
-            captured["prompts"] = prompts
-            return [SimpleNamespace(outputs=[SimpleNamespace(text="rewrite", finish_reason="stop", token_ids=[4, 5])])]
-
-    monkeypatch.setitem(__import__("sys").modules, "vllm", SimpleNamespace(LLM=Engine, SamplingParams=lambda **kw: kw))
-    output = rewrite.VLLMRewriter(evaluation.RewriteConfig())([build_messages("original")])
-    assert output == [rewrite.RewriteResult("rewrite", "stop", 2)]
-    assert captured["template"] == {
-        "tokenize": True,
-        "return_dict": False,
-        "add_generation_prompt": True,
-        "enable_thinking": False,
-    }
-    assert captured["prompts"] == [{"prompt_token_ids": [1, 2, 3]}]
 
 
 def test_duplicate_votes_cannot_inflate_score(prepared):

@@ -76,32 +76,8 @@ trainer:
 
   total_epochs: 1
 
-  # Evaluate the initially loaded model before its first optimizer update.
-  eval_before_training: false
-
   logger: [console, tensorboard]
 
   test_freq: after_each_epoch
 
   save_freq: after_each_epoch
-
-# Consumed by examples.prompt_rewrite.train, after each epoch checkpoint.
-video_eval:
-  run_dir: outputs/prompt_rewrite/${trainer.experiment_name}
-
-  dataset: data/prompt_rewrite_aa_moviegen_eval_200.jsonl
-
-  references: data/prompt_rewrite_h3_eval/outputs_h3max_disabled_768p
-
-  eval_repo: ${oc.env:HOME}/video-generation-eval
-
-  # Resident FSDP2 generation uses this many prompts per GPU.
-  batch_size: 1
-
-  max_new_tokens: 2048
-
-  max_model_len: 8192
-
-  h3_concurrency: 500
-
-  judge_concurrency: 500

@@ -8,7 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Staged CLI; GPU inference and network stages are dry runs unless --execute is set."""
+"""Legacy artifact CLI; live checkpoint evaluation uses prompt_rewrite.rl evaluate."""
 
 import argparse
 import json
@@ -59,19 +59,16 @@ def parse_args(argv=None):
         prepare.add_argument(
             "--" + field.replace("_", "-"), default=default, type=type(default) if default is not None else str
         )
-    for stage in ("rewrite", "generate", "judge", "benchmark-references"):
+    for stage in ("generate", "judge", "benchmark-references"):
         command = sub.add_parser(stage, parents=[common])
         mode = command.add_mutually_exclusive_group()
         mode.add_argument("--execute", action="store_true")
         mode.add_argument("--dry-run", action="store_true", help="Preview only (the default)")
-        if stage == "rewrite":
-            command.add_argument("--batch-size", type=int, default=8)
-        else:
-            command.add_argument(
-                "--concurrency",
-                type=int,
-                default=self_hosted_h3.DEFAULT_CONCURRENCY if stage == "generate" else JUDGE_CONCURRENCY,
-            )
+        command.add_argument(
+            "--concurrency",
+            type=int,
+            default=self_hosted_h3.DEFAULT_CONCURRENCY if stage == "generate" else JUDGE_CONCURRENCY,
+        )
         if stage == "generate":
             command.add_argument("--poll-interval", type=float, default=1)
         if stage in ("generate", "judge"):
@@ -132,9 +129,7 @@ def main(argv=None) -> int:
             return 0
         else:
             run = EvaluationRun(args.run_dir)
-            if args.stage == "rewrite":
-                result = run.rewrite(execute=args.execute, batch_size=args.batch_size)
-            elif args.stage == "import-rewrites":
+            if args.stage == "import-rewrites":
                 result = run.import_rewrites(read_jsonl(args.input.expanduser()))
             elif args.stage == "generate":
                 result = run.generate(

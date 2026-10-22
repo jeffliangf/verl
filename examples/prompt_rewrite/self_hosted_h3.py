@@ -116,7 +116,7 @@ def configuration(backend, endpoints, reference_host, profile, token_file=None, 
 
 
 def request_body(prompt, settings):
-    """Translate the unchanged policy tool argument to the resident service API."""
+    """Build the fixed-duration standalone rewrite-evaluation request."""
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000:
         raise ValueError("Self-hosted H3 needs a nonempty prompt of at most 8000 characters")
     if settings["duration"] != 10:
@@ -202,6 +202,62 @@ def available_workers(client, endpoints):
         ready = [result for result in pool.map(inspect, endpoints) if result is not None]
     random.shuffle(ready)
     return [origin for origin, _ in sorted(ready, key=lambda row: row[1])]
+
+
+def server_status(protocol, *, timeout=5):
+    """Read public health endpoints without credentials or submitting any jobs.
+
+    Readiness does not attest to model identity. Compare only settings actually
+    reported by the service, and explicitly list missing provenance fields.
+    """
+    require_backend(protocol.get("h3_backend"))
+    if not isfinite(timeout) or timeout <= 0:
+        raise ValueError("Status timeout must be positive and finite")
+    expected = {key: value for key, value in protocol["h3"].items() if key not in {"duration", "seed"}}
+
+    def inspect(origin):
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                response = opener.open(origin + "/healthz", timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 503:
+                    raise
+                response = exc  # Warming/unavailable workers still return useful health JSON.
+            with response:
+                health = json.load(response)
+            if not isinstance(health, dict):
+                raise ValueError("Expected a health JSON object")
+            observed = {key: health[key] for key in expected if key in health}
+            if "steps" not in observed and "transformer_forwards" in health:
+                observed["steps"] = health["transformer_forwards"]
+            missing = sorted(expected.keys() - observed.keys())
+            mismatches = {
+                key: {"expected": expected[key], "reported": value}
+                for key, value in observed.items()
+                if value != expected[key]
+            }
+            return {
+                "endpoint": origin,
+                "reachable": True,
+                "health": health,
+                "settings_check": {
+                    "status": "mismatch" if mismatches else "unverified" if missing else "reported_match",
+                    "missing": missing,
+                    "mismatches": mismatches,
+                },
+            }
+        except (OSError, ValueError) as exc:
+            return {"endpoint": origin, "reachable": False, "error": str(exc)}
+
+    endpoints = protocol["h3_endpoints"]
+    with ThreadPoolExecutor(max_workers=min(16, max(1, len(endpoints)))) as pool:
+        workers = list(pool.map(inspect, endpoints))
+    return {
+        "expected_settings": expected,
+        "all_ready": bool(workers) and all(row.get("health", {}).get("status") == "ready" for row in workers),
+        "endpoints": workers,
+    }
 
 
 def remux_container(path, timeout):
@@ -327,7 +383,7 @@ def generate_one(task, protocol, client, probe, poll_interval=1, timeout=1800):
                 if media.get("duration_s") == 0 and (media.get("video") or {}).get("frames") == 0:
                     remux_container(output, remaining())
                     media, remuxed = probe(output), True
-                if media_profile(media) != protocol["media_profile"]:
+                if media_profile(media, duration=task["request"]["duration"]) != protocol["media_profile"]:
                     raise ValueError(f"H3 media format differs from the reference videos: {output}")
                 save(
                     status="succeeded",

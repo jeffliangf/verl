@@ -26,7 +26,23 @@ import pytest
 import torch
 
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
-from verl.trainer.ppo.v1.utils import MetricsAggregator
+from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_reward_extra_metrics
+
+
+def test_reward_diagnostics_ignore_padding_missing_metadata_and_nonfinite_values():
+    rows = [
+        {"reward_extra_info": {"valid_call": 1.0, "info": "ok", "nan": float("nan"), "detail": {"x": 1}}},
+        {"reward_extra_info": {"valid_call": 0.0, "comparisons": 12, "inf": float("inf")}},
+        {"reward_extra_info": {"valid_call": 1.0, "comparisons": 100}},
+        {},
+        None,
+        {"reward_extra_info": None},
+    ]
+    assert compute_reward_extra_metrics(rows, [True, True, False, True, True, True]) == {
+        "training/reward_extra/valid_call/mean": 0.5,
+        "training/reward_extra/comparisons/mean": 12.0,
+    }
+    assert compute_reward_extra_metrics(rows, [False] * len(rows)) == {}
 
 
 def test_empty_aggregator_returns_empty():

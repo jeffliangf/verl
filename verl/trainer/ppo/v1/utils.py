@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections import Counter, defaultdict
+from numbers import Real
 from typing import Any
 
 import numpy as np
@@ -21,6 +22,25 @@ from verl.protocol import DataProto
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import compute_advantage
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
+
+
+def compute_reward_extra_metrics(extra_fields, non_padding_mask) -> dict[str, float]:
+    """Average numeric rollout diagnostics over real samples that report each key.
+
+    Missing values are not failures/zeros. Strings and structured reward metadata
+    remain in rollout artifacts instead of being sent to scalar loggers.
+    """
+    values = defaultdict(list)
+    for extra, keep in zip(extra_fields, non_padding_mask, strict=True):
+        if not keep or not isinstance(extra, dict):
+            continue
+        reward = extra.get("reward_extra_info")
+        if not isinstance(reward, dict):
+            continue
+        for key, value in reward.items():
+            if isinstance(value, Real) and np.isfinite(value):
+                values[key].append(float(value))
+    return {f"training/reward_extra/{key}/mean": float(np.mean(items)) for key, items in values.items()}
 
 
 class MetricsAggregator:

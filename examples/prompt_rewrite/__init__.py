@@ -10,6 +10,6 @@
 # limitations under the License.
 """Checkpoint-independent prompt rewriting and video evaluation.
 
-Use ``python -m examples.prompt_rewrite --help`` for the staged CLI.
-The modules also accept rewrites from SFT/RL inference without loading vLLM.
+Use ``python -m examples.prompt_rewrite.rl --help`` for training and canonical
+checkpoint evaluation. The package CLI preserves legacy artifact/report commands.
 """

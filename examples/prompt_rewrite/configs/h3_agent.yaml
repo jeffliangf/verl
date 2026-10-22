@@ -1,0 +1,2 @@
+- name: h3_terminal
+  _target_: examples.prompt_rewrite.agent.H3TerminalLoop

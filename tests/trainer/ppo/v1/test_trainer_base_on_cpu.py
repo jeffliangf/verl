@@ -193,3 +193,72 @@ def test_update_actor_passes_score_centering_flag(score_centering):
     trainer._update_actor(batch, {})
 
     assert batch.extra_info["score_centering"] is score_centering
+
+
+def test_reward_diagnostics_reach_training_and_validation_tensorboard(tmp_path, monkeypatch):
+    import numpy as np
+    import torch
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    from tensordict import TensorDict
+
+    from verl.trainer.ppo.v1 import trainer_base
+    from verl.utils.tracking import Tracking
+
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.config = OmegaConf.create({"actor_rollout_ref": {"model": {}, "rollout": {}}})
+    trainer.use_critic = False
+    trainer._rollout_moe_lb_metrics_accumulator = None
+    trainer._get_n_gpus_for_throughput = lambda: 1
+    diagnostics = [{"valid_call": 1.0, "zero_variance_group": 0.0}, {"valid_call": 0.0}, {"valid_call": 1.0}]
+
+    class MetricData(dict):
+        def to_padded_tensor(self):
+            return TensorDict({"rm_scores": torch.zeros(3, 2)}, batch_size=[3])
+
+    def fetch(**kwargs):
+        assert "extra_fields" in kwargs["fields"]
+        lengths = SimpleNamespace(offsets=lambda: torch.tensor([0, 2, 4, 6]))
+        return MetricData(
+            prompts=lengths,
+            responses=lengths,
+            num_turns=np.array([1, 1, 1]),
+            extra_fields=np.array([{"reward_extra_info": row} for row in diagnostics], dtype=object),
+        )
+
+    monkeypatch.setattr(trainer_base, "get_metric_data_with_optional_routed_experts", fetch)
+    for name in (
+        "compute_moe_lb_metrics",
+        "compute_data_metrics",
+        "compute_timing_metrics",
+        "compute_throughout_metrics",
+        "compute_variance_proxy_metrics",
+    ):
+        monkeypatch.setattr(trainer_base, name, lambda **kwargs: {})
+    batch = SimpleNamespace(
+        keys=["a_0_0", "b_0_0", "padding_0_0"],
+        partition_id="train",
+        tags=[{"min_global_steps": 1, "max_global_steps": 1, "is_padding": pad} for pad in [False, False, True]],
+    )
+    metrics = {}
+    trainer._compute_metrics(batch, metrics, {}, global_steps=2, epoch=0)
+    metrics.update(
+        trainer._val_metrics_update(
+            ["aa_eval", "aa_eval"],
+            ["a", "b"],
+            {"reward": [0.75, 0.25], "valid_call": [1.0, 1.0], "vs_prompt": [1.0, 0.0]},
+            [1, 1],
+        )
+    )
+    monkeypatch.setenv("TENSORBOARD_DIR", str(tmp_path))
+    logger = Tracking("test", "diagnostics", default_backend=["tensorboard"])
+    logger.log(metrics, step=2)
+    logger.finish()
+    events = EventAccumulator(str(tmp_path)).Reload()
+    for tag, expected in {
+        "training/reward_extra/valid_call/mean": 0.5,
+        "training/reward_extra/zero_variance_group/mean": 0.0,
+        "val-aux/aa_eval/valid_call/mean@1": 1.0,
+        "val-aux/aa_eval/vs_prompt/mean@1": 0.5,
+    }.items():
+        scalar = events.Scalars(tag)[0]
+        assert scalar.step == 2 and scalar.value == pytest.approx(expected)

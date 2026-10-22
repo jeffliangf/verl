@@ -8,7 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Small orchestration API reused by zero-shot, SFT, and RL evaluation jobs."""
+"""Legacy artifact generation/reporting; live policy evaluation lives in rl.py."""
 
 import os
 from collections import Counter
@@ -27,7 +27,6 @@ from .config import (
     JUDGE_SETTINGS,
     ROOT,
     RewriteConfig,
-    build_messages,
 )
 from .dataset import load_samples, reference_inventory, reference_video_fields, verify_references
 from .storage import (
@@ -196,26 +195,10 @@ class EvaluationRun:
         if "rewriter" not in self.protocol:
             raise ValueError("A reference benchmark uses existing videos; only judge, report, and status apply")
 
-    def rewrite(self, *, execute: bool = False, rewriter=None, batch_size: int = 8):
-        """Use vLLM or a callable backed by the trainer's loaded policy."""
+    def rewrite(self, **kwargs):
+        """Reject the retired text-only policy interface with a migration hint."""
         self._require_rewriter()
-        with run_lock(self.path):
-            if not execute:
-                return {
-                    "rewriter": self.protocol["rewriter"],
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    "example_messages": build_messages(
-                        self.protocol["samples"][0]["prompt"],
-                        self.protocol["system_prompt"],
-                        self.protocol.get("rewrite_instruction", ""),
-                    ),
-                    **self.status(),
-                }
-            backend = (
-                rewriter if rewriter is not None else rewrite.VLLMRewriter(RewriteConfig(**self.protocol["rewriter"]))
-            )
-            rewrite.run_rewrites(self.path, self.protocol, backend, batch_size)
-            return self.status()
+        raise ValueError("Live policy evaluation moved to: python -m examples.prompt_rewrite.rl evaluate")
 
     def import_rewrites(self, rows: list[dict]):
         """Accept outputs from an SFT/RL rollout without starting another policy process."""
