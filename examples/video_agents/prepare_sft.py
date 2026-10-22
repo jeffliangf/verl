@@ -14,7 +14,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .config import DEFAULT_DATASET, DEFAULT_REWRITE_INSTRUCTION, DEFAULT_SYSTEM_PROMPT, ROOT, build_messages
+from .config import DEFAULT_DATASET, DEFAULT_REWRITE_INSTRUCTION, DEFAULT_SYSTEM_PROMPT, ROOT, build_sft_messages
 from .storage import atomic_text, file_sha256, fingerprint, read_jsonl, write_json, write_jsonl
 
 TARGET_KEY = "h3_context_ir"
@@ -48,7 +48,7 @@ def _convert_rows(path: Path, split: str) -> tuple[list[dict], int, set[str]]:
                 "id": row["id"],
                 "source": source,
                 "split": split,
-                "messages": build_messages(row["prompt"]) + [{"role": "assistant", "content": row[TARGET_KEY]}],
+                "messages": build_sft_messages(row["prompt"]) + [{"role": "assistant", "content": row[TARGET_KEY]}],
                 "enable_thinking": False,
             }
         )

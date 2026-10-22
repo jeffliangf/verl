@@ -111,7 +111,7 @@ actor_rollout_ref:
 
       default_agent_loop: h3_terminal
 
-      agent_loop_manager_class: examples.prompt_rewrite.agent.TournamentManager
+      agent_loop_manager_class: examples.video_agents.agent.TournamentManager
 
     multi_turn:
       enable: true
@@ -146,7 +146,7 @@ trainer:
   v1:
     trainer_mode: sync
 
-  project_name: prompt-rewrite-rl
+  project_name: video-agents-rl
 
   experiment_name: qwen38-h3-tournament
 

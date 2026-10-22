@@ -31,7 +31,7 @@ from .config import (
     ROOT,
 )
 from .dataset import load_samples, reference_inventory, reference_video_fields
-from .evaluation import EXTERNAL_FILES
+from .judge import EXTERNAL_FILES
 from .storage import (
     atomic_text,
     file_sha256,
@@ -98,7 +98,7 @@ def tool_config(directory: Path, train_file: Path) -> dict:
     return {
         "tools": [
             {
-                "class_name": "examples.prompt_rewrite.agent.SolH3Tool",
+                "class_name": "examples.video_agents.agent.SolH3Tool",
                 "config": {
                     "type": "native",
                     "protocol": str(directory / "protocol.json"),
@@ -262,7 +262,7 @@ def training_config(args):
         raise ValueError("This preset uses video rewards without policy distillation")
     if (
         config.actor_rollout_ref.rollout.agent.agent_loop_manager_class
-        != "examples.prompt_rewrite.agent.TournamentManager"
+        != "examples.video_agents.agent.TournamentManager"
         or not multi_turn.enable
         or multi_turn.format != "qwen3_coder"
         or multi_turn.max_parallel_calls != 1

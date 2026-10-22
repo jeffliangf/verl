@@ -106,7 +106,7 @@ def run_lock(run_dir: Path):
 
 def load_external(path: Path):
     """Load a standalone helper from the user's existing video evaluation repository."""
-    name = "_prompt_rewrite_" + fingerprint(str(path.resolve()))
+    name = "_video_agents_" + fingerprint(str(path.resolve()))
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load {path}")

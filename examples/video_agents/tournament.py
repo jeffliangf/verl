@@ -14,7 +14,7 @@ import itertools
 import subprocess
 from pathlib import Path
 
-from . import h3, judge, scoring
+from . import h3, judge, scoring, self_hosted_h3
 from .config import CANDIDATE, REFERENCE_FIELDS
 from .dataset import verify_references
 from .storage import file_sha256, fingerprint, freeze_json, read_json, run_lock, write_json
@@ -68,7 +68,7 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
         state, path = read_json(Path(task["state"])), Path(task["output"])
         if (
             state.get("status") != "succeeded"
-            or any(state.get(key) != value for key, value in h3.task_identity(task, protocol).items())
+            or any(state.get(key) != value for key, value in self_hosted_h3.identity(task, protocol).items())
             or state.get("sha256") != file_sha256(path)
             or state.get("bytes") != path.stat().st_size
             or h3.media_profile(state.get("media", {}), duration=request["duration"]) != protocol["media_profile"]
@@ -130,11 +130,9 @@ def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
         path = directory / "judge" / f"judgments-{order}.jsonl"
         manifest_path = directory / "judge" / f"manifest-{order}.json"
         completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
-        if any(row.get("status") != "completed" for row in completed.values()):
-            raise RuntimeError("Evaluation fallback ledgers cannot be used as RL rewards")
         pending = set(manifest["pairs"]) - set(completed)
         if pending:
-            command = judge.command(directory, protocol, order, True, 1)
+            command = judge.command(directory, protocol, order)
             request_timeout = str(protocol["timeouts"]["judge_request"])
             command.extend(
                 [

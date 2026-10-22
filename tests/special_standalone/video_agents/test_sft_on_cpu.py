@@ -12,9 +12,9 @@
 
 import pytest
 
-from examples.prompt_rewrite import sft
-from examples.prompt_rewrite.prepare_sft import prepare_sft
-from examples.prompt_rewrite.storage import read_json, write_jsonl
+from examples.video_agents import sft
+from examples.video_agents.prepare_sft import prepare_sft
+from examples.video_agents.storage import read_json, write_jsonl
 
 
 @pytest.fixture
@@ -120,7 +120,7 @@ def test_retired_video_baseline_flag_is_not_silently_ignored(inputs):
 def test_rejects_different_eval_targets(inputs):
     args = sft.parse_args(inputs)
     config, _ = sft.training_config(args)
-    from examples.prompt_rewrite.storage import read_jsonl
+    from examples.video_agents.storage import read_jsonl
 
     rows = read_jsonl(args.dataset)
     rows[0]["h3_context_ir"] = "Changed teacher target"
@@ -157,8 +157,8 @@ def test_sft_reader_masks_the_exact_generation_prefix(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from examples.prompt_rewrite.config import build_messages
-    from examples.prompt_rewrite.sft_dataset import PromptRewriteSFTDataset
+    from examples.video_agents.config import build_sft_messages
+    from examples.video_agents.sft_dataset import PromptRewriteSFTDataset
 
     class CompleteConversationTokenizer:
         def apply_chat_template(self, messages, *, add_generation_prompt, **kwargs):
@@ -168,7 +168,7 @@ def test_sft_reader_masks_the_exact_generation_prefix(tmp_path):
                 text += "<assistant>"
             return list(text.encode())
 
-    messages = build_messages("An original prompt") + [{"role": "assistant", "content": "SECRET teacher target"}]
+    messages = build_sft_messages("An original prompt") + [{"role": "assistant", "content": "SECRET teacher target"}]
     path = tmp_path / "train.parquet"
     pq.write_table(pa.Table.from_pylist([{"id": "train-1", "messages": messages, "enable_thinking": False}]), path)
     config = {"pad_mode": "no_padding", "truncation": "error", "max_length": 8192}

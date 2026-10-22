@@ -14,21 +14,21 @@ from pathlib import Path
 
 from . import self_hosted_h3
 from .config import (
-    H3_ENDPOINT,
-    H3_SETTINGS,
+    MAX_REFERENCE_ENDPOINT,
+    MAX_REFERENCE_SETTINGS,
+    MAX_REFERENCE_VIDEO_FIELDS,
     REFERENCE_FIELDS,
-    REFERENCE_VIDEO_FIELDS,
     SELF_HOSTED_REFERENCE_VIDEO_FIELDS,
 )
-from .h3 import media_profile, request_body
+from .h3 import media_profile
 from .storage import file_sha256, fingerprint, read_json, read_jsonl
 
 
-def load_samples(path: Path, limit: int | None = None) -> list[dict]:
+def load_samples(path: Path) -> list[dict]:
     """Validate IDs/text without modifying the user's dataset."""
     rows, seen = read_jsonl(path), set()
-    if not rows or (limit is not None and not 0 < limit <= len(rows)):
-        raise ValueError("Dataset must be nonempty and limit must be within its row count")
+    if not rows:
+        raise ValueError("Evaluation dataset must be nonempty")
     for row in rows:
         for field in ("id", "prompt", "h3_context_ir"):
             if not isinstance(row.get(field), str) or not row[field].strip():
@@ -38,7 +38,7 @@ def load_samples(path: Path, limit: int | None = None) -> list[dict]:
         if "source" in row and (not isinstance(row["source"], str) or not row["source"].strip()):
             raise ValueError(f"Invalid source in eval row {row['id']}")
         seen.add(row["id"])
-    return rows[:limit]
+    return rows
 
 
 def reference_video_fields(manifest: dict) -> dict[str, str]:
@@ -47,8 +47,16 @@ def reference_video_fields(manifest: dict) -> dict[str, str]:
     if backend == self_hosted_h3.BACKEND:
         return SELF_HOSTED_REFERENCE_VIDEO_FIELDS
     if backend == "max":
-        return REFERENCE_VIDEO_FIELDS
+        return MAX_REFERENCE_VIDEO_FIELDS
     raise ValueError(f"Unknown reference H3 backend: {backend}")
+
+
+def reference_request(prompt: str, manifest: dict) -> dict:
+    """Reconstruct a saved reference request for provenance checks, never submission."""
+    settings = manifest["settings"]
+    if manifest.get("h3_backend") == self_hosted_h3.BACKEND:
+        return self_hosted_h3.request_body(prompt, settings)
+    return {**settings, "content": [{"type": "text", "text": prompt}]}
 
 
 def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[list[dict], dict, str]:
@@ -60,8 +68,8 @@ def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[l
     manifest = read_json(reference_dir / "manifest.json")
     fields = reference_video_fields(manifest)
     hosted = manifest.get("h3_backend") == self_hosted_h3.BACKEND
-    settings = self_hosted_h3.SETTINGS if hosted else H3_SETTINGS
-    endpoint = self_hosted_h3.ENDPOINT if hosted else H3_ENDPOINT
+    settings = self_hosted_h3.SETTINGS if hosted else MAX_REFERENCE_SETTINGS
+    endpoint = self_hosted_h3.ENDPOINT if hosted else MAX_REFERENCE_ENDPOINT
     if (
         manifest.get("endpoint") != endpoint
         or manifest.get("settings") != settings
@@ -89,7 +97,7 @@ def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[l
         references = {}
         for field in REFERENCE_FIELDS:
             task = tasks.get((row["id"], field))
-            request = self_hosted_h3.request_body(row[field], settings) if hosted else request_body(row[field])
+            request = reference_request(row[field], manifest)
             if task is None or task["request"] != request:
                 raise ValueError(f"Reference request differs from dataset: {row['id']}/{field}")
             video_path = (reference_dir / task["output"]).resolve()

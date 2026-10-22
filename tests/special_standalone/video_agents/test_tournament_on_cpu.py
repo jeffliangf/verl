@@ -19,18 +19,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from examples.prompt_rewrite import h3, judge, rl, self_hosted_h3, tournament
-from examples.prompt_rewrite.config import (
+from examples.video_agents import h3, judge, rl, self_hosted_h3, tournament
+from examples.video_agents.config import (
     CANDIDATE,
     DEFAULT_SELF_HOSTED_REFERENCES,
-    H3_ENDPOINT,
-    H3_SETTINGS,
     JUDGE_SETTINGS,
-    REFERENCE_VIDEO_FIELDS,
+    MAX_REFERENCE_ENDPOINT,
+    MAX_REFERENCE_SETTINGS,
+    MAX_REFERENCE_VIDEO_FIELDS,
     SELF_HOSTED_REFERENCE_VIDEO_FIELDS,
 )
-from examples.prompt_rewrite.evaluation import EXTERNAL_FILES
-from examples.prompt_rewrite.storage import file_sha256, fingerprint, read_json, read_jsonl, write_json, write_jsonl
+from examples.video_agents.dataset import reference_request
+from examples.video_agents.judge import EXTERNAL_FILES
+from examples.video_agents.storage import file_sha256, fingerprint, read_json, read_jsonl, write_json, write_jsonl
 
 MEDIA = {
     "duration_s": 10.125,
@@ -59,13 +60,13 @@ def prepared_rl(tmp_path):
             video.parent.mkdir(parents=True, exist_ok=True)
             video.write_bytes(f"reference {i} {field}".encode())
             state = video.with_suffix(".json")
-            request = h3.request_body(row[field])
+            request = reference_request(row[field], {"settings": MAX_REFERENCE_SETTINGS})
             write_json(
                 state,
                 {
                     "status": "succeeded",
                     "request_sha256": fingerprint(request),
-                    "endpoint": H3_ENDPOINT,
+                    "endpoint": MAX_REFERENCE_ENDPOINT,
                     "host": HOST,
                     "sha256": file_sha256(video),
                     "bytes": video.stat().st_size,
@@ -82,13 +83,13 @@ def prepared_rl(tmp_path):
                     "state": state.name,
                 }
             )
-            row[REFERENCE_VIDEO_FIELDS[field]] = str(video)
+            row[MAX_REFERENCE_VIDEO_FIELDS[field]] = str(video)
         rows.append(row)
     write_json(
         references / "manifest.json",
         {
-            "settings": H3_SETTINGS,
-            "endpoint": H3_ENDPOINT,
+            "settings": MAX_REFERENCE_SETTINGS,
+            "endpoint": MAX_REFERENCE_ENDPOINT,
             "context_ir_rewriter_enabled": False,
             "tasks": tasks,
         },
@@ -389,9 +390,9 @@ def test_prepare_self_hosted_rl_keeps_tool_and_max_reference_provenance(prepared
     assert schema["function"]["name"] == "sol_h3"
     assert schema["function"]["parameters"]["properties"]["prompt"]["maxLength"] == 8000
     assert protocol["h3"]["model"] == "MiniMax-H3-Base-FL2VA"
-    assert protocol["reference_h3"]["settings"] == H3_SETTINGS
+    assert protocol["reference_h3"]["settings"] == MAX_REFERENCE_SETTINGS
     assert protocol["reference_h3"]["backend"] == "max"
-    assert protocol["reference_video_fields"] == REFERENCE_VIDEO_FIELDS
+    assert protocol["reference_video_fields"] == MAX_REFERENCE_VIDEO_FIELDS
     assert protocol["samples"]["val"] == original["samples"]["val"]
     assert "duration" not in protocol["h3"] and "seed" not in protocol["h3"]
 
@@ -403,7 +404,8 @@ def test_rl_defaults_use_self_hosted_references(tmp_path):
     assert (args.groups_per_worker, args.h3_concurrency_per_worker, args.poll_interval) == (1, 2, 1)
 
 
-def test_prepare_rl_records_self_hosted_reference_provenance(prepared_rl, tmp_path):
+@pytest.fixture
+def hosted_references(prepared_rl, tmp_path):
     _, _, args = prepared_rl
     args = copy.copy(args)
     args.run_dir, args.data_dir = tmp_path / "hosted-run", tmp_path / "hosted-data"
@@ -433,6 +435,11 @@ def test_prepare_rl_records_self_hosted_reference_provenance(prepared_rl, tmp_pa
         row[SELF_HOSTED_REFERENCE_VIDEO_FIELDS[task["field"]]] = str(args.references / task["output"])
     write_json(args.references / "manifest.json", manifest)
     write_jsonl(args.eval_dataset, rows)
+    return args
+
+
+def test_prepare_rl_records_self_hosted_reference_provenance(hosted_references):
+    args = hosted_references
     assert rl.prepare(args)["network_requests"] == 0
     protocol = tournament.load_protocol(args.run_dir / "protocol.json")
     assert protocol["reference_video_fields"] == SELF_HOSTED_REFERENCE_VIDEO_FIELDS
@@ -440,7 +447,7 @@ def test_prepare_rl_records_self_hosted_reference_provenance(prepared_rl, tmp_pa
         "backend": "self-hosted",
         "settings": self_hosted_h3.SETTINGS,
         "endpoint": "/v1/videos",
-        "endpoints": manifest["h3_endpoints"],
+        "endpoints": ["http://reference-gateway:18080"],
     }
     assert protocol["h3_endpoints"] == [HOST]
     assert protocol["h3"] == {
@@ -454,6 +461,53 @@ def test_prepare_rl_records_self_hosted_reference_provenance(prepared_rl, tmp_pa
         assert set(schema["parameters"]["properties"]) == {"prompt", "duration", "seed"}
         assert schema["parameters"]["properties"]["prompt"]["maxLength"] == 8000
         assert "SECRET" not in json.dumps(row)
+
+
+@pytest.mark.parametrize("invalid", ["backend", "settings", "pool", "request", "state_media", "video_path", "bytes"])
+def test_prepare_rejects_mismatched_reference_provenance(hosted_references, invalid):
+    args = hosted_references
+    manifest = read_json(args.references / "manifest.json")
+    task = manifest["tasks"][0]
+    state_path = args.references / task["state"]
+    state = read_json(state_path)
+    rows = read_jsonl(args.eval_dataset)
+    if invalid == "backend":
+        manifest["h3_backend"] = "unknown"
+    elif invalid == "settings":
+        manifest["settings"]["model"] = "another-model"
+    elif invalid == "pool":
+        state["endpoints"] = ["http://another-gateway:18080"]
+    elif invalid == "request":
+        task["request"]["prompt"] = "Another prompt"
+    elif invalid == "state_media":
+        state["media"]["video"]["width"] = 1280
+    elif invalid == "video_path":
+        rows[0][SELF_HOSTED_REFERENCE_VIDEO_FIELDS[task["field"]]] = "/wrong/video.mp4"
+    else:
+        (args.references / task["output"]).write_bytes(b"changed reference clip")
+    write_json(args.references / "manifest.json", manifest)
+    write_json(state_path, state)
+    write_jsonl(args.eval_dataset, rows)
+    with pytest.raises(ValueError):
+        rl.prepare(args)
+    assert not (args.run_dir / "protocol.json").exists()
+
+
+@pytest.mark.parametrize("changed", ["candidate", "reference", "evaluator"])
+def test_changed_artifacts_stop_before_judging(prepared_rl, tmp_path, monkeypatch, changed):
+    directory, protocol, _ = prepared_rl
+    sample = protocol["samples"]["val"][0]
+    clips = candidates(tmp_path)[:1]
+    if changed == "candidate":
+        path = Path(clips[0]["path"])
+    elif changed == "reference":
+        path = Path(sample["references"]["prompt"]["path"])
+    else:
+        path = Path(protocol["eval_repo"]) / EXTERNAL_FILES[0]
+    path.write_bytes(b"changed artifact")
+    monkeypatch.setattr(tournament.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected judge request"))
+    with pytest.raises(ValueError, match="changed"):
+        tournament.score_group(directory / "changed", protocol, sample, clips, validate=True)
 
 
 @pytest.mark.parametrize("backend", [None, "max"])
@@ -626,7 +680,7 @@ def model_request(prepared_rl):
 
 @pytest.fixture
 def loop_factory(prepared_rl, monkeypatch):
-    from examples.prompt_rewrite import agent
+    from examples.video_agents import agent
     from verl.experimental.agent_loop.agent_loop import DictConfigWrap, ToolListWrap
     from verl.tools.tool_registry import initialize_tools_from_config
     from verl.workers.rollout.replica import TokenOutput
@@ -826,7 +880,7 @@ async def test_token_budget_exhaustion_is_a_policy_failure(loop_factory, model_r
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["aborted", "empty", "timeout", "h3"])
 async def test_infrastructure_errors_are_not_invalid_policy_calls(loop_factory, model_request, monkeypatch, failure):
-    from examples.prompt_rewrite import agent
+    from examples.video_agents import agent
 
     make, generated = loop_factory
     if failure == "h3":
@@ -847,7 +901,7 @@ async def test_infrastructure_errors_are_not_invalid_policy_calls(loop_factory, 
 
 @pytest.fixture
 def native_worker(prepared_rl, monkeypatch):
-    from examples.prompt_rewrite import agent
+    from examples.video_agents import agent
 
     directory, protocol, prepared_args = prepared_rl
     worker = object.__new__(agent.TournamentWorker)
@@ -881,7 +935,7 @@ def native_worker(prepared_rl, monkeypatch):
 async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(native_worker, monkeypatch, failure):
     import numpy as np
 
-    from examples.prompt_rewrite import agent
+    from examples.video_agents import agent
     from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
     from verl.utils.tensordict_utils import assign_non_tensor_data, get_tensordict
 

@@ -14,9 +14,9 @@ import pandas as pd
 import pyarrow.parquet as pq
 import pytest
 
-from examples.prompt_rewrite.config import build_messages
-from examples.prompt_rewrite.prepare_sft import prepare_sft
-from examples.prompt_rewrite.storage import read_json, write_jsonl
+from examples.video_agents.config import build_sft_messages
+from examples.video_agents.prepare_sft import prepare_sft
+from examples.video_agents.storage import read_json, write_jsonl
 
 
 def test_parquet_preserves_text_and_sources_and_repairs_target_key(tmp_path):
@@ -40,8 +40,8 @@ def test_parquet_preserves_text_and_sources_and_repairs_target_key(tmp_path):
     manifest = prepare_sft(train_file, val_file, output)
     train = pq.read_table(output / "train.parquet").to_pylist()
     val = pq.read_table(output / "val.parquet").to_pylist()
-    assert train[0]["messages"] == build_messages("A café") + [{"role": "assistant", "content": target}]
-    assert val[0]["messages"] == build_messages("Rain") + [{"role": "assistant", "content": "SECRET eval teacher"}]
+    assert train[0]["messages"] == build_sft_messages("A café") + [{"role": "assistant", "content": target}]
+    assert val[0]["messages"] == build_sft_messages("Rain") + [{"role": "assistant", "content": "SECRET eval teacher"}]
     assert (train[0]["id"], train[0]["source"], train[0]["split"]) == ("train-1", "train", "train")
     assert val[0]["split"] == "val"
     assert train[0]["enable_thinking"] is False and val[0]["enable_thinking"] is False

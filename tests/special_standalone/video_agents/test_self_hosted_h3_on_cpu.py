@@ -19,9 +19,9 @@ from pathlib import Path
 
 import pytest
 
-from examples.prompt_rewrite import h3
-from examples.prompt_rewrite import self_hosted_h3 as hosted
-from examples.prompt_rewrite.storage import read_json
+from examples.video_agents import h3
+from examples.video_agents import self_hosted_h3 as hosted
+from examples.video_agents.storage import read_json, write_json
 
 MEDIA = {
     "duration_s": 10.125,
@@ -44,7 +44,7 @@ def job(tmp_path):
     }
     task = {
         "id": "sample",
-        "request": h3.request_for_protocol("Exact video prompt", protocol),
+        "request": hosted.request_body("Exact video prompt", protocol["h3"]),
         "state": str(tmp_path / "state.json"),
         "output": str(tmp_path / "video.mp4"),
     }
@@ -158,6 +158,20 @@ def test_ambiguous_submission_is_never_retried(job):
     assert len(client.posts) == 1
 
 
+def test_interrupted_submission_is_never_retried(job, monkeypatch):
+    task, protocol = job
+    client = FakeClient()
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(client, "submit", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        hosted.generate_one(task, protocol, client, lambda path: MEDIA)
+    assert read_json(Path(task["state"]))["status"] == "submitting"
+    assert not hosted.generate_one(task, protocol, client, lambda path: MEDIA)
+
+
 @pytest.mark.parametrize("code", [429, 503])
 def test_explicit_backpressure_can_be_retried(job, code):
     task, protocol = job
@@ -205,7 +219,8 @@ def test_generated_media_must_match_the_requested_duration(job, duration):
     assert read_json(Path(task["state"]))["media"] == media
 
 
-def test_http_client_authenticates_download_and_bypasses_proxies(job, monkeypatch):
+@pytest.mark.parametrize("execution", ["client", "worker"])
+def test_http_generation_authenticates_and_resumes_without_reposting(job, monkeypatch, execution):
     task, protocol = job
     requests = []
 
@@ -242,7 +257,32 @@ def test_http_client_authenticates_download_and_bypasses_proxies(job, monkeypatc
         monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
         monkeypatch.setenv("NO_PROXY", "")
         protocol["h3_endpoints"] = [f"http://127.0.0.1:{server.server_port}"]
-        assert hosted.generate_one(task, protocol, hosted.Client("test-token"), lambda path: MEDIA)
+        if execution == "worker":
+            # Exercise the renamed module in an actual subprocess, including
+            # worker recovery from a missing download without a second POST.
+            directory = Path(task["state"]).parent
+            repo = directory / "eval-repo"
+            (repo / "bestofn").mkdir(parents=True)
+            (repo / "bestofn/normalize.py").write_text(f"def probe(path): return {MEDIA!r}\n")
+            protocol["eval_repo"] = str(repo)
+            write_json(directory / "protocol.json", protocol)
+            write_json(directory / "generation.json", [task])
+            monkeypatch.setenv("H3_SELF_HOSTED_TOKEN", "test-token")
+
+            def generate():
+                subprocess.run(h3.worker_command(directory, 1, 0.001, 10), check=True, timeout=15)
+
+        else:
+
+            def generate():
+                assert hosted.generate_one(task, protocol, hosted.Client("test-token"), lambda path: MEDIA)
+
+        generate()
+        generate()
+        Path(task["output"]).unlink()
+        generate()
+        assert read_json(Path(task["state"]))["status"] == "succeeded"
+        assert sum(method == "POST" for method, _, _ in requests) == 1
         assert requests[-1] == ("GET", f"/v1/jobs/{JOB}/video", "Bearer test-token")
     finally:
         server.shutdown()
@@ -255,30 +295,28 @@ def test_backend_configuration_preserves_reference_provenance(job):
     assert protocol["h3"]["model"] == "MiniMax-H3-Base-FL2VA"
     assert protocol["reference_h3"]["settings"]["model"] == "MiniMax-H3-Max"
     with pytest.raises(ValueError, match="at most 8000"):
-        h3.request_for_protocol("x" * 8001, protocol)
+        hosted.request_body("x" * 8001, protocol["h3"])
     with pytest.raises(ValueError, match="origins"):
         hosted.configuration(hosted.BACKEND, "http://secret@worker:18080", "max", protocol["media_profile"])
 
 
 def test_max_api_is_disabled_for_cli_and_direct_callers(job, monkeypatch, tmp_path):
-    from examples.prompt_rewrite.__main__ import parse_args
-    from examples.prompt_rewrite.evaluation import EvaluationRun
+    from examples.video_agents import rl
 
     task, protocol = job
-    assert parse_args(["prepare", "--run-dir", str(tmp_path)]).h3_backend == "self-hosted"
+    assert rl.parse_args(["prepare", "--run-dir", str(tmp_path)]).h3_backend == "self-hosted"
     with pytest.raises(SystemExit):
-        parse_args(["prepare", "--run-dir", str(tmp_path), "--h3-backend", "max"])
+        rl.parse_args(["prepare", "--run-dir", str(tmp_path), "--h3-backend", "max"])
+    args = rl.parse_args(["prepare", "--run-dir", str(tmp_path)])
+    args.h3_backend = "max"
     monkeypatch.setattr(
         hosted.Client, "from_environment", classmethod(lambda *a: pytest.fail("Read credentials for a disabled API"))
     )
     for call in (
         lambda: hosted.configuration("max", None, "max", protocol["media_profile"]),
-        lambda: EvaluationRun.prepare(tmp_path / "disabled", h3_backend="max"),
-        lambda: h3.generate_one(task),
-        lambda: h3.generate_tasks([task]),
+        lambda: rl.prepare(args),
         lambda: hosted.generate_one(task, {**protocol, "h3_backend": "max"}, FakeClient(), lambda _: MEDIA),
         lambda: hosted.generate_tasks([task], {**protocol, "h3_backend": "max"}, lambda _: MEDIA),
-        lambda: h3.run_with_fallbacks(tmp_path, {"h3_backend": "max"}, [task], 1, 1),
     ):
         with pytest.raises(ValueError, match="H3 Max API is disabled"):
             call()

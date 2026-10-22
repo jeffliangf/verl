@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=prompt-rewrite-sft
+#SBATCH --job-name=video-agents-sft
 #SBATCH --partition=all
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -8,11 +8,11 @@
 #SBATCH --mem=1024G
 #SBATCH --exclusive
 #SBATCH --time=24:00:00
-#SBATCH --output=outputs/prompt_rewrite/slurm-%j.log
+#SBATCH --output=outputs/video_agents/slurm-%j.log
 set -euo pipefail
 umask 077
 
-# Submit from the staged checkout; create outputs/prompt_rewrite before sbatch.
+# Submit from the staged checkout; create outputs/video_agents before sbatch.
 export UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT:-/raid/jeff/prompt-rewrite-venv}
 export PATH="$HOME/.local/bin:$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 export UV_CACHE_DIR=${UV_CACHE_DIR:-/raid/jeff/uv-cache}
@@ -31,13 +31,13 @@ export HYDRA_FULL_ERROR=1
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 : "${MODEL_PATH:?Set MODEL_PATH to the staged immutable base-model snapshot}"
-RUN_DIR=${RUN_DIR:-outputs/prompt_rewrite/qwen38-sft-b64-l4096}
+RUN_DIR=${RUN_DIR:-outputs/video_agents/qwen38-sft-b64-l4096}
 mkdir -p "$RUN_DIR"
 nvidia-smi --query-gpu=timestamp,index,name,memory.used,memory.total,utilization.gpu \
     --format=csv -l 10 > "$RUN_DIR/gpus.csv" &
 monitor_pid=$!
 trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
 
-uv run --frozen --extra fsdp python -m examples.prompt_rewrite.sft \
-    --run-dir "$RUN_DIR" --nproc-per-node 8 --eval-before-training --execute \
+uv run --frozen --extra fsdp python -m examples.video_agents.sft \
+    --run-dir "$RUN_DIR" --nproc-per-node 8 --execute \
     -- "model.path=$MODEL_PATH" "trainer.total_epochs=${TOTAL_EPOCHS:-3}" "$@"

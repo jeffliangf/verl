@@ -24,7 +24,7 @@ from .config import (
     DEFAULT_REWRITE_INSTRUCTION,
     DEFAULT_SYSTEM_PROMPT,
     ROOT,
-    build_messages,
+    build_sft_messages,
 )
 from .dataset import load_samples
 from .storage import file_sha256, freeze_json, run_lock
@@ -67,7 +67,7 @@ def training_config(args):
     if config.model.custom_chat_template is not None:
         raise ValueError("Use the model's shared chat template for this SFT/evaluation preset")
     if (
-        config.data.custom_cls.path != "pkg://examples.prompt_rewrite.sft_dataset"
+        config.data.custom_cls.path != "pkg://examples.video_agents.sft_dataset"
         or config.data.custom_cls.name != "PromptRewriteSFTDataset"
     ):
         raise ValueError("Keep PromptRewriteSFTDataset so preflight and training use the same assistant masks")
@@ -135,7 +135,7 @@ def validate_data(config, dataset: Path) -> dict:
         raise ValueError("SFT validation IDs differ from the video evaluation cohort")
     for row in splits["val"]:
         sample = evaluation[row["id"]]
-        expected = build_messages(sample["prompt"]) + [{"role": "assistant", "content": sample["h3_context_ir"]}]
+        expected = build_sft_messages(sample["prompt"]) + [{"role": "assistant", "content": sample["h3_context_ir"]}]
         if row["messages"] != expected or row["source"] != sample["source"]:
             raise ValueError(f"SFT validation text/source differs from video evaluation: {row['id']}")
     return {
@@ -187,7 +187,7 @@ def run(args) -> int:
     tensorboard_dir = local_path(
         args.tensorboard_dir
         or os.environ.get("TENSORBOARD_DIR")
-        or (ROOT / "tensorboard_log/prompt-rewrite" / args.run_dir.name)
+        or (ROOT / "tensorboard_log/video-agents" / args.run_dir.name)
     )
     env = {**os.environ, "TENSORBOARD_DIR": str(tensorboard_dir)}
     print(

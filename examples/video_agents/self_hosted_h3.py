@@ -25,7 +25,7 @@ from math import isfinite
 from pathlib import Path
 from uuid import UUID
 
-from .config import H3_ENDPOINT, H3_SETTINGS
+from .config import MAX_REFERENCE_ENDPOINT, MAX_REFERENCE_SETTINGS
 from .storage import file_sha256, fingerprint, read_json, write_json
 
 BACKEND = "self-hosted"
@@ -95,7 +95,11 @@ def configuration(backend, endpoints, reference_host, profile, token_file=None, 
         "h3_backend": BACKEND,
         "h3_endpoints": origins,
         "h3": deepcopy(SETTINGS),
-        "reference_h3": {"settings": deepcopy(H3_SETTINGS), "host": reference_host, "endpoint": H3_ENDPOINT},
+        "reference_h3": {
+            "settings": deepcopy(MAX_REFERENCE_SETTINGS),
+            "host": reference_host,
+            "endpoint": MAX_REFERENCE_ENDPOINT,
+        },
     }
     if reference_manifest is not None:
         result["reference_h3"] = {
@@ -116,11 +120,11 @@ def configuration(backend, endpoints, reference_host, profile, token_file=None, 
 
 
 def request_body(prompt, settings):
-    """Build the fixed-duration standalone rewrite-evaluation request."""
+    """Reconstruct the ten-second requests used to generate reference videos."""
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000:
         raise ValueError("Self-hosted H3 needs a nonempty prompt of at most 8000 characters")
     if settings["duration"] != 10:
-        raise ValueError("The prompt-rewrite evaluator requires 10-second clips")
+        raise ValueError("Reference videos must be 10-second clips")
     return {"prompt": prompt, "duration": settings["duration"], "seed": settings["seed"]}
 
 

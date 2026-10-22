@@ -8,8 +8,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Checkpoint-independent prompt rewriting and video evaluation.
+"""Prompt-rewrite SFT and native tool-calling video agents.
 
-Use ``python -m examples.prompt_rewrite.rl --help`` for training and canonical
-checkpoint evaluation. The package CLI preserves legacy artifact/report commands.
+Use ``python -m examples.video_agents.rl --help`` for agent training/evaluation
+and ``python -m examples.video_agents.sft --help`` for the rewrite SFT baseline.
 """

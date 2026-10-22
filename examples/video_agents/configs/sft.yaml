@@ -9,7 +9,7 @@ defaults:
 data:
   train_files: data/prompt_rewrite_sft/train.parquet
 
-  # The same 200 prompts used by examples.prompt_rewrite video evaluation.
+  # The same 200 prompts used by examples.video_agents video evaluation.
   val_files: data/prompt_rewrite_sft/val.parquet
 
   # Keep the trainer's drop_last behavior: 2,944 train and 192 validation rows.
@@ -22,7 +22,7 @@ data:
 
   # Render full conversations; Qwen's template rejects a standalone system turn.
   custom_cls:
-    path: pkg://examples.prompt_rewrite.sft_dataset
+    path: pkg://examples.video_agents.sft_dataset
 
     name: PromptRewriteSFTDataset
 
@@ -70,7 +70,7 @@ checkpoint:
   load_contents: [model, optimizer, extra]
 
 trainer:
-  project_name: prompt-rewrite-sft
+  project_name: video-agents-sft
 
   experiment_name: qwen38-27b
 
