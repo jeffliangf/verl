@@ -1,8 +1,14 @@
 # Prompt rewrite evaluation
 
-Evaluate a zero-shot, SFT, or RL rewriter using the same 200 prompts, H3 Max generation
-settings, reference videos, and Gemini rubric. Each run represents one immutable
+Evaluate a zero-shot, SFT, or RL rewriter using the same 200 prompts, self-hosted H3
+generation settings, reference videos, and Gemini rubric. Each run represents one immutable
 checkpoint and decoding configuration. Training is a separate step.
+
+**The paid H3 Max API is disabled.** New standalone evaluations use the Sol-H3
+gateway and the completed self-hosted reference videos. Max is never a fallback.
+Saved Max runs remain readable for inspection and reporting, but generation from
+them is rejected before any network request. Existing SFT/RL experiment directories
+and training presets have not been migrated.
 
 ```text
 original prompt → rewriter → rewritten_prompt → H3 → candidate video
@@ -24,7 +30,7 @@ text are excluded from its request by the existing evaluator.
 | `config.py`, `system_prompt.txt`, `rewrite_instruction.txt` | Shared system role, task instruction, and experiment settings |
 | `dataset.py` | Eval schema and reference-video provenance checks |
 | `rewrite.py` | Lazy vLLM adapter, injectable policy callable, imported rollout outputs |
-| `h3.py` | Direct generation, persistent task IDs, resumable polling/downloads |
+| `h3.py`, `self_hosted_h3.py` | Self-hosted generation, persistent job IDs, resumable polling/downloads |
 | `judge.py` | Original/swapped manifests and the existing Gemini runner |
 | `scoring.py` | Pure per-prompt scores and confidence intervals |
 | `reporting.py` | Three-score summaries and TensorBoard scalar logging |
@@ -36,8 +42,9 @@ text are excluded from its request by the existing evaluator.
 Video generation, judging, and scoring use the Python standard library.
 TensorBoard logging uses the lightweight `tensorboard` package, already included
 in the verl runtime; reporting does not load PyTorch or a GPU.
-The H3 HTTP helpers, MP4 reader, v4 rubric, and Gemini runner come from
-`~/video-generation-eval`; their source hashes are frozen in each run.
+The MP4 reader, v4 rubric, and Gemini runner come from `~/video-generation-eval`;
+their source hashes are frozen in each run. The self-hosted HTTP client lives here;
+new runs do not load or depend on the old Max HTTP helpers.
 
 ## Shared system role and task instructions
 
@@ -67,12 +74,12 @@ zero-shot evaluation when comparing checkpoints under the new instructions.
 A fresh checkout needs these assets supplied separately:
 
 - The evaluation JSONL, including `id`, `prompt`, `h3_context_ir`, `source`,
-  `prompt_h3_max_video`, and `h3_context_ir_h3_max_video`. Use accessible absolute
+  `prompt_h3_self_hosted_video`, and `h3_context_ir_h3_self_hosted_video`. Use accessible absolute
   video paths; the two source names are `movie_gen_video_bench` and `aa_eval`.
 - The reference directory with `manifest.json`, both videos per prompt, and their
   generation state files. Copy the complete directory so the manifest's relative
   paths continue to resolve.
-- A checkout of `video-generation-eval` containing `scripts/generate_h3_repeats.py`,
+- A checkout of `video-generation-eval` containing
   `scripts/run_gemini_pairwise_eval.py`, `scripts/build_pairwise_manifest.py`, and
   `bestofn/normalize.py`. Set `prepare --eval-repo` if it lives elsewhere.
 - For live execution, the model weights and GPU runtime for inference, plus the
@@ -83,25 +90,135 @@ Full datasets, videos, checkpoints, credentials, generated reports, and TensorBo
 event files are runtime inputs or outputs; they are not included with this code.
 Small SFT conversation previews are included in `data/prompt_rewrite_sft`.
 
+## Self-hosted H3 on H200
+
+Self-hosted H3 is the only enabled generation backend. `--h3-backend self-hosted`
+is the default; `--h3-backend max` is rejected. The generator is **H3-Base FL2VA
+with the four-step FastH3 adapter**. Set `--h3-endpoints` or `H3_SELF_HOSTED_ENDPOINTS` to a reachable gateway.
+`H3_HOST` and `H3_TOKEN` cannot enable the retired Max API.
+
+Use the single gateway **`http://10.2.201.187:18080`**. It dispatches internally
+to healthy workers; this URL and the bearer token stay the same when GPU counts,
+worker addresses, or Slurm jobs change. As of 2026-10-22, the pool has **20 H200
+GPUs / ten two-GPU workers**. Check `/healthz` for current capacity.
+The service preserves its correctness limits and uses dense attention for
+rejected shapes; completed job records report `used_gate_fallback` and attention
+counters. Every generation/Ray worker must be
+able to reach the gateway. This is a private cluster address and is not directly
+reachable from the `/home/jeff/Sana` workstation. A tunnel on
+one machine serves clients on that machine only. Distributed training needs
+network routing or equivalent forwarding on every client host.
+
+On the H200 cluster, the shared bearer-token file is
+`/home/jeff/sol-h3-h200/deployment/token`. Pass its filename at preparation time;
+the protocol stores the path, never the token. Ray workers read the file
+directly, so this does not depend on forwarding the driver's environment.
+For clients elsewhere, use a protected token file accessible to those clients.
+Standalone generation also accepts `H3_SELF_HOSTED_TOKEN_FILE` or
+`H3_SELF_HOSTED_TOKEN`; the paid provider's `H3_TOKEN` is not used.
+
+The public cluster login is **`jeff@157.66.255.187`, SSH port `44222`**;
+Jeff's key on this workstation is `/home/jeff/.ssh/gmi`. The full standalone
+service guide is `/home/jeff/Sana/models/minimax_h3/Sol-H3/README.md`, under
+**Access the deployed H200 service**. For direct cluster access:
+
+```bash
+ssh -i ~/.ssh/gmi -p 44222 jeff@157.66.255.187
+```
+
+For a single-host client outside that network, this SSH tunnel exposes the gateway
+on that client's loopback interface. Keep it running in another terminal on the
+**training/client host**:
+
+```bash
+ssh -i ~/.ssh/gmi -p 44222 -N \
+  -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+  -L 127.0.0.1:28080:10.2.201.187:18080 jeff@157.66.255.187
+```
+
+Use `--h3-endpoints http://127.0.0.1:28080` in this case. Copy the token securely
+to a local private file and pass that path with `--h3-token-file`. This one
+tunnel reaches all GPU workers through the gateway. A tunnel
+running only on a login machine does not provide connectivity to Ray actors on
+another compute machine.
+
+From the verl checkout in a network-connected environment, prepare a new
+standalone evaluation with the gateway and token-file options:
+
+```bash
+# Stable across GPU allocation and worker updates.
+H3_ENDPOINTS=http://10.2.201.187:18080
+
+curl --noproxy '*' --fail "$H3_ENDPOINTS/healthz"
+
+python -m examples.prompt_rewrite prepare \
+  --run-dir outputs/prompt_rewrite/qwen38-self-hosted-eval \
+  --h3-backend self-hosted --h3-endpoints "$H3_ENDPOINTS" \
+  --h3-token-file /home/jeff/sol-h3-h200/deployment/token
+
+# Run rewrite --execute or import-rewrites for this run before generation.
+python -m examples.prompt_rewrite generate \
+  --run-dir outputs/prompt_rewrite/qwen38-self-hosted-eval \
+  --execute --concurrency 8 --poll-interval 1
+```
+
+Each service worker has one active generation and eight waiting slots. The
+gateway prefers shorter queues. The client retries explicitly rejected 429/503
+submissions within the H3 timeout and saves the gateway URL and job ID for
+recovery. All polling and downloads use that same URL; the gateway retains the
+accepting worker internally and archives completed videos independently of GPU
+allocations. Neither the client nor gateway automatically repeats an ambiguous
+POST. Request concurrency is independent of the number of configured URLs:
+a single gateway supports concurrent jobs across the entire GPU pool.
+
+This adapter requests 10-second, 1344x768/24-fps clips with 32-kHz stereo audio
+and seed 42, matching the evaluator's native media checks. Warm generation took
+about 31 seconds per clip when sparse attention passed the original H200
+benchmark; repaired workers using dense fallback measured about 45 seconds on
+four recovered prompts. New prompt shapes can take longer. Each tool prompt is
+limited to 8,000 characters. Existing run directories remain frozen to their
+original provider and endpoint configuration. Prepare a new run to switch an
+old direct-worker run to the gateway; do not rewrite accepted jobs' recovery
+state. Once a run uses the gateway, its internal worker pool can change without
+altering that run's configuration.
+Install `ffmpeg` or `imageio-ffmpeg` in the client environment. Sol-H3's
+fragmented MP4s are remuxed into regular MP4s for the evaluator's existing parser;
+the encoded video and audio are copied without re-encoding.
+
+The standalone default reference directory is
+`data/prompt_rewrite_h3_eval/outputs_self_hosted_gateway_768p`: 200 original-prompt
+and 200 Context-IR videos generated with this same Base/FastH3 configuration.
+Preparation verifies their request bodies, endpoint pool, saved job state, file
+sizes, checksums, native media profile, and the dataset's self-hosted video paths.
+`reference_h3` records the actual reference model and endpoint pool separately
+from the candidate connection. Explicitly selecting historical Max references
+remains possible for offline comparisons; it does not enable Max generation.
+Gemini still uses its existing API and credentials.
+
 ## Zero-shot run
 
 Run from the verl repository root. First prepare the full evaluation and inspect
 the rewrite input. These commands make no network requests and load no model:
 
 ```bash
+# For this workstation, first open the gateway tunnel described above.
+export H3_SELF_HOSTED_ENDPOINTS=http://127.0.0.1:28080
+export H3_SELF_HOSTED_TOKEN_FILE=/path/to/local/private-token
+
 uv run --no-project --python 3.12 python -m examples.prompt_rewrite prepare \
-  --run-dir outputs/prompt_rewrite/qwen38-zero-shot \
-  --name qwen38-zero-shot --model Qwen/Qwen3.8-27B
+  --run-dir outputs/prompt_rewrite/qwen38-zero-shot-self-hosted \
+  --name qwen38-zero-shot-self-hosted --model Qwen/Qwen3.8-27B
 
 uv run --no-project --python 3.12 python -m examples.prompt_rewrite rewrite \
-  --run-dir outputs/prompt_rewrite/qwen38-zero-shot
+  --run-dir outputs/prompt_rewrite/qwen38-zero-shot-self-hosted
 ```
 
 Preparation defaults to `data/prompt_rewrite_aa_moviegen_eval_200.jsonl` and the
-existing `data/prompt_rewrite_h3_eval/outputs_h3max_disabled_768p/manifest.json`. It verifies both
+`data/prompt_rewrite_h3_eval/outputs_self_hosted_gateway_768p/manifest.json`. It verifies both
 reference files for every prompt, including their request text, settings,
-checksum, and native video/audio format. The JSONL's `prompt_h3_max_video` and
-`h3_context_ir_h3_max_video` paths are required and must match the reference manifest.
+checksum, and native video/audio format. The JSONL's `prompt_h3_self_hosted_video` and
+`h3_context_ir_h3_self_hosted_video` paths are required and must match the reference manifest.
+Missing or mismatched self-hosted paths are errors even if old Max paths are present.
 These become the `prompt` and `h3_context_ir` reference scores, respectively.
 
 For a small smoke run, prepare a **different directory** with `--limit 2`.
@@ -111,7 +228,7 @@ On a GPU worker with the repository's vLLM environment, generate the rewrites:
 
 ```bash
 uv run --frozen --extra fsdp --extra vllm python -m examples.prompt_rewrite rewrite \
-  --run-dir outputs/prompt_rewrite/qwen38-zero-shot --execute
+  --run-dir outputs/prompt_rewrite/qwen38-zero-shot-self-hosted --execute
 ```
 
 The default is BF16, one GPU, thinking disabled, greedy decoding, and 2,048 output
@@ -127,30 +244,29 @@ Generate and judge videos after reviewing the rewrites:
 
 ```bash
 uv run --no-project --python 3.12 python -m examples.prompt_rewrite generate \
-  --run-dir outputs/prompt_rewrite/qwen38-zero-shot --execute --concurrency 500
+  --run-dir outputs/prompt_rewrite/qwen38-zero-shot-self-hosted --execute --concurrency 8 --poll-interval 1
 
 uv run --no-project --python 3.12 python -m examples.prompt_rewrite judge \
-  --run-dir outputs/prompt_rewrite/qwen38-zero-shot --execute --concurrency 500
+  --run-dir outputs/prompt_rewrite/qwen38-zero-shot-self-hosted --execute --concurrency 500
 
 uv run --no-project --python 3.12 --with tensorboard==2.20.0 python -m examples.prompt_rewrite report \
-  --run-dir outputs/prompt_rewrite/qwen38-zero-shot
+  --run-dir outputs/prompt_rewrite/qwen38-zero-shot-self-hosted
 ```
 
 `rewrite`, `generate`, and `judge` default to dry runs; `--execute` starts work.
 `generate` requires all rewrites, and `judge` requires all candidate videos.
-Credentials use the same environment variables or `arena/.env` as the existing
-eval repository (`H3_HOST`, `H3_TOKEN`, and the Gemini runner's API key).
+Generation uses the frozen `--h3-token-file`, `H3_SELF_HOSTED_TOKEN_FILE`, or
+`H3_SELF_HOSTED_TOKEN`. Gemini uses the existing evaluator's API key or `arena/.env`.
 
 For 200 prompts this creates **200 new videos and 800 Gemini judgments**. Both
-reference cohorts are reused. H3 concurrency defaults to 500, so all 200 candidate
-tasks can be active at once. Gemini concurrency also defaults to 500 and is
+reference cohorts are reused. Standalone H3 concurrency defaults to eight, with
+one-second polling. Gemini concurrency defaults to 500 and is
 configured separately; its existing runner limits active workers to available
 prompt batches.
-No Context-IR endpoint is called. Generation uses `MiniMax-H3-Max` with
-`extra.prompt_expansion_mode: "disabled"`, 768P,
-10 seconds, requested ratio 16:9, seed 42, and the same host as the references.
-Its native reference output is 1344×768 at 24 fps with audio; candidate media must
-match. A fixed seed does not establish deterministic behavior of the remote API.
+No Context-IR endpoint is called. Generation sends the exact rewritten prompt
+to self-hosted H3-Base/FastH3 with duration 10 and seed 42. The native output is
+1344×768 at 24 fps with 32-kHz stereo audio; candidate media must match the
+references. A fixed seed does not establish deterministic behavior of the service.
 
 The judge settings are `gemini-3.7-flash`, high thinking, standard video
 processing, seed 0, unchanged v4 instructions, and no explicit token ceiling.
@@ -269,21 +385,21 @@ before creating replacement work. Changed inputs or evaluator code require a
 new run directory. Reference and candidate checksums are checked before judging.
 Existing runs keep their frozen generation settings even when defaults change.
 
-To reuse the completed zero-shot rewrites with H3 Max, prepare a separate run
+To reuse the completed zero-shot rewrites with self-hosted H3, prepare a separate run
 and import the saved outputs. This skips GPU inference and preserves the old run:
 
 ```bash
 uv run --no-project --python 3.12 python -m examples.prompt_rewrite prepare \
-  --run-dir outputs/prompt_rewrite/qwen38-zero-shot-h3-max \
-  --name qwen38-zero-shot-h3-max
+  --run-dir outputs/prompt_rewrite/qwen38-zero-shot-self-hosted \
+  --name qwen38-zero-shot-self-hosted --h3-endpoints "$H3_SELF_HOSTED_ENDPOINTS"
 
 uv run --no-project --python 3.12 python -m examples.prompt_rewrite import-rewrites \
-  --run-dir outputs/prompt_rewrite/qwen38-zero-shot-h3-max \
+  --run-dir outputs/prompt_rewrite/qwen38-zero-shot-self-hosted \
   --input outputs/prompt_rewrite/qwen38-zero-shot/rewrites.jsonl
 ```
 
 Then run `generate`, `judge`, and `report` with the new `--run-dir`. Both reference
-videos and newly generated candidate videos use H3 Max with expansion disabled.
+videos and newly generated candidate videos use self-hosted H3-Base/FastH3.
 
 ## Direct reference benchmark
 
@@ -292,12 +408,12 @@ for each sample, using the exact cohort and settings of a saved evaluation:
 
 ```bash
 uv run --no-project --python 3.12 python -m examples.prompt_rewrite benchmark-references \
-  --source-run outputs/prompt_rewrite/qwen38-zero-shot-h3-max \
-  --run-dir outputs/prompt_rewrite/h3-context-ir-vs-prompt-h3-max \
-  --name h3-context-ir-vs-prompt-h3-max --execute --concurrency 500
+  --source-run outputs/prompt_rewrite/qwen38-zero-shot-self-hosted \
+  --run-dir outputs/prompt_rewrite/h3-context-ir-vs-prompt-self-hosted \
+  --name h3-context-ir-vs-prompt-self-hosted --execute --concurrency 500
 
 uv run --no-project --python 3.12 --with tensorboard==2.20.0 python -m examples.prompt_rewrite report \
-  --run-dir outputs/prompt_rewrite/h3-context-ir-vs-prompt-h3-max
+  --run-dir outputs/prompt_rewrite/h3-context-ir-vs-prompt-self-hosted
 ```
 
 The candidate is `h3_context_ir`, scored against `prompt`. Thus, a score above
@@ -466,7 +582,7 @@ restored afterward. The optimizer and full-run learning-rate schedule stay in
 memory throughout. Each protocol records `rewriter.backend=hf_fsdp2`, since
 numerical results can differ between HF and vLLM inference.
 
-Rank zero sends the rewrites to H3 Max with prompt expansion disabled, judges
+Rank zero sends the rewrites through the shared H3 client, judges
 both orders against both stored references, and reports AA eval, MovieGen, and
 their equal-weight average **against each reference**. This requires 200 new
 videos and 800 Gemini judgments per evaluation, including the optional baseline.

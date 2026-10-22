@@ -15,13 +15,13 @@ import json
 import subprocess
 from pathlib import Path
 
+from . import self_hosted_h3
 from .config import (
     DEFAULT_DATASET,
     DEFAULT_EVAL_REPO,
-    DEFAULT_REFERENCES,
     DEFAULT_REWRITE_INSTRUCTION,
+    DEFAULT_SELF_HOSTED_REFERENCES,
     DEFAULT_SYSTEM_PROMPT,
-    H3_CONCURRENCY,
     JUDGE_CONCURRENCY,
     RewriteConfig,
 )
@@ -38,8 +38,9 @@ def parse_args(argv=None):
     prepare = sub.add_parser("prepare", parents=[common], help="Validate references and freeze a checkpoint's inputs")
     prepare.add_argument("--name", default="qwen38-zero-shot")
     prepare.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
-    prepare.add_argument("--references", type=Path, default=DEFAULT_REFERENCES)
+    prepare.add_argument("--references", type=Path, default=DEFAULT_SELF_HOSTED_REFERENCES)
     prepare.add_argument("--eval-repo", type=Path, default=DEFAULT_EVAL_REPO)
+    self_hosted_h3.add_arguments(prepare)
     prepare.add_argument("--system-prompt-file", type=Path)
     prepare.add_argument("--rewrite-instruction-file", type=Path)
     prepare.add_argument("--limit", type=int, help="Freeze a small cohort for a smoke run in its own directory")
@@ -67,10 +68,12 @@ def parse_args(argv=None):
             command.add_argument("--batch-size", type=int, default=8)
         else:
             command.add_argument(
-                "--concurrency", type=int, default=H3_CONCURRENCY if stage == "generate" else JUDGE_CONCURRENCY
+                "--concurrency",
+                type=int,
+                default=self_hosted_h3.DEFAULT_CONCURRENCY if stage == "generate" else JUDGE_CONCURRENCY,
             )
         if stage == "generate":
-            command.add_argument("--poll-interval", type=float, default=20)
+            command.add_argument("--poll-interval", type=float, default=1)
         if stage in ("generate", "judge"):
             command.add_argument("--neutral-on-failure", action="store_true")
             command.add_argument("--pass-timeout-seconds", type=float, default=1800)
@@ -117,6 +120,9 @@ def main(argv=None) -> int:
                 system_prompt=system,
                 rewrite_instruction=instruction,
                 limit=args.limit,
+                h3_backend=args.h3_backend,
+                h3_endpoints=args.h3_endpoints,
+                h3_token_file=args.h3_token_file,
             )
             result = run.status()
         elif args.stage == "benchmark-references":

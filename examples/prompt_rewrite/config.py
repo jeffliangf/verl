@@ -16,11 +16,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET = ROOT / "data/prompt_rewrite_aa_moviegen_eval_200.jsonl"
+# Training presets retain their historical defaults until those experiments migrate.
 DEFAULT_REFERENCES = ROOT / "data/prompt_rewrite_h3_eval/outputs_h3max_disabled_768p"
+DEFAULT_SELF_HOSTED_REFERENCES = ROOT / "data/prompt_rewrite_h3_eval/outputs_self_hosted_gateway_768p"
 DEFAULT_EVAL_REPO = Path.home() / "video-generation-eval"
 DEFAULT_SYSTEM_PROMPT = Path(__file__).with_name("system_prompt.txt").read_text(encoding="utf-8").strip()
 DEFAULT_REWRITE_INSTRUCTION = Path(__file__).with_name("rewrite_instruction.txt").read_text(encoding="utf-8").strip()
 
+# Historical Max metadata is retained only to validate saved artifacts.
 H3_ENDPOINT = "/v2/video_generation"
 H3_CONCURRENCY = 500
 JUDGE_CONCURRENCY = 500
@@ -44,6 +47,10 @@ REFERENCE_FIELDS = ("prompt", "h3_context_ir")
 REFERENCE_VIDEO_FIELDS = {
     "prompt": "prompt_h3_max_video",
     "h3_context_ir": "h3_context_ir_h3_max_video",
+}
+SELF_HOSTED_REFERENCE_VIDEO_FIELDS = {
+    "prompt": "prompt_h3_self_hosted_video",
+    "h3_context_ir": "h3_context_ir_h3_self_hosted_video",
 }
 CANDIDATE = "rewritten_prompt"
 SCORE_SOURCES = {"moviegen": "movie_gen_video_bench", "aa_eval": "aa_eval"}

@@ -12,12 +12,16 @@
 
 import copy
 import json
+import shutil
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 
-from examples.prompt_rewrite import evaluation, h3, judge, rewrite, scoring
+from examples.prompt_rewrite import evaluation, h3, judge, rewrite, scoring, self_hosted_h3
 from examples.prompt_rewrite.__main__ import main
 from examples.prompt_rewrite.config import (
     CANDIDATE,
@@ -26,6 +30,7 @@ from examples.prompt_rewrite.config import (
     H3_SETTINGS,
     JUDGE_SETTINGS,
     REFERENCE_VIDEO_FIELDS,
+    SELF_HOSTED_REFERENCE_VIDEO_FIELDS,
     build_messages,
 )
 from examples.prompt_rewrite.evaluation import EXTERNAL_FILES, EvaluationRun
@@ -46,25 +51,21 @@ class FakeH3:
         self.fail_post = False
         self.fail_query = False
 
-    def load_env(self):
-        pass
-
-    def auth_headers(self, token):
-        return {}
-
-    def post_json(self, url, headers, request):
-        self.posts.append((url, request))
+    def submit(self, origin, request, **kwargs):
+        self.posts.append((origin + self_hosted_h3.ENDPOINT, request))
         if self.fail_post:
             raise TimeoutError("ambiguous submission")
-        return {"task_id": str(len(self.posts))}
+        return {"id": str(UUID(int=len(self.posts)))}
 
-    def get_json(self, url, headers):
+    def get_json(self, url, **kwargs):
+        if url.endswith("/healthz"):
+            return {"status": "ready", "queued": 0, "queue_capacity": 8}
         self.queries.append(url)
         if self.fail_query:
             raise OSError("temporary polling failure")
-        return {"task": {"status": "succeeded", "content": {"url": "https://video.invalid/output.mp4"}}}
+        return {"id": url.rsplit("/", 1)[-1], "status": "succeeded"}
 
-    def download_video(self, url, path):
+    def download(self, origin, job_id, path, **kwargs):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"candidate clip")
 
@@ -129,11 +130,12 @@ def prepared(tmp_path, monkeypatch):
             return SimpleNamespace(INSTRUCTIONS_VERSION=4, INSTRUCTIONS="Frozen comparison rubric")
         if path.name == "normalize.py":
             return SimpleNamespace(probe=lambda _: MEDIA)
-        if path.name == "generate_h3_repeats.py":
-            return client
         raise AssertionError(f"Unexpected module: {path}")
 
     monkeypatch.setattr(evaluation, "load_external", external)
+    monkeypatch.setattr(self_hosted_h3.Client, "from_environment", classmethod(lambda cls, protocol=None: client))
+    monkeypatch.setenv("H3_SELF_HOSTED_ENDPOINTS", HOST)
+    monkeypatch.setenv("H3_SELF_HOSTED_TOKEN", "test-token")
     monkeypatch.setenv("H3_HOST", HOST)
     monkeypatch.setenv("H3_TOKEN", "test-token")
     monkeypatch.setenv("TENSORBOARD_DIR", str(tmp_path / "tensorboard"))
@@ -148,6 +150,184 @@ def import_outputs(run):
             for sample in run.protocol["samples"]
         ]
     )
+
+
+@pytest.fixture
+def hosted_references(prepared, tmp_path):
+    source, client, rows = prepared
+    references = tmp_path / "hosted-references"
+    shutil.copytree(Path(source.protocol["reference_manifest"]).parent, references)
+    manifest = read_json(references / "manifest.json")
+    manifest.update(
+        h3_backend="self-hosted",
+        h3_endpoints=["http://reference-a:18080", "http://reference-b:18080"],
+        h3=copy.deepcopy(self_hosted_h3.SETTINGS),
+        settings=copy.deepcopy(self_hosted_h3.SETTINGS),
+        endpoint=self_hosted_h3.ENDPOINT,
+        media_profile=h3.media_profile(MEDIA),
+    )
+    rows = copy.deepcopy(rows)
+    by_id = {row["id"]: row for row in rows}
+    for index, task in enumerate(manifest["tasks"]):
+        row = by_id[task["item_id"]]
+        task["request"] = self_hosted_h3.request_body(row[task["field"]], manifest["settings"])
+        task["request_sha256"] = fingerprint(task["request"])
+        state_path = references / task["state"]
+        state = read_json(state_path)
+        state.pop("host")
+        state.update(
+            self_hosted_h3.identity(task, manifest),
+            worker_url=manifest["h3_endpoints"][index % 2],
+            task_id=str(UUID(int=index + 100)),
+        )
+        write_json(state_path, state)
+        row[SELF_HOSTED_REFERENCE_VIDEO_FIELDS[task["field"]]] = str(references / task["output"])
+    write_json(references / "manifest.json", manifest)
+    dataset = tmp_path / "hosted.jsonl"
+    write_jsonl(dataset, rows)
+    return dict(dataset=dataset, references=references, eval_repo=Path(source.protocol["eval_repo"]))
+
+
+def test_self_hosted_references_keep_pool_and_model_provenance(hosted_references, tmp_path):
+    run = EvaluationRun.prepare(tmp_path / "hosted-run", **hosted_references)
+    protocol = run.protocol
+    assert protocol["h3_backend"] == "self-hosted"
+    assert protocol["h3_endpoints"] == [HOST]
+    assert protocol["reference_video_fields"] == SELF_HOSTED_REFERENCE_VIDEO_FIELDS
+    assert protocol["reference_h3"] == {
+        "backend": "self-hosted",
+        "settings": self_hosted_h3.SETTINGS,
+        "endpoint": "/v1/videos",
+        "endpoints": ["http://reference-a:18080", "http://reference-b:18080"],
+    }
+    assert "scripts/generate_h3_repeats.py" not in protocol["dependencies"]
+    import_outputs(run)
+    assert run.generate(execute=True, concurrency=1)["video_statuses"] == {"succeeded": 3}
+    assert len(run.comparison_inputs()["original"]["pairs"]) == 6
+
+
+@pytest.mark.parametrize("invalid", ["missing_field", "max_path", "pool", "worker", "settings", "request", "bytes"])
+def test_self_hosted_references_reject_mismatches_without_using_max(hosted_references, tmp_path, invalid):
+    dataset, references = hosted_references["dataset"], hosted_references["references"]
+    rows = [json.loads(line) for line in dataset.read_text().splitlines()]
+    manifest = read_json(references / "manifest.json")
+    task = manifest["tasks"][0]
+    state_path = references / task["state"]
+    state = read_json(state_path)
+    if invalid == "missing_field":
+        del rows[0]["prompt_h3_self_hosted_video"]
+    elif invalid == "max_path":
+        rows[0]["prompt_h3_self_hosted_video"] = rows[0]["prompt_h3_max_video"]
+    elif invalid == "pool":
+        state["endpoints"] = ["http://unrelated:18080"]
+    elif invalid == "worker":
+        state["worker_url"] = "http://unrelated:18080"
+    elif invalid == "settings":
+        manifest["settings"]["seed"] = 99
+    elif invalid == "request":
+        task["request"]["prompt"] = "Different reference prompt"
+    else:
+        (references / task["output"]).write_bytes(b"changed video")
+    write_jsonl(dataset, rows)
+    write_json(references / "manifest.json", manifest)
+    write_json(state_path, state)
+    with pytest.raises(ValueError):
+        EvaluationRun.prepare(tmp_path / "invalid-hosted", **hosted_references)
+
+
+@pytest.mark.parametrize("backend", [None, "max"])
+@pytest.mark.parametrize("neutral", [False, True])
+def test_legacy_runs_reject_generation_before_credentials_or_fallbacks(prepared, monkeypatch, backend, neutral):
+    run, client, _ = prepared
+    run.protocol.pop("h3_backend")
+    if backend:
+        run.protocol["h3_backend"] = backend
+    run.protocol["h3"] = copy.deepcopy(H3_SETTINGS)
+    write_json(run.path / "protocol.json", run.protocol)
+    write_json(run.path / "protocol-sha256.json", fingerprint(run.protocol))
+    monkeypatch.setattr(evaluation, "load_external", lambda *a: pytest.fail("Loaded a provider client"))
+    monkeypatch.setattr(h3.subprocess, "run", lambda *a, **k: pytest.fail("Started a generation worker"))
+    monkeypatch.setattr(
+        self_hosted_h3.Client, "from_environment", classmethod(lambda *a: pytest.fail("Read credentials"))
+    )
+    assert run.status()["rewrites_complete"] == 0
+    with pytest.raises(ValueError, match="H3 Max API is disabled"):
+        run.generate(execute=True, neutral_on_failure=neutral)
+    monkeypatch.setattr("sys.argv", ["h3", "--run-dir", str(run.path)])
+    with pytest.raises(ValueError, match="H3 Max API is disabled"):
+        h3.main()
+    assert not (run.path / "generation.json").exists()
+    assert not (run.path / "videos/fallbacks.json").exists()
+    assert not client.posts
+
+
+def test_completed_legacy_artifacts_remain_readable(prepared):
+    run, client, _ = prepared
+    run.protocol.pop("h3_backend")
+    run.protocol["h3"] = copy.deepcopy(H3_SETTINGS)
+    write_json(run.path / "protocol.json", run.protocol)
+    write_json(run.path / "protocol-sha256.json", fingerprint(run.protocol))
+    import_outputs(run)
+    for task in run.generation_tasks():
+        path = Path(task["output"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"historical Max clip")
+        write_json(
+            Path(task["state"]),
+            {
+                **h3.task_identity(task, run.protocol),
+                "status": "succeeded",
+                "sha256": file_sha256(path),
+                "bytes": path.stat().st_size,
+                "media": MEDIA,
+            },
+        )
+    add_judgments(run, run.comparison_inputs())
+    assert run.report(log_tensorboard=False)["complete"]
+    assert not client.posts
+
+
+def test_self_hosted_evaluation_uses_distinct_protocol_and_generation_path(prepared, tmp_path, monkeypatch):
+    from examples.prompt_rewrite import self_hosted_h3
+
+    source, paid_client, _ = prepared
+    run = EvaluationRun.prepare(
+        tmp_path / "self-hosted",
+        dataset=Path(source.protocol["dataset"]),
+        references=Path(source.protocol["reference_manifest"]).parent,
+        eval_repo=Path(source.protocol["eval_repo"]),
+        h3_backend="self-hosted",
+        h3_endpoints="http://worker:18080",
+    )
+    import_outputs(run)
+    tasks = run.generation_tasks()
+    assert tasks[0]["request"] == {"prompt": "Rewrite for Original prompt 0", "duration": 10, "seed": 42}
+    calls = []
+
+    def generate(actual_tasks, protocol, probe, concurrency, poll_interval, timeout):
+        calls.append(actual_tasks)
+        for task in actual_tasks:
+            output = Path(task["output"])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"self-hosted clip")
+            write_json(
+                Path(task["state"]),
+                {
+                    **h3.task_identity(task, protocol),
+                    "status": "succeeded",
+                    "sha256": file_sha256(output),
+                    "bytes": output.stat().st_size,
+                    "media": MEDIA,
+                },
+            )
+        return {task["id"]: True for task in actual_tasks}
+
+    monkeypatch.setattr(self_hosted_h3, "generate_tasks", generate)
+    result = run.generate(execute=True, concurrency=8, poll_interval=1)
+    assert result["videos_accounted_for"] == 3
+    assert len(run._generated_candidates()) == 3
+    assert len(calls) == 1 and not paid_client.posts
+    assert run.protocol["reference_h3"]["settings"] == H3_SETTINGS
 
 
 def test_prepare_cli_keeps_vllm_as_default_backend(prepared, tmp_path):
@@ -218,15 +398,13 @@ def test_resident_epoch_pipeline_reuses_model_and_completed_work(prepared, monke
 
     def h3_worker(args, *, check, timeout):
         run = EvaluationRun(Path(args[args.index("--run-dir") + 1]))
-        results = h3.generate_tasks(
+        results = self_hosted_h3.generate_tasks(
             run.generation_tasks(),
-            client,
-            HOST,
-            {},
+            run.protocol,
             lambda _: MEDIA,
-            h3.media_profile(MEDIA),
             concurrency=1,
             timeout=timeout,
+            client=client,
         )
         return SimpleNamespace(returncode=int(not all(results.values())))
 
@@ -283,10 +461,10 @@ def test_full_pipeline_and_repeated_resume(prepared):
     assert client.posts == []
     assert run.generate(execute=True, concurrency=1)["video_statuses"] == {"succeeded": 3}
     assert len(client.posts) == 3
-    assert all(url == HOST + H3_ENDPOINT for url, _ in client.posts)
+    assert all(url == HOST + self_hosted_h3.ENDPOINT for url, _ in client.posts)
     assert all("SECRET" not in json.dumps(body) for _, body in client.posts)
-    assert all(body["model"] == "MiniMax-H3-Max" for _, body in client.posts)
-    assert all(body["extra"] == {"prompt_expansion_mode": "disabled"} for _, body in client.posts)
+    assert all(set(body) == {"prompt", "duration", "seed"} for _, body in client.posts)
+    assert all(body["duration"] == 10 and body["seed"] == 42 for _, body in client.posts)
     run.generate(execute=True, concurrency=1)
     assert len(client.posts) == 3
     manifests = run.comparison_inputs()
@@ -384,12 +562,11 @@ def test_saved_run_uses_frozen_generation_settings(prepared, monkeypatch):
     import_outputs(run)
     original_requests = run.generation_tasks()
     monkeypatch.setattr(h3, "H3_SETTINGS", {"model": "a-future-default"})
-    monkeypatch.setattr(evaluation, "H3_SETTINGS", {"model": "a-future-default"})
+    monkeypatch.setattr(self_hosted_h3, "SETTINGS", {"duration": 5, "seed": 1})
     run = EvaluationRun(run.path)
     assert run.generation_tasks() == original_requests
     run.generate(execute=True, concurrency=1)
-    assert all(body["model"] == "MiniMax-H3-Max" for _, body in client.posts)
-    assert all(body["extra"]["prompt_expansion_mode"] == "disabled" for _, body in client.posts)
+    assert all(body["duration"] == 10 and body["seed"] == 42 for _, body in client.posts)
 
 
 def test_tensorboard_scores_round_trip_at_training_step(prepared, tmp_path):
@@ -518,11 +695,11 @@ def test_unknown_submission_is_never_reposted(prepared):
     import_outputs(run)
     task = run.generation_tasks()[0]
     client.fail_post = True
-    args = (task, client, HOST, {}, lambda _: MEDIA, h3.media_profile(MEDIA))
-    assert not h3.generate_one(*args)
+    args = (task, run.protocol, client, lambda _: MEDIA)
+    assert not self_hosted_h3.generate_one(*args)
     assert read_json(Path(task["state"]))["status"] == "submit_unknown"
     client.fail_post = False
-    assert not h3.generate_one(*args)
+    assert not self_hosted_h3.generate_one(*args)
     assert len(client.posts) == 1
 
 
@@ -530,14 +707,14 @@ def test_poll_failure_resumes_accepted_task_and_missing_download(prepared):
     run, client, _ = prepared
     import_outputs(run)
     task = run.generation_tasks()[0]
-    args = (task, client, HOST, {}, lambda _: MEDIA, h3.media_profile(MEDIA))
+    args = (task, run.protocol, client, lambda _: MEDIA)
     client.fail_query = True
-    assert not h3.generate_one(*args)
-    assert read_json(Path(task["state"]))["task_id"] == "1"
+    assert not self_hosted_h3.generate_one(*args)
+    assert read_json(Path(task["state"]))["task_id"] == str(UUID(int=1))
     client.fail_query = False
-    assert h3.generate_one(*args)
+    assert self_hosted_h3.generate_one(*args)
     Path(task["output"]).unlink()
-    assert h3.generate_one(*args)
+    assert self_hosted_h3.generate_one(*args)
     assert len(client.posts) == 1
 
 
@@ -546,15 +723,15 @@ def test_process_death_during_submission_is_not_reposted(prepared, monkeypatch):
     import_outputs(run)
     task = run.generation_tasks()[0]
 
-    def die(*args):
+    def die(*args, **kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(client, "post_json", die)
-    args = (task, client, HOST, {}, lambda _: MEDIA, h3.media_profile(MEDIA))
+    monkeypatch.setattr(client, "submit", die)
+    args = (task, run.protocol, client, lambda _: MEDIA)
     with pytest.raises(KeyboardInterrupt):
-        h3.generate_one(*args)
+        self_hosted_h3.generate_one(*args)
     assert read_json(Path(task["state"]))["status"] == "submitting"
-    assert not h3.generate_one(*args)
+    assert not self_hosted_h3.generate_one(*args)
 
 
 def test_partial_report_does_not_turn_missing_votes_into_half_points(prepared):
@@ -797,10 +974,10 @@ def test_h3_rejection_scores_neutral_and_judges_only_existing_videos(prepared, m
     import_outputs(run)
     get = client.get_json
 
-    def query(url, headers):
-        if url.endswith("/3"):
-            return {"task": {"status": "failed", "error": {"code": "1027", "message": "output new_sensitive"}}}
-        return get(url, headers)
+    def query(url, **kwargs):
+        if url.endswith(str(UUID(int=3))):
+            return {"id": str(UUID(int=3)), "status": "failed", "error": "generation failed"}
+        return get(url, **kwargs)
 
     monkeypatch.setattr(client, "get_json", query)
     assert run.generate(execute=True, concurrency=1)["video_statuses"] == {"succeeded": 2, "failed": 1}
@@ -882,7 +1059,11 @@ def test_h3_provider_timeout_is_neutral_without_retry(prepared, monkeypatch):
     import_outputs(run)
     tasks = run.generation_tasks()
 
-    def timeout(*args):
+    get = client.get_json
+
+    def timeout(url, **kwargs):
+        if url.endswith("/healthz"):
+            return get(url, **kwargs)
         raise TimeoutError("H3 query timed out")
 
     monkeypatch.setattr(client, "get_json", timeout)
@@ -894,38 +1075,54 @@ def test_h3_provider_timeout_is_neutral_without_retry(prepared, monkeypatch):
 
 
 def test_h3_generation_worker_completes_and_resumes_in_a_real_subprocess(prepared, tmp_path):
-    source, _, _ = prepared
+    source, client, _ = prepared
     repo = Path(source.protocol["eval_repo"])
-    posts = repo / "worker-posts.jsonl"
-    (repo / "scripts/generate_h3_repeats.py").write_text(
-        "from pathlib import Path\n"
-        "def load_env(): pass\n"
-        "def auth_headers(token): return {}\n"
-        "def post_json(url, headers, body):\n"
-        f"    with Path({str(posts)!r}).open('a') as f: f.write('submitted\\n')\n"
-        "    return {'task_id': 'test-job'}\n"
-        "def get_json(url, headers):\n"
-        "    return {'task': {'status': 'succeeded', 'content': {'url': 'https://video.invalid/clip'}}}\n"
-        "def download_video(url, path):\n"
-        "    path.parent.mkdir(parents=True, exist_ok=True)\n"
-        "    path.write_bytes(b'candidate clip')\n"
-    )
     (repo / "bestofn/normalize.py").write_text(f"def probe(path): return {MEDIA!r}\n")
-    run = EvaluationRun.prepare(
-        tmp_path / "subprocess-run",
-        dataset=Path(source.protocol["dataset"]),
-        references=Path(source.protocol["reference_manifest"]).parent,
-        eval_repo=repo,
-    )
-    import_outputs(run)
-    status = run.generate(execute=True, concurrency=1, neutral_on_failure=True, pass_timeout_seconds=15)
-    assert status["video_statuses"] == {"succeeded": 3} and status["video_fallbacks"] == 0
-    run.generate(execute=True, concurrency=1, neutral_on_failure=True, pass_timeout_seconds=15)
-    # Recover a missing local clip by querying its saved task ID, never by reposting.
-    Path(run.generation_tasks()[0]["output"]).unlink()
-    run.generate(execute=True, concurrency=1, neutral_on_failure=True, pass_timeout_seconds=15)
-    assert posts.read_text().splitlines() == ["submitted"] * 3
-    assert len(run.comparison_inputs()["original"]["pairs"]) == 6
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def respond(self, payload):
+            assert self.headers.get("Authorization") == "Bearer test-token"
+            data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            assert self.path == "/v1/videos"
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.respond(client.submit("http://local-test", body))
+
+        def do_GET(self):
+            self.respond(b"candidate clip" if self.path.endswith("/video") else client.get_json(self.path))
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        run = EvaluationRun.prepare(
+            tmp_path / "subprocess-run",
+            dataset=Path(source.protocol["dataset"]),
+            references=Path(source.protocol["reference_manifest"]).parent,
+            eval_repo=repo,
+            h3_endpoints=f"http://127.0.0.1:{server.server_port}",
+        )
+        import_outputs(run)
+        status = run.generate(execute=True, concurrency=1, neutral_on_failure=True, pass_timeout_seconds=15)
+        assert status["video_statuses"] == {"succeeded": 3} and status["video_fallbacks"] == 0
+        run.generate(execute=True, concurrency=1, neutral_on_failure=True, pass_timeout_seconds=15)
+        # Recover a missing clip by querying its saved task ID, never by reposting.
+        Path(run.generation_tasks()[0]["output"]).unlink()
+        run.generate(execute=True, concurrency=1, neutral_on_failure=True, pass_timeout_seconds=15)
+        assert len(client.posts) == 3
+        assert len(run.comparison_inputs()["original"]["pairs"]) == 6
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
 
 
 def test_h3_invalid_artifact_is_not_hidden_by_fallback(prepared):
@@ -936,7 +1133,7 @@ def test_h3_invalid_artifact_is_not_hidden_by_fallback(prepared):
     def invalid(_):
         raise ValueError("invalid video container")
 
-    assert not h3.generate_one(task, client, HOST, {}, invalid, h3.media_profile(MEDIA))
+    assert not self_hosted_h3.generate_one(task, run.protocol, client, invalid)
     assert read_json(Path(task["state"]))["error_stage"] == "artifact"
     with pytest.raises(ValueError, match="Invalid H3 video artifact"):
         run.generate(execute=True, neutral_on_failure=True)

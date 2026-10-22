@@ -16,23 +16,20 @@ from dataclasses import asdict
 from math import isfinite
 from pathlib import Path
 
-from . import h3, judge, reporting, rewrite, scoring
+from . import h3, judge, reporting, rewrite, scoring, self_hosted_h3
 from .config import (
     DEFAULT_DATASET,
     DEFAULT_EVAL_REPO,
-    DEFAULT_REFERENCES,
     DEFAULT_REWRITE_INSTRUCTION,
+    DEFAULT_SELF_HOSTED_REFERENCES,
     DEFAULT_SYSTEM_PROMPT,
-    H3_CONCURRENCY,
-    H3_SETTINGS,
     JUDGE_CONCURRENCY,
     JUDGE_SETTINGS,
-    REFERENCE_VIDEO_FIELDS,
     ROOT,
     RewriteConfig,
     build_messages,
 )
-from .dataset import load_samples, reference_inventory, verify_references
+from .dataset import load_samples, reference_inventory, reference_video_fields, verify_references
 from .storage import (
     atomic_text,
     file_sha256,
@@ -47,7 +44,6 @@ from .storage import (
 )
 
 EXTERNAL_FILES = (
-    "scripts/generate_h3_repeats.py",
     "scripts/run_gemini_pairwise_eval.py",
     "scripts/build_pairwise_manifest.py",
     "bestofn/normalize.py",
@@ -73,13 +69,17 @@ class EvaluationRun:
         name: str = "qwen38-zero-shot",
         config: RewriteConfig | None = None,
         dataset: Path = DEFAULT_DATASET,
-        references: Path = DEFAULT_REFERENCES,
+        references: Path = DEFAULT_SELF_HOSTED_REFERENCES,
         eval_repo: Path = DEFAULT_EVAL_REPO,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         rewrite_instruction: str = DEFAULT_REWRITE_INSTRUCTION,
         limit: int | None = None,
+        h3_backend: str = self_hosted_h3.BACKEND,
+        h3_endpoints: str | None = None,
+        h3_token_file: Path | None = None,
     ):
         """Inspect and freeze real reference videos; no inference or network requests."""
+        self_hosted_h3.require_backend(h3_backend)
         run_dir, dataset = Path(run_dir).expanduser().resolve(), Path(dataset).expanduser().resolve()
         references, eval_repo = Path(references).expanduser().resolve(), Path(eval_repo).expanduser().resolve()
         config = config or RewriteConfig()
@@ -92,6 +92,7 @@ class EvaluationRun:
                 raise ValueError("Expected the existing v4 Gemini comparison rubric")
             probe = load_external(eval_repo / "bestofn/normalize.py").probe
             samples, profile, host = reference_inventory(load_samples(dataset, limit), references, probe)
+            reference_manifest = read_json(references / "manifest.json")
             protocol = {
                 "schema_version": 1,
                 "name": name,
@@ -99,13 +100,12 @@ class EvaluationRun:
                 "dataset_sha256": file_sha256(dataset),
                 "reference_manifest": str(references / "manifest.json"),
                 "reference_manifest_sha256": file_sha256(references / "manifest.json"),
-                "reference_video_fields": REFERENCE_VIDEO_FIELDS,
+                "reference_video_fields": reference_video_fields(reference_manifest),
                 "samples": samples,
                 "rewriter": asdict(config),
                 "system_prompt": system_prompt,
                 "rewrite_instruction": rewrite_instruction,
                 "chat_template_kwargs": {"enable_thinking": False},
-                "h3": H3_SETTINGS,
                 "h3_host": host,
                 "context_ir_rewriter_enabled": False,
                 "media_profile": profile,
@@ -114,6 +114,11 @@ class EvaluationRun:
                 "eval_repo": str(eval_repo),
                 "dependencies": dependencies,
             }
+            protocol.update(
+                self_hosted_h3.configuration(
+                    h3_backend, h3_endpoints, host, profile, h3_token_file, reference_manifest=reference_manifest
+                )
+            )
             freeze_json(run_dir / "protocol.json", protocol)
             freeze_json(run_dir / "protocol-sha256.json", fingerprint(protocol))
             atomic_text(run_dir / "system_prompt.txt", system_prompt + "\n")
@@ -228,7 +233,7 @@ class EvaluationRun:
             tasks.append(
                 {
                     "id": sample["id"],
-                    "request": h3.request_body(records[sample["id"]]["rewritten_prompt"], self.protocol["h3"]),
+                    "request": h3.request_for_protocol(records[sample["id"]]["rewritten_prompt"], self.protocol),
                     "output": str(directory / "rewritten_prompt.mp4"),
                     "state": str(directory / "state.json"),
                 }
@@ -240,11 +245,13 @@ class EvaluationRun:
         self,
         *,
         execute: bool = False,
-        concurrency: int = H3_CONCURRENCY,
-        poll_interval: float = 20,
+        concurrency: int = self_hosted_h3.DEFAULT_CONCURRENCY,
+        poll_interval: float = 1,
         neutral_on_failure: bool = False,
         pass_timeout_seconds: float = h3.PASS_TIMEOUT_SECONDS,
     ):
+        if execute:
+            self_hosted_h3.require_backend(self.protocol.get("h3_backend"))
         if not isfinite(pass_timeout_seconds) or pass_timeout_seconds <= 0:
             raise ValueError("H3 timeout must be positive and finite")
         with run_lock(self.path):
@@ -252,28 +259,19 @@ class EvaluationRun:
             verify_references(self.protocol["samples"])
             tasks = self.generation_tasks()
             if execute:
-                repo = Path(self.protocol["eval_repo"])
-                client = load_external(repo / "scripts/generate_h3_repeats.py")
-                client.load_env()
-                host = os.environ.get("H3_HOST", "").rstrip("/")
-                token = os.environ.get("H3_TOKEN", "")
-                if not host or not token:
-                    raise ValueError("Set H3_HOST/H3_TOKEN in the environment or eval repo's arena/.env")
-                if host != self.protocol["h3_host"]:
-                    raise ValueError("H3 host differs from the frozen reference generation host")
                 if neutral_on_failure:
+                    # Check credentials before starting a killable worker, so a
+                    # configuration error cannot become a neutral video score.
+                    self_hosted_h3.Client.from_environment(self.protocol)
                     h3.run_with_fallbacks(
                         self.path, self.protocol, tasks, concurrency, poll_interval, pass_timeout_seconds
                     )
                 else:
                     fallbacks = h3.read_fallbacks(self.path, self.protocol, tasks)
-                    h3.generate_tasks(
+                    self_hosted_h3.generate_tasks(
                         [task for task in tasks if task["id"] not in fallbacks],
-                        client,
-                        host,
-                        client.auth_headers(token),
-                        load_external(repo / "bestofn/normalize.py").probe,
-                        self.protocol["media_profile"],
+                        self.protocol,
+                        load_external(Path(self.protocol["eval_repo"]) / "bestofn/normalize.py").probe,
                         concurrency,
                         poll_interval,
                         pass_timeout_seconds,
@@ -292,11 +290,8 @@ class EvaluationRun:
             if not state_path.exists():
                 raise ValueError(f"Candidate video has not been generated: {task['id']}")
             state = read_json(state_path)
-            if (
-                state.get("status") != "succeeded"
-                or state.get("request_sha256") != fingerprint(task["request"])
-                or state.get("host") != self.protocol["h3_host"]
-                or state.get("endpoint") != h3.H3_ENDPOINT
+            if state.get("status") != "succeeded" or any(
+                state.get(key) != value for key, value in h3.task_identity(task, self.protocol).items()
             ):
                 raise ValueError(f"Incomplete or mismatched candidate video: {task['id']}")
             digest = file_sha256(video_path)
