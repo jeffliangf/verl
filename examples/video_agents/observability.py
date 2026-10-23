@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import time
+import traceback
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -31,6 +32,17 @@ class ProviderError(RuntimeError):
 
     def __reduce__(self):
         return type(self), (self.stage, str(self))
+
+
+def failure_record(exc: BaseException, **fields) -> dict:
+    """Everything needed to locate a failure later, including its cause chain."""
+    return {
+        **fields,
+        "type": type(exc).__name__,
+        "stage": getattr(exc, "stage", "internal"),
+        "error": str(exc),
+        "traceback": "".join(traceback.format_exception(exc)),
+    }
 
 
 def record_event(path: Path, stage: str, event: str, **fields):
@@ -67,15 +79,20 @@ def timed_stage(path: Path, stage: str, **fields):
         yield result
     except BaseException as exc:
         result.update(status="error", error_type=type(exc).__name__)
+        if isinstance(exc, ProviderError):
+            result["failure_stage"] = exc.stage
         raise
     finally:
         record_event(path, stage, "end", **fields, **result, elapsed_seconds=time.monotonic() - started)
 
 
 def summarize_timings(run_dir: Path):
-    """Report successful-stage percentiles separately from failures and unfinished work."""
+    """Report successful-stage percentiles separately from failures and unfinished work.
+
+    The run-level ``group`` stage counts group outcomes (succeeded, dropped, error).
+    """
     elapsed, outcomes = defaultdict(list), defaultdict(Counter)
-    starts, ends, malformed, dropped = {}, set(), 0, 0
+    starts, ends, malformed = {}, set(), 0
     for path in sorted(Path(run_dir).rglob("timings*.jsonl")):
         with path.open("rb") as handle:
             for line in handle:
@@ -100,8 +117,6 @@ def summarize_timings(run_dir: Path):
                             name = f"h3_{key.removesuffix('_seconds')}"
                             outcomes[name]["succeeded"] += 1
                             elapsed[name].append(row[key])
-                elif stage == "group" and event == "dropped":
-                    dropped += 1
     stages = {}
     for name, counts in sorted(outcomes.items()):
         values = sorted(elapsed[name])
@@ -126,7 +141,6 @@ def summarize_timings(run_dir: Path):
         "run_dir": str(Path(run_dir).resolve()),
         "percentile_method": "linear interpolation at (n - 1) * q; successful observations only",
         "stages": stages,
-        "dropped_groups": dropped,
         "unfinished_stages": [row for key, row in starts.items() if key not in ends],
         "malformed_lines": malformed,
     }

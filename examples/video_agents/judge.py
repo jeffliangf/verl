@@ -77,11 +77,11 @@ def freeze_manifests(run_dir: Path, manifests: dict[str, dict]):
         freeze_json(run_dir / "judge" / f"manifest-{order}.json", manifest)
 
 
-def command(run_dir: Path, protocol: dict, order: str) -> list[str]:
+def command(run_dir: Path, protocol: dict, order: str, pair_ids) -> list[str]:
     """Explicitly override the runner defaults to match the established comparison runs."""
     if order not in ORDERS:
         raise ValueError("Unknown presentation order")
-    settings = protocol["judge"]
+    settings, timeouts = protocol["judge"], protocol["timeouts"]
     repo = Path(protocol["eval_repo"])
     args = [
         sys.executable,
@@ -107,11 +107,24 @@ def command(run_dir: Path, protocol: dict, order: str) -> list[str]:
         str(settings["seed"]),
         "--concurrency",
         "1",
+        "--request-timeout",
+        str(timeouts["judge_request"]),
+        "--file-timeout",
+        str(timeouts["judge_file"]),
+        "--file-control-timeout",
+        str(timeouts["judge_control"]),
+        "--max-attempts",
+        str(protocol["judge_max_attempts"]),
+        # Any failed comparison drops the whole example, so stop at the first one.
+        "--max-errors",
+        "1",
         "--all",
         "--execute",
     ]
     if settings["max_output_tokens"] is not None:
         args.extend(["--max-output-tokens", str(settings["max_output_tokens"])])
+    for pair_id in sorted(pair_ids):
+        args.extend(["--pair-id", pair_id])
     return args
 
 
@@ -164,9 +177,6 @@ def validate_identity(row: dict, manifest: dict, manifest_hash: str, settings: d
 
 def read_judgments(path: Path, manifest: dict, manifest_path: Path, settings: dict) -> tuple[dict, dict]:
     """Read real completed judgments; missing/error rows remain incomplete."""
-    fallback = path.with_name(path.name.replace("judgments-", "fallbacks-")).with_suffix(".json")
-    if fallback.exists():
-        raise ValueError("Legacy fallback ledgers cannot be used as video-agent rewards")
     completed, counts = {}, Counter()
     manifest_hash = file_sha256(manifest_path)
     for row in _ledger_rows(path, counts):
@@ -184,30 +194,10 @@ def read_judgments(path: Path, manifest: dict, manifest_path: Path, settings: di
     return completed, dict(counts)
 
 
-def read_policy_refusals(path: Path, manifest: dict, manifest_path: Path, settings: dict, completed: dict) -> list:
-    """Identify explicit policy refusals, without interpreting other failures as ties."""
-    refusals = []
-    manifest_hash = file_sha256(manifest_path)
+def judgment_errors(path: Path, pair_ids) -> dict[str, str]:
+    """The latest recorded error for each listed pair, for failure reports."""
+    errors = {}
     for row in _ledger_rows(path, Counter()):
-        if (row.get("status"), row.get("stage"), row.get("error_type")) != ("error", "interaction", "HttpFailure"):
-            continue
-        error = row.get("error")
-        if not isinstance(error, str):
-            continue
-        status, _, body = error.partition(": ")
-        if status not in ("HTTP 400", "HTTP 403"):
-            continue
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
-            continue
-        if payload["error"].get("code") != "prohibited_content":
-            continue
-        # Error rows need the same identity checks as successful votes. A stale
-        # refusal superseded by a real completed judgment is no longer pending.
-        validate_identity(row, manifest, manifest_hash, settings)
-        if row["pair_id"] not in completed:
-            refusals.append(row)
-    return refusals
+        if row.get("status") == "error" and row.get("pair_id") in pair_ids:
+            errors[row["pair_id"]] = f"{row.get('stage')}: {row.get('error')}"
+    return errors

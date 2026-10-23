@@ -12,16 +12,9 @@
 
 from pathlib import Path
 
-from . import self_hosted_h3
-from .config import (
-    MAX_REFERENCE_ENDPOINT,
-    MAX_REFERENCE_SETTINGS,
-    MAX_REFERENCE_VIDEO_FIELDS,
-    REFERENCE_FIELDS,
-    SELF_HOSTED_REFERENCE_VIDEO_FIELDS,
-)
-from .h3 import media_profile
-from .storage import file_sha256, fingerprint, read_json, read_jsonl
+from . import h3
+from .config import REFERENCE_FIELDS, REFERENCE_VIDEO_FIELDS
+from .storage import file_sha256, read_json, read_jsonl
 
 
 def load_samples(path: Path) -> list[dict]:
@@ -41,104 +34,60 @@ def load_samples(path: Path) -> list[dict]:
     return rows
 
 
-def reference_video_fields(manifest: dict) -> dict[str, str]:
-    """Select annotations from explicit provenance, never from whichever files exist."""
-    backend = manifest.get("h3_backend", "max")
-    if backend == self_hosted_h3.BACKEND:
-        return SELF_HOSTED_REFERENCE_VIDEO_FIELDS
-    if backend == "max":
-        return MAX_REFERENCE_VIDEO_FIELDS
-    raise ValueError(f"Unknown reference H3 backend: {backend}")
-
-
-def reference_request(prompt: str, manifest: dict) -> dict:
-    """Reconstruct a saved reference request for provenance checks, never submission."""
-    settings = manifest["settings"]
-    if manifest.get("h3_backend") == self_hosted_h3.BACKEND:
-        return self_hosted_h3.request_body(prompt, settings)
-    return {**settings, "content": [{"type": "text", "text": prompt}]}
-
-
-def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[list[dict], dict, str]:
+def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[list[dict], dict]:
     """Verify request texts, completed state, bytes, checksums, and media formats.
 
     The source file hash may change when video paths are attached to JSONL rows;
     actual request equality is the authority for matching existing videos.
     """
     manifest = read_json(reference_dir / "manifest.json")
-    fields = reference_video_fields(manifest)
-    hosted = manifest.get("h3_backend") == self_hosted_h3.BACKEND
-    settings = self_hosted_h3.SETTINGS if hosted else MAX_REFERENCE_SETTINGS
-    endpoint = self_hosted_h3.ENDPOINT if hosted else MAX_REFERENCE_ENDPOINT
+    endpoints = manifest.get("h3_endpoints")
+    if manifest.get("h3_backend") != h3.BACKEND:
+        raise ValueError("Reference videos must come from the self-hosted H3 service")
     if (
-        manifest.get("endpoint") != endpoint
-        or manifest.get("settings") != settings
+        manifest.get("endpoint") != h3.ENDPOINT
+        or manifest.get("settings") != h3.SETTINGS
+        or manifest.get("h3") != h3.SETTINGS
         or manifest.get("context_ir_rewriter_enabled") is not False
+        or not isinstance(endpoints, list)
+        or not endpoints
+        or any(not isinstance(origin, str) or not origin for origin in endpoints)
+        or len(set(endpoints)) != len(endpoints)
     ):
-        raise ValueError("Reference videos use different H3 generation settings")
-    if hosted:
-        endpoints = manifest.get("h3_endpoints")
-        if (
-            not isinstance(endpoints, list)
-            or not endpoints
-            or any(not isinstance(origin, str) or not origin for origin in endpoints)
-            or len(set(endpoints)) != len(endpoints)
-            or manifest.get("h3") != settings
-        ):
-            raise ValueError("Self-hosted reference settings or endpoint pool are missing or mismatched")
+        raise ValueError("Reference videos use different H3 settings or an invalid endpoint pool")
     tasks = {}
     for task in manifest["tasks"]:
         key = (task["item_id"], task["field"])
         if key in tasks:
             raise ValueError(f"Duplicate reference task: {key}")
         tasks[key] = task
-    samples, common_profile, common_host = [], None, None
+    samples = []
     for row in rows:
         references = {}
         for field in REFERENCE_FIELDS:
             task = tasks.get((row["id"], field))
-            request = reference_request(row[field], manifest)
-            if task is None or task["request"] != request:
+            if task is None or task["request"] != h3.request_body(row[field], manifest["settings"]):
                 raise ValueError(f"Reference request differs from dataset: {row['id']}/{field}")
             video_path = (reference_dir / task["output"]).resolve()
-            video_field = fields[field]
+            video_field = REFERENCE_VIDEO_FIELDS[field]
             if not isinstance(row.get(video_field), str) or not row[video_field].strip():
                 raise ValueError(f"Missing reference video field: {row['id']}/{video_field}")
             if Path(row[video_field]).expanduser().resolve() != video_path:
                 raise ValueError(f"Dataset video path differs from reference manifest: {row['id']}/{field}")
             state = read_json(reference_dir / task["state"])
-            expected_request = fingerprint(task["request"])
             if (
                 state.get("status") != "succeeded"
-                or state.get("request_sha256") != expected_request
-                or task.get("request_sha256") != expected_request
-                or state.get("endpoint") != endpoint
-            ):
-                raise ValueError(f"Reference state is incomplete or mismatched: {row['id']}/{field}")
-            if hosted and (
-                any(state.get(key) != value for key, value in self_hosted_h3.identity(task, manifest).items())
+                or any(state.get(key) != value for key, value in h3.identity(task, manifest).items())
                 or state.get("worker_url") not in endpoints
                 or not state.get("task_id")
             ):
-                raise ValueError(
-                    f"Self-hosted reference job belongs to a different request or pool: {row['id']}/{field}"
-                )
+                raise ValueError(f"Reference job is incomplete or from a different request/pool: {row['id']}/{field}")
             digest = file_sha256(video_path)
             if state.get("sha256") != digest or state.get("bytes") != video_path.stat().st_size:
                 raise ValueError(f"Reference video has changed: {video_path}")
-            profile = media_profile(probe(video_path))
-            if hosted and (
-                profile != manifest.get("media_profile") or media_profile(state.get("media", {})) != profile
-            ):
-                raise ValueError(f"Self-hosted reference media differs from its manifest or state: {video_path}")
-            # Preserve the legacy return shape for callers. Self-hosted pool
-            # provenance is stored separately, and jobs may use different workers.
-            host = endpoints[0] if hosted else state.get("host")
-            if not isinstance(host, str) or not host:
-                raise ValueError("Reference H3 host was not recorded")
-            common_profile, common_host = common_profile or profile, common_host or host
-            if profile != common_profile or host != common_host:
-                raise ValueError("Reference videos have mixed native formats or H3 hosts")
+            profile = h3.media_profile(probe(video_path))
+            if profile != manifest.get("media_profile") or h3.media_profile(state.get("media", {})) != profile:
+                raise ValueError(f"Reference media differs from its manifest or state: {video_path}")
             references[field] = {"path": str(video_path), "sha256": digest}
         samples.append(
             {
@@ -149,9 +98,7 @@ def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[l
                 "references": references,
             }
         )
-    if common_profile["height"] != 768 or common_profile["fps"] != 24:
-        raise ValueError("Expected the existing 768p, 24fps H3 reference profile")
-    return samples, common_profile, common_host
+    return samples, manifest["media_profile"]
 
 
 def verify_references(samples: list[dict]):

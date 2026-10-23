@@ -15,7 +15,7 @@ import subprocess
 from math import isfinite
 from pathlib import Path
 
-from . import h3, judge, scoring, self_hosted_h3
+from . import h3, judge, scoring
 from .config import CANDIDATE, REFERENCE_FIELDS
 from .dataset import verify_references
 from .observability import ProviderError, record_event, timed_stage
@@ -24,15 +24,6 @@ from .storage import file_sha256, fingerprint, freeze_json, read_json, run_lock,
 GROUP_SIZE = 4
 INVALID_REWARD = -1.0
 TIMEOUT_STAGES = ("llm", "h3", "h3_request", "judge_request", "judge_file", "judge_control", "judge_pass")
-
-
-class GeminiPolicyRefusal(RuntimeError):
-    """An identity-verified content-policy rejection for this prompt group."""
-
-    def __init__(self, order: str, pair_ids: list[str]):
-        super().__init__(f"Gemini prohibited_content rejection in {order}: {pair_ids}")
-        self.order = order
-        self.pair_ids = pair_ids
 
 
 def check_dependencies(protocol: dict):
@@ -49,24 +40,26 @@ def load_protocol(path: Path) -> dict:
         raise ValueError("RL protocol changed; prepare a new run directory")
     if protocol.get("task") != "h3_tournament" or protocol.get("group_size") != GROUP_SIZE:
         raise ValueError("Expected a four-candidate H3 tournament protocol")
+    if protocol.get("h3_backend") != h3.BACKEND:
+        raise ValueError("Expected a self-hosted Sol-H3 protocol; the H3 Max API is disabled")
     check_dependencies(protocol)
     return protocol
 
 
 def runtime_protocol(protocol: dict, settings) -> dict:
-    """Overlay launch-time provider limits from video_rl; the frozen identity is kept."""
+    """Attach the launch-time provider limits from video_rl; the frozen identity is kept."""
     timeouts = dict(settings.get("timeouts") or {})
-    if unknown := set(timeouts) - set(TIMEOUT_STAGES):
-        raise ValueError(f"Unknown video_rl.timeouts stages: {sorted(unknown)}")
+    if set(timeouts) != set(TIMEOUT_STAGES):
+        raise ValueError(f"video_rl.timeouts must set exactly: {', '.join(TIMEOUT_STAGES)}")
     seconds = timeouts.values()
     if any(isinstance(v, bool) or not isinstance(v, int | float) or not isfinite(v) or v <= 0 for v in seconds):
         raise ValueError("video_rl.timeouts must be positive, finite seconds")
-    attempts = settings.get("judge_max_attempts", 1)
+    attempts = settings.get("judge_max_attempts")
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
         raise ValueError("video_rl.judge_max_attempts must be a positive integer")
     return {
         **protocol,
-        "timeouts": {**protocol["timeouts"], **timeouts},
+        "timeouts": timeouts,
         "judge_max_attempts": attempts,
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
     }
@@ -80,13 +73,13 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
         "state": str(directory / "state.json"),
         "output": str(directory / "video.mp4"),
     }
-    worker_protocol = {key: protocol[key] for key in ("h3", "h3_host", "media_profile", "eval_repo")}
-    for key in ("h3_backend", "h3_endpoints", "h3_token_file", "reference_h3"):
-        if key in protocol:
-            worker_protocol[key] = protocol[key]
-    worker_protocol["rl_protocol_sha256"] = protocol.get("protocol_sha256") or fingerprint(protocol)
-    if "h3_request" in protocol["timeouts"]:
-        worker_protocol["timeouts"] = {"h3_request": protocol["timeouts"]["h3_request"]}
+    worker_protocol = {
+        **{key: protocol[key] for key in ("h3", "h3_endpoints", "media_profile", "eval_repo")},
+        **({"h3_token_file": protocol["h3_token_file"]} if "h3_token_file" in protocol else {}),
+        "timeouts": {"h3_request": protocol["timeouts"]["h3_request"]},
+        "rl_protocol_sha256": protocol["protocol_sha256"],
+    }
+    log_path = directory / "h3-worker.log"
     with run_lock(directory):
         freeze_json(directory / "protocol.json", worker_protocol)
         freeze_json(directory / "generation.json", [task])
@@ -94,25 +87,32 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
         # This worker already persists the task ID before polling and refuses to
         # resubmit an uncertain POST. subprocess.run kills and waits on timeout.
         try:
-            with timed_stage(directory / "timings.jsonl", "h3_worker", timeout_seconds=timeout):
+            with (
+                timed_stage(directory / "timings.jsonl", "h3_worker", timeout_seconds=timeout),
+                log_path.open("ab") as log,
+            ):
                 subprocess.run(
-                    h3.worker_command(directory, 1, protocol["poll_interval"], timeout),
+                    h3.worker_command(directory, protocol["poll_interval"], timeout),
                     check=True,
                     timeout=timeout,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise ProviderError("h3", f"H3 exceeded {timeout}s; inspect the saved job in {directory}") from exc
+            raise ProviderError("h3", f"H3 exceeded {timeout}s; see {log_path} and the saved job state") from exc
         except subprocess.CalledProcessError as exc:
             state = read_json(Path(task["state"])) if Path(task["state"]).exists() else {}
+            detail = f"{state.get('status')}: {state.get('error')}; see {log_path}"
             if state.get("status") in h3.TERMINAL_FAILURES or (
                 state.get("status") == "error" and state.get("error_stage") == "provider"
             ):
-                raise ProviderError("h3", f"H3 service failed: {state.get('error')}; inspect {directory}") from exc
-            raise  # Artifact, configuration, and worker-code errors must remain fatal.
+                raise ProviderError("h3", f"H3 service failed ({detail})") from exc
+            # Artifact, configuration, and worker-code errors must remain fatal.
+            raise RuntimeError(f"H3 worker failed ({detail})") from exc
         state, path = read_json(Path(task["state"])), Path(task["output"])
         if (
             state.get("status") != "succeeded"
-            or any(state.get(key) != value for key, value in self_hosted_h3.identity(task, protocol).items())
+            or any(state.get(key) != value for key, value in h3.identity(task, protocol).items())
             or state.get("sha256") != file_sha256(path)
             or state.get("bytes") != path.stat().st_size
             or h3.media_profile(state.get("media", {}), duration=request["duration"]) != protocol["media_profile"]
@@ -159,65 +159,40 @@ def tournament_manifests(sample: dict, candidates: list[dict], protocol: dict) -
     }
 
 
-def require_judgments(manifest: dict, rows: dict):
-    """Missing comparisons are infrastructure failures, never ties or losses."""
-    if set(rows) != set(manifest["pairs"]) or any(row.get("status") != "completed" for row in rows.values()):
-        raise ProviderError("gemini", "Tournament requires every judgment; missing results cannot train the policy")
-
-
 def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
-    """Reuse the judge CLI and ledgers with strict, bounded failure handling."""
+    """Reuse the judge CLI and ledgers; any missing comparison is a provider failure."""
     judge.freeze_manifests(directory, manifests)
-
-    def read_pass(order):
-        manifest = manifests[order]
-        path = directory / "judge" / f"judgments-{order}.jsonl"
-        manifest_path = directory / "judge" / f"manifest-{order}.json"
-        completed, counts = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
-        refusals = judge.read_policy_refusals(path, manifest, manifest_path, protocol["judge"], completed)
-        if refusals:
-            raise GeminiPolicyRefusal(order, sorted({row["pair_id"] for row in refusals}))
-        return completed, counts
-
     results = {}
     for order in judge.ORDERS:
         manifest = manifests[order]
         path = directory / "judge" / f"judgments-{order}.jsonl"
-        completed, _ = read_pass(order)
+        manifest_path = directory / "judge" / f"manifest-{order}.json"
+        log_path = directory / "judge" / f"runner-{order}.log"
+        completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
         pending = set(manifest["pairs"]) - set(completed)
         if pending:
-            command = judge.command(directory, protocol, order)
-            request_timeout = str(protocol["timeouts"]["judge_request"])
-            command.extend(
-                [
-                    "--request-timeout",
-                    request_timeout,
-                    "--file-timeout",
-                    str(protocol["timeouts"].get("judge_file", protocol["timeouts"]["judge_request"])),
-                    "--max-attempts",
-                    str(protocol.get("judge_max_attempts", 1)),
-                    "--max-errors",
-                    "1",
-                ]
-            )
-            if "judge_control" in protocol["timeouts"]:
-                command.extend(["--file-control-timeout", str(protocol["timeouts"]["judge_control"])])
-            for pair_id in sorted(pending):
-                command.extend(["--pair-id", pair_id])
             timeout = protocol["timeouts"]["judge_pass"]
             try:
-                with timed_stage(
-                    directory / "judge/timings.jsonl", "gemini_pass", order=order, timeout_seconds=timeout
+                with (
+                    timed_stage(directory / "judge/timings.jsonl", "gemini_pass", order=order, timeout_seconds=timeout),
+                    log_path.open("ab") as log,
                 ):
-                    subprocess.run(command, check=True, timeout=timeout)
+                    subprocess.run(
+                        judge.command(directory, protocol, order, pending),
+                        check=True,
+                        timeout=timeout,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                    )
             except subprocess.TimeoutExpired as exc:
                 # The runner writes judgments before deleting its remote files.
                 # subprocess.run has killed and reaped the timed-out process;
                 # complete, identity-validated results remain usable even if
                 # cleanup did not finish. Missing or invalid results still fail.
-                completed, _ = read_pass(order)
+                completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
                 if set(completed) != set(manifest["pairs"]):
-                    raise ProviderError("gemini", f"Gemini {order} pass exceeded {timeout}s") from exc
+                    detail = judgment_failure(path, set(manifest["pairs"]) - set(completed), log_path)
+                    raise ProviderError("gemini", f"Gemini {order} pass exceeded {timeout}s; {detail}") from exc
                 record_event(
                     directory / "judge/timings.jsonl",
                     "gemini_pass",
@@ -227,32 +202,33 @@ def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
                     cleanup_status="unconfirmed",
                 )
             except subprocess.CalledProcessError as exc:
-                _, counts = read_pass(order)
-                if counts.get("error", 0):
-                    raise ProviderError("gemini", f"Gemini failed comparisons; inspect {path}") from exc
-                raise
-            completed, _ = read_pass(order)
-        require_judgments(manifest, completed)
+                if not judge.judgment_errors(path, pending):
+                    raise RuntimeError(f"Gemini runner crashed without recording an error; see {log_path}") from exc
+                detail = judgment_failure(path, pending, log_path)
+                raise ProviderError("gemini", f"Gemini {order} comparisons failed; {detail}") from exc
+            completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
+        if missing := set(manifest["pairs"]) - set(completed):
+            detail = judgment_failure(path, missing, log_path)
+            raise ProviderError("gemini", f"Gemini {order} pass left comparisons unjudged; {detail}")
         results[order] = completed
     return results
 
 
+def judgment_failure(path: Path, pair_ids: set, log_path: Path) -> str:
+    """Name the failed comparisons, their recorded errors, and where to look."""
+    errors = judge.judgment_errors(path, pair_ids)
+    listed = "; ".join(f"{pair_id}: {errors.get(pair_id, 'no result')[:300]}" for pair_id in sorted(pair_ids))
+    return f"{listed}; see {path} and {log_path}"
+
+
 def tournament_rewards(candidates: list[dict], manifests: dict, judgments: dict) -> list[dict]:
     """Average pair wins, with explicit forfeits for invalid policy calls."""
-    if len(candidates) != GROUP_SIZE:
-        raise ValueError("Training requires exactly four candidate trajectories")
-    if any(c["status"] not in {"succeeded", "invalid_call"} for c in candidates):
-        raise RuntimeError("Provider failures must stop training, not receive a policy penalty")
     valid = [c["status"] == "succeeded" for c in candidates]
     invalid_count = GROUP_SIZE - sum(valid)
     points = [float(invalid_count) if ok else 0.0 for ok in valid]
+    pairs = manifests["original"]["pairs"]
     split_count = 0
-    for order in judge.ORDERS:
-        require_judgments(manifests[order], judgments[order])
-    expected_pairs = {f"{i}_vs_{j}" for i, j in itertools.combinations(range(GROUP_SIZE), 2) if valid[i] and valid[j]}
-    if set(manifests["original"]["pairs"]) != expected_pairs:
-        raise ValueError("Incomplete tournament manifest")
-    for key, pair in manifests["original"]["pairs"].items():
+    for key, pair in pairs.items():
         i, j = (int(value) for value in key.split("_vs_"))
         result = scoring.score_pair(
             pair, judgments["original"][key], judgments["swapped"][key], candidate=f"candidate_{i}"
@@ -266,8 +242,8 @@ def tournament_rewards(candidates: list[dict], manifests: dict, judgments: dict)
             "score": reward,
             "valid_call": float(ok),
             "zero_variance_group": float(len(set(rewards)) == 1),
-            "order_disagreement": split_count / len(expected_pairs) if expected_pairs else 0.0,
-            "judge_comparisons": 2 * len(expected_pairs),
+            "order_disagreement": split_count / len(pairs) if pairs else 0.0,
+            "judge_comparisons": 2 * len(pairs),
         }
         for reward, ok in zip(rewards, valid, strict=True)
     ]
@@ -277,7 +253,7 @@ def score_group(directory: Path, protocol: dict, sample: dict, candidates: list[
     """Score a training tournament or a held-out candidate against both references."""
     check_dependencies(protocol)
     if any(c["status"] not in {"succeeded", "invalid_call"} for c in candidates):
-        raise RuntimeError(f"An H3 job failed; inspect {directory} and restart from a training checkpoint")
+        raise RuntimeError(f"Only generated videos and invalid calls can be scored; inspect {directory}")
     for candidate in candidates:
         if candidate["status"] == "succeeded" and file_sha256(Path(candidate["path"])) != candidate["sha256"]:
             raise ValueError("Candidate video changed before judging")
@@ -290,63 +266,23 @@ def score_group(directory: Path, protocol: dict, sample: dict, candidates: list[
             valid = candidates[0]["status"] == "succeeded"
             eval_protocol = {**protocol, "name": "h3-agent", "samples": [sample]}
             manifests = judge.build_manifests(eval_protocol, {sample["id"]: candidates[0]} if valid else {})
+            judgments = run_judgments(directory, protocol, manifests)
+            pairs = manifests["original"]["pairs"]
+            by_reference = {pair["reference"]: key for key, pair in pairs.items()}
+            result = {"valid_call": float(valid), "judge_comparisons": 2 * len(pairs)}
+            for reference in REFERENCE_FIELDS:
+                key = by_reference.get(reference)
+                result[f"vs_{reference}"] = (
+                    scoring.score_pair(
+                        pairs[key], judgments["original"][key], judgments["swapped"][key], candidate=CANDIDATE
+                    )["score"]
+                    if valid
+                    else 0.0
+                )
+            result["score"] = sum(result[f"vs_{ref}"] for ref in REFERENCE_FIELDS) / len(REFERENCE_FIELDS)
+            rewards = [result]
         else:
             manifests = tournament_manifests(sample, candidates, protocol)
-        try:
-            judgments = run_judgments(directory, protocol, manifests)
-        except GeminiPolicyRefusal as exc:
-            # Skip the entire example, including any partial comparisons. Equal
-            # rewards give a training group zero GRPO advantage. A held-out
-            # example is dropped from the evaluation denominator instead. Keep
-            # the real error ledger untouched.
-            policy = "dropped_example" if validate else "neutral_example"
-            refusal = {
-                "sample_id": sample["id"],
-                "reason": "prohibited_content",
-                "policy": policy,
-                **({} if validate else {"score": 0.5}),
-                "order": exc.order,
-                "pair_ids": exc.pair_ids,
-                "ledger": f"judge/judgments-{exc.order}.jsonl",
-                "validate": validate,
-            }
-            write_json(directory / "gemini-refusal.json", refusal)
-            record_event(directory / "judge/timings.jsonl", "gemini_refusal", policy, **refusal)
-            if validate:
-                raise ProviderError("gemini_refusal", f"Gemini refused held-out example {sample['id']}") from exc
-            rewards = [
-                {
-                    "score": 0.5,
-                    "valid_call": float(candidate["status"] == "succeeded"),
-                    "judge_comparisons": 0,
-                    "gemini_refusal": 1.0,
-                    "zero_variance_group": 1.0,
-                    "order_disagreement": 0.0,
-                }
-                for candidate in candidates
-            ]
-        else:
-            if validate:
-                result = {"valid_call": float(valid), "judge_comparisons": 4 if valid else 0}
-                for reference in REFERENCE_FIELDS:
-                    matches = [
-                        key for key, pair in manifests["original"]["pairs"].items() if pair["reference"] == reference
-                    ]
-                    result[f"vs_{reference}"] = (
-                        scoring.score_pair(
-                            manifests["original"]["pairs"][matches[0]],
-                            judgments["original"][matches[0]],
-                            judgments["swapped"][matches[0]],
-                            candidate=CANDIDATE,
-                        )["score"]
-                        if valid
-                        else 0.0
-                    )
-                result["score"] = sum(result[f"vs_{ref}"] for ref in REFERENCE_FIELDS) / len(REFERENCE_FIELDS)
-                rewards = [result]
-            else:
-                rewards = tournament_rewards(candidates, manifests, judgments)
-        for reward in rewards:
-            reward.setdefault("gemini_refusal", 0.0)
+            rewards = tournament_rewards(candidates, manifests, run_judgments(directory, protocol, manifests))
         write_json(directory / "rewards.json", rewards)
         return rewards

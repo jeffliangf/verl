@@ -10,38 +10,14 @@
 # limitations under the License.
 """Dataset locations, prompts, and judge settings for SFT and video-agent RL."""
 
-import json
-from math import ceil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET = ROOT / "data/prompt_rewrite_aa_moviegen_eval_200.jsonl"
-DEFAULT_SELF_HOSTED_REFERENCES = ROOT / "data/prompt_rewrite_h3_eval/outputs_self_hosted_gateway_768p"
+DEFAULT_REFERENCES = ROOT / "data/prompt_rewrite_h3_eval/outputs_self_hosted_gateway_768p"
 DEFAULT_EVAL_REPO = Path.home() / "video-generation-eval"
 DEFAULT_SYSTEM_PROMPT = Path(__file__).with_name("system_prompt.txt").read_text(encoding="utf-8").strip()
 DEFAULT_REWRITE_INSTRUCTION = Path(__file__).with_name("rewrite_instruction.txt").read_text(encoding="utf-8").strip()
-LATENCY_BASELINE = json.loads(Path(__file__).with_name("configs").joinpath("latency_baseline.json").read_text())
-DEFAULT_TIMEOUTS = {
-    "llm": 900,
-    "h3_request": 30,
-    "judge_file": 300,
-    "judge_pass": 1800,
-    **{
-        stage: ceil(LATENCY_BASELINE["timeout_multiplier"] * LATENCY_BASELINE[stage]["p99_seconds"])
-        for stage in ("h3", "judge_request")
-    },
-}
-
-# Read-only metadata for existing reference videos; all new generation uses Sol-H3.
-MAX_REFERENCE_ENDPOINT = "/v2/video_generation"
-MAX_REFERENCE_SETTINGS = {
-    "model": "MiniMax-H3-Max",
-    "resolution": "768P",
-    "duration": 10,
-    "ratio": "16:9",
-    "seed": 42,
-    "extra": {"prompt_expansion_mode": "disabled"},
-}
 JUDGE_SETTINGS = {
     "judge_model": "gemini-3.7-flash",
     "thinking_level": "high",
@@ -51,11 +27,8 @@ JUDGE_SETTINGS = {
     "instructions_version": 4,
 }
 REFERENCE_FIELDS = ("prompt", "h3_context_ir")
-MAX_REFERENCE_VIDEO_FIELDS = {
-    "prompt": "prompt_h3_max_video",
-    "h3_context_ir": "h3_context_ir_h3_max_video",
-}
-SELF_HOSTED_REFERENCE_VIDEO_FIELDS = {
+# Evaluation-row fields holding each reference's self-hosted H3 video path.
+REFERENCE_VIDEO_FIELDS = {
     "prompt": "prompt_h3_self_hosted_video",
     "h3_context_ir": "h3_context_ir_h3_self_hosted_video",
 }

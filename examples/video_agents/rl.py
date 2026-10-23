@@ -21,18 +21,9 @@ from hashlib import sha256
 from math import isfinite
 from pathlib import Path
 
-from . import self_hosted_h3
-from .config import (
-    DEFAULT_DATASET,
-    DEFAULT_EVAL_REPO,
-    DEFAULT_SELF_HOSTED_REFERENCES,
-    DEFAULT_SYSTEM_PROMPT,
-    DEFAULT_TIMEOUTS,
-    JUDGE_SETTINGS,
-    LATENCY_BASELINE,
-    ROOT,
-)
-from .dataset import load_samples, reference_inventory, reference_video_fields
+from . import h3
+from .config import DEFAULT_DATASET, DEFAULT_EVAL_REPO, DEFAULT_REFERENCES, DEFAULT_SYSTEM_PROMPT, JUDGE_SETTINGS, ROOT
+from .dataset import load_samples, reference_inventory
 from .judge import EXTERNAL_FILES
 from .observability import summarize_timings
 from .storage import (
@@ -114,7 +105,6 @@ def tool_config(directory: Path, train_file: Path) -> dict:
 
 def prepare(args) -> dict:
     """Freeze data, tool schema, evaluation references, and provider settings offline."""
-    self_hosted_h3.require_backend(args.h3_backend)
     directory = local_path(args.run_dir)
     data_dir = local_path(args.data_dir)
     train_file, val_file = local_path(args.train_file), local_path(args.eval_dataset)
@@ -124,24 +114,15 @@ def prepare(args) -> dict:
         r["prompt"].strip() for r in validation
     }:
         raise ValueError("Train/evaluation overlap by ID or prompt")
-    timeouts = {
-        "llm": args.llm_timeout,
-        "h3": args.h3_timeout,
-        "h3_request": args.h3_request_timeout,
-        "judge_request": args.judge_request_timeout,
-        "judge_file": args.judge_file_timeout,
-        "judge_pass": args.judge_pass_timeout,
-    }
-    if any(not isfinite(v) or v <= 0 for v in [*timeouts.values(), args.poll_interval]):
-        raise ValueError("Timeouts and polling interval must be positive and finite")
+    if not isfinite(args.poll_interval) or args.poll_interval <= 0:
+        raise ValueError("Polling interval must be positive and finite")
     if min(args.groups_per_worker, args.h3_concurrency_per_worker) < 1:
         raise ValueError("Worker concurrency must be positive")
     dependencies = {relative: file_sha256(repo / relative) for relative in EXTERNAL_FILES}
     rubric = load_external(repo / "scripts/build_pairwise_manifest.py")
     if rubric.INSTRUCTIONS_VERSION != JUDGE_SETTINGS["instructions_version"]:
         raise ValueError("Expected the existing v4 Gemini rubric")
-    val, profile, host = reference_inventory(validation, references, load_external(repo / "bestofn/normalize.py").probe)
-    reference_manifest = read_json(references / "manifest.json")
+    val, profile = reference_inventory(validation, references, load_external(repo / "bestofn/normalize.py").probe)
     protocol = {
         "schema_version": 2,
         "task": "h3_tournament",
@@ -149,28 +130,17 @@ def prepare(args) -> dict:
         "samples": {"train": train, "val": val},
         "source_files": {str(path): file_sha256(path) for path in (train_file, val_file, references / "manifest.json")},
         "reference_manifest": str(references / "manifest.json"),
-        "reference_video_fields": reference_video_fields(reference_manifest),
-        "h3_host": host,
         "media_profile": profile,
         "judge": JUDGE_SETTINGS,
         "rubric": rubric.INSTRUCTIONS,
         "eval_repo": str(repo),
         "dependencies": dependencies,
-        "timeouts": timeouts,
-        "latency_baseline": LATENCY_BASELINE,
         "poll_interval": args.poll_interval,
         "groups_per_worker": args.groups_per_worker,
         "h3_concurrency_per_worker": args.h3_concurrency_per_worker,
     }
     protocol.update(
-        self_hosted_h3.configuration(
-            args.h3_backend,
-            args.h3_endpoints,
-            host,
-            profile,
-            args.h3_token_file,
-            reference_manifest=reference_manifest,
-        )
+        h3.configuration(args.h3_endpoints, profile, read_json(references / "manifest.json"), args.h3_token_file)
     )
     # Policy-controlled arguments and their defaults live in the dataset. Keep
     # only fixed service settings here; reference_h3 retains the reference seed/duration.
@@ -338,7 +308,6 @@ def train(args) -> dict:
     evaluation = args.command == "evaluate"
     output = local_path(args.output_dir) if evaluation else directory
     protocol = load_protocol(directory / "protocol.json")
-    self_hosted_h3.require_backend(protocol.get("h3_backend"))
     config, overrides = training_config(args)
     if read_json(directory / "tools.json") != tool_config(directory, local_path(config.data.train_files)):
         raise ValueError("Prepared H3 tool configuration changed")
@@ -361,7 +330,6 @@ def train(args) -> dict:
         "mode": "evaluate" if evaluation else "train",
         "output_dir": str(output),
         "model": config.actor_rollout_ref.model.path,
-        "h3_backend": protocol["h3_backend"],
         "h3_model": protocol["h3"]["model"],
         "h3_endpoints": protocol["h3_endpoints"],
         "reference_h3": protocol["reference_h3"],
@@ -395,11 +363,9 @@ def parse_args(argv=None):
     prep.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     prep.add_argument("--train-file", type=Path, default=ROOT / "data/prompt_rewrite_rl.jsonl")
     prep.add_argument("--eval-dataset", type=Path, default=DEFAULT_DATASET)
-    prep.add_argument("--references", type=Path, default=DEFAULT_SELF_HOSTED_REFERENCES)
+    prep.add_argument("--references", type=Path, default=DEFAULT_REFERENCES)
     prep.add_argument("--eval-repo", type=Path, default=DEFAULT_EVAL_REPO)
-    self_hosted_h3.add_arguments(prep)
-    for stage, timeout in DEFAULT_TIMEOUTS.items():
-        prep.add_argument(f"--{stage.replace('_', '-')}-timeout", type=float, default=timeout)
+    h3.add_arguments(prep)
     prep.add_argument("--poll-interval", type=float, default=1)
     prep.add_argument("--groups-per-worker", type=int, default=5)
     prep.add_argument("--h3-concurrency-per-worker", type=int, default=5)
@@ -431,7 +397,7 @@ def main(argv=None):
         print(json.dumps(prepare(args), indent=2))
     elif args.command == "status":
         protocol = load_protocol(local_path(args.run_dir) / "protocol.json")
-        result = self_hosted_h3.server_status(protocol, timeout=args.timeout)
+        result = h3.server_status(protocol, timeout=args.timeout)
         print(json.dumps(result, indent=2))
         return 0 if result["all_ready"] else 1
     elif args.command == "timings":

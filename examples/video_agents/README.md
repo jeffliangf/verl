@@ -28,10 +28,9 @@ video. This is a native tool-calling agent with a deliberately small action spac
 | `rl.py` | Prepare agent datasets; launch native GRPO or checkpoint validation |
 | `agent.py` | Execute the tool, end the episode, and publish group rewards |
 | `tournament.py` | Generate candidates and score training/validation comparisons |
-| `self_hosted_h3.py` | Sol-H3 HTTP client, job recovery, downloads, and health checks |
-| `h3.py` | Generation subprocess entry point and media checks |
+| `h3.py` | Sol-H3 client, job recovery, downloads, media checks, and the generation subprocess |
 | `judge.py`, `judge_worker.py`, `scoring.py` | Gemini manifests, timed requests, verified ledgers, and pair scores |
-| `observability.py` | Stage timings, provider failure classification, and latency summaries |
+| `observability.py` | Stage timings, failure records, provider failure classification, and latency summaries |
 | `dataset.py` | Validate held-out data and reference-video provenance |
 | `prepare_sft.py` | Convert rewrite examples to SFT conversations |
 | `sft.py`, `sft_dataset.py` | Launch native SFT and mask loss to assistant tokens |
@@ -81,10 +80,9 @@ service failure, timeout, or missing judgment drops the whole four-rollout promp
 group. No trajectories or rewards from that group enter the optimizer. Native
 `trainer.v1.sampler.sync_refill_failed_groups=true` replaces it with a fresh group
 under the same policy weights, preserving the training batch size. Sibling
-rollouts settle before the failed group is released. Artifact corruption,
-configuration errors, and aborted or empty LLM responses still abort during
-training; an LLM turn that exceeds its time limit is dropped like a service
-failure.
+rollouts settle before the failed group is released. A Gemini `prohibited_content`
+refusal is an ordinary Gemini failure. Artifact corruption, configuration errors,
+and aborted or empty LLM responses still abort during training.
 
 Held-out evaluation never stops training. A prompt whose video, Gemini judgments,
 or LLM turn fails for any reason, including a Gemini `prohibited_content`
@@ -101,66 +99,65 @@ Only a batch in which every prompt failed raises an error.
 Exceeding that many dropped groups stops the step before updating weights, so a
 persistent outage cannot cause unlimited replacement. TensorBoard reports
 `training/rollout_failure/evicted_samples`. Dropped groups retain `failure.json`
-with their sample ID, policy step, provider stage, and reason.
+with their sample ID, policy step, provider stage, reason, and traceback.
 
-Newly prepared runs use the measured latency baseline in
-`configs/latency_baseline.json` from the two-step, four-H200 run at H3 concurrency
-20. Timeouts are twice P99, rounded up to whole seconds:
-
-| Measured stage | Observations | P50 | P99 | Timeout |
-| --- | ---: | ---: | ---: | ---: |
-| H3 accepted job through queue and generation | 64 | 49.34 s | 90.41 s | 181 s |
-| One Gemini judgment, excluding upload | 192 | 11.53 s | 16.84 s | 34 s |
-
-The H3 worker deadline includes admission, polling, download, and media checks;
-its calibration measures the dominant queue/generation portion. Waiting for a
-client concurrency slot is logged separately. Limits for previously unmeasured
-stages remain 30 s per H3 HTTP request, 300 s for Gemini file operations, 1800 s
-per Gemini presentation-order pass, and 900 s for LLM generation. Each limit can
-be overridden during `prepare` using `--h3-timeout`, `--h3-request-timeout`,
-`--judge-request-timeout`, `--judge-file-timeout`, `--judge-pass-timeout`, or
-`--llm-timeout`. These small-sample percentiles describe successful requests;
-failures are counted separately.
-
-At launch, `video_rl.timeouts` overrides the frozen protocol's limits without
-changing its identity, so a resumed run can adopt them. The defaults in
-`configs/rl.yaml` are about twice the healthy P99 measured in canary job 2391,
-dropping the slowest ~1% of work instead of waiting for it:
+`video_rl.timeouts` in `configs/rl.yaml` is the only source of provider limits.
+They apply at launch without changing the frozen protocol, so a resumed run adopts
+them; limits frozen by older runs are ignored. Service limits are about twice the
+healthy P99 measured in canary job 2391, dropping the slowest ~1% of work instead
+of waiting for it:
 
 | Stage | Healthy P99 | Limit |
 | --- | ---: | ---: |
-| LLM turn (`llm`) | 130-187 s | 240 s |
-| H3 worker (`h3`) | 80 s | 150 s |
+| H3 worker: admission, generation, download, media checks (`h3`) | 80 s | 150 s |
+| One H3 HTTP request (`h3_request`) | 4 s | 30 s |
 | One Gemini judgment (`judge_request`) | 20-22 s | 45 s |
 | Gemini upload and file processing (`judge_file`) | 10-12 s | 60 s |
 | Gemini upload start, polling, deletion (`judge_control`) | 3 s | 15 s |
 | One presentation-order pass (`judge_pass`) | 65-132 s | 300 s |
+| LLM turn (`llm`) | 130-187 s | 900 s |
+
+The LLM limit is a stall guard, not a tail cut. An LLM turn takes about its
+response tokens divided by ~15 tokens/s (r = 0.997 in job 2391), so
+`data.max_response_length` (8,192) already bounds it near 540 s. A lower wall-clock
+limit would drop the policy's own long outputs, which are invalid calls that must
+be scored. To shorten the LLM tail, lower `max_response_length` instead.
 
 `video_rl.judge_max_attempts` (default 2) gives each Gemini HTTP call one fast
 retry for 408/429/5xx and upload/polling network errors; the runner never
 retries a judgment after a network timeout.
 
-Stage logs are append-only JSONL, with UTC start/end times, elapsed seconds,
-outcome, error type, timeout, and correlation IDs. They cover LLM inference,
-concurrency waits, H3 submission/status polling/download/media checks, provider
-queue/generation timings, Gemini upload/file processing/judgments/cleanup,
-complete judge passes, group outcomes, and replacement dispatch. Files live at:
+## Debugging failures
 
-- `<run>/timings.jsonl`: batch dispatch and replacement counts.
-- `<run>/train/step_<N>/<group>/timings.jsonl`: group, LLM, and tool stages.
-- `<run>/videos/<instance>/timings.jsonl`: H3 requests and provider timings.
-- `<run>/train/step_<N>/<group>/judge/timings*.jsonl`: Gemini stages.
+Every failure leaves a trail from the job log to its files:
 
-Validation uses the same layout under `val/`. An unmatched start identifies
-interrupted work, including a killed subprocess. Timing logs omit credentials,
-prompts, and provider response bodies. Summarize the next run offline with:
+1. The job log prints one `video-agents:` line per dispatch (groups scored and
+   dropped by stage) and per dropped or failed group, naming its `failure.json`.
+2. `<run>/timings.jsonl` indexes the run: each dispatch, with drop counts by stage;
+   one `group` start/end per prompt group, with partition, step, sample ID,
+   directory, outcome, failure stage, error type, and scores; and evaluation
+   summaries. A start without an end is a group in flight when the job stopped.
+3. Each group directory, `<run>/{train,val}/step_<N>/<group>/`, holds:
+   - `failure.json`: error type, stage, message, and full traceback with its cause;
+   - `trajectories.json`: tokens and each rollout's `h3_result`; an invalid call
+     records its `reason` and the decoded `response_tail` of the model's output;
+   - `timings.jsonl`: slot waits, LLM turns, and tool calls;
+   - `judge/runner-<order>.log`, `judge/judgments-<order>.jsonl`, and
+     `judge/timings*.jsonl`: the Gemini runner's own output, its ledger, and timings.
+4. Each video directory, `<run>/videos/<instance>/`, holds `h3-worker.log`, the
+   job's `state.json`, and, on failure, `failure.json`.
+
+Gemini failures name each failed comparison with its recorded error, such as a
+`prohibited_content` refusal, plus both file paths. Timing logs omit credentials,
+prompts, and provider response bodies; messages and tracebacks live only in
+`failure.json` and the subprocess logs. Summarize stage latencies offline with:
 
 ```bash
 python -m examples.video_agents.rl timings --run-dir outputs/video_agents/rl
 ```
 
 This reports P50/P99 and proposed 2×P99 limits without changing the frozen run,
-alongside errors, dropped groups, incomplete stages, and malformed log lines.
+alongside errors, group outcomes, incomplete stages, and malformed log lines.
 An accepted remote H3 job may continue after the local timeout; saved IDs remain
 available for inspection and recovery, and ambiguous POSTs are never repeated.
 
@@ -194,8 +191,8 @@ These runtime assets are supplied separately:
   Workers must be able to access the same run, data, references, evaluator, and
   token paths. MP4 remuxing needs `ffmpeg` or `imageio-ffmpeg`.
 
-All new generation uses Sol-H3. Existing Max reference clips can still be
-validated from their recorded metadata; there is no Max generation client.
+All generation uses the self-hosted Sol-H3 service. Reference videos must come
+from it too; preparation verifies their manifest, job states, checksums, and media.
 The client saves job IDs before polling and does not repeat an uncertain POST.
 
 ## Run agent RL
@@ -291,6 +288,8 @@ The retired artifact CLI, `evaluation.py`, `rewrite.py`, `reporting.py`, and
 `train.py` compatibility wrapper were removed, along with neutral-failure
 reporting. Saved artifacts remain on disk; the removed commands belong to the
 previous revision. Agent training and checkpoint evaluation share one path.
+H3-Max reference provenance, prepare-time timeouts, and neutral scores for Gemini
+refusals were later removed; existing self-hosted run directories still load.
 
 To support inspection and revision, add a concrete observation tool and a bounded
 multi-turn loop. Define which video the agent submits for reward and count all

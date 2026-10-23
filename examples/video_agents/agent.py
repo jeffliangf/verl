@@ -12,6 +12,7 @@
 
 import asyncio
 import json
+from collections import Counter
 from copy import copy
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,9 +28,17 @@ from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ, AgentLoopWorke
 from verl.utils.tensordict_utils import get_non_tensor_data
 
 from .config import REFERENCE_FIELDS
-from .observability import ProviderError, record_event, timed_stage
+from .observability import ProviderError, failure_record, record_event, timed_stage
 from .storage import item_key, write_json
 from .tournament import GROUP_SIZE, generate_video, load_protocol, runtime_protocol, score_group
+
+# Decoded tokens kept with an invalid call, so the policy's actual output can be read.
+RESPONSE_TAIL_TOKENS = 512
+
+
+def log(message: str):
+    """One job-log line per notable event; the referenced files hold the details."""
+    print(f"video-agents: {message}", flush=True)
 
 
 class SolH3Tool(BaseTool):
@@ -84,7 +93,7 @@ class SolH3Tool(BaseTool):
                     "error": str(exc),
                     "error_type": type(exc).__name__,
                 }
-                write_json(directory / "failure.json", result)
+                write_json(directory / "failure.json", failure_record(exc, directory=str(directory)))
         finally:
             self.slots.release()
         agent_data.extra_fields["h3_result"] = result
@@ -97,9 +106,11 @@ class H3TerminalLoop(ToolAgentLoop):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         client = self.server_manager
+        self.stop_reason = None
 
         async def generate(**request):
             output = await client.generate(**request)
+            self.stop_reason = output.stop_reason
             if output.stop_reason not in {"completed", "length"} or not output.token_ids:
                 raise RuntimeError(f"LLM request did not complete: {output.stop_reason}")
             return output
@@ -118,29 +129,39 @@ class H3TerminalLoop(ToolAgentLoop):
                     timeout=timeout,
                 )
             except TimeoutError as exc:
-                # A slow-tail generation drops its group like a provider failure.
+                # The limit sits above the longest turn max_response_length allows,
+                # so only a stalled server reaches it; drop that group like any
+                # other service failure. Long outputs are scored, never dropped.
                 raise ProviderError("llm", f"LLM generation exceeded {timeout}s") from exc
             timing["response_tokens"] = len(agent_data.response_ids)
             return result
 
     async def _handle_processing_tools_state(self, agent_data):
-        calls = agent_data.tool_calls
-        valid = len(calls) == 1 and calls[0].name == "sol_h3"
-        if valid:
+        calls, reason = agent_data.tool_calls, None
+        if len(calls) != 1:
+            reason = f"expected one tool call, got {len(calls)}"
+        elif calls[0].name != "sol_h3":
+            reason = f"unknown tool {calls[0].name!r}"
+        else:
             try:
                 self.tools["sol_h3"].build_request(json.loads(calls[0].arguments), agent_data._active_tool_schemas[0])
-            except (ValueError, TypeError, ValidationError):
-                valid = False
-        if not valid:
-            agent_data.extra_fields["h3_result"] = {"status": "invalid_call"}
+            except ValidationError as exc:
+                reason = f"invalid arguments: {exc.message}"
+            except (ValueError, TypeError) as exc:
+                reason = f"invalid arguments: {exc}"
+        if reason:
+            agent_data.extra_fields["h3_result"] = {"status": "invalid_call", "reason": reason[:500]}
             return AgentState.TERMINATED
         await super()._handle_processing_tools_state(agent_data)
-        result = agent_data.extra_fields.get("h3_result", {})
-        if result.get("status") == "infrastructure_error":
-            raise ProviderError("h3", f"H3 execution failed: {result}")
-        if result.get("status") != "succeeded":
-            raise RuntimeError(f"H3 execution failed: {result}")
-        return AgentState.TERMINATED
+        result = agent_data.extra_fields.get("h3_result", {"status": "missing", "error": "the tool returned nothing"})
+        if result["status"] == "succeeded":
+            return AgentState.TERMINATED
+        message = f"H3 {result.get('error_type', result['status'])}: {result.get('error')}"
+        if "directory" in result:
+            message += f"; see {result['directory']}/failure.json"
+        if result["status"] == "infrastructure_error":
+            raise ProviderError("h3", message)
+        raise RuntimeError(message)
 
     async def run(self, sampling_params, **kwargs):
         self.timing_path = Path(kwargs.get("_video_timings", Path(self.config.video_rl.output_dir) / "timings.jsonl"))
@@ -154,8 +175,6 @@ class H3TerminalLoop(ToolAgentLoop):
             or not isinstance(template_kwargs, dict)
         ):
             raise ValueError("Each dataset row must supply sol_h3 tools and chat_template_kwargs")
-        if (kwargs.get("extra_info") or {}).get("tool_selection"):
-            raise ValueError("The dataset tools field defines the complete H3 tool selection")
         # Tool instances are shared across concurrent rollouts. Keep parser metadata
         # local to this loop, while sharing the executor's semaphore and protocol.
         tool = copy(self.tools["sol_h3"])
@@ -169,16 +188,13 @@ class H3TerminalLoop(ToolAgentLoop):
         self.apply_chat_template_kwargs = dict(template_kwargs)
         self.continuous_token_builder.chat_template_kwargs = self.apply_chat_template_kwargs
         output = await super().run(sampling_params, **kwargs)
-        output.extra_fields.setdefault("h3_result", {"status": "invalid_call"})
-        record_event(
-            self.timing_path,
-            "tool_call",
-            "completed",
-            **self.timing_fields,
-            status=output.extra_fields["h3_result"]["status"],
-        )
         if not output.response_ids:
             raise RuntimeError("The LLM server returned no tokens")
+        reason = "no tool call" + (" before the length limit" if self.stop_reason == "length" else "")
+        result = output.extra_fields.setdefault("h3_result", {"status": "invalid_call", "reason": reason})
+        if result["status"] == "invalid_call":
+            result["response_tail"] = self.tokenizer.decode(output.response_ids[-RESPONSE_TAIL_TOKENS:])
+        record_event(self.timing_path, "tool_call", "completed", **self.timing_fields, status=result["status"])
         return output
 
 
@@ -201,35 +217,47 @@ class TournamentWorker(AgentLoopWorkerTQBase):
         return output
 
     async def generate_sequences(self, batch):
+        """Return one record per prompt group: its rewards, or why it was dropped."""
         await super().generate_sequences(batch)
         # Sync training must observe infrastructure failures before sampling the
         # queue. The native fire-and-forget worker otherwise marks failed groups
         # sampleable, and the trainer may pad their missing trajectories.
-        tasks = list(self.background_tasks)
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*list(self.background_tasks), return_exceptions=True)
         for result in results:
             if isinstance(result, BaseException):
                 raise result
-        return [result for result in results if result is not None]
+        return results
 
     async def _run_prompt(self, prompt, sampling_params, trajectory, trace=False):
         partition = "val" if trajectory["validate"] else "train"
-        directory = self.output_dir / partition / f"step_{prompt['global_steps']}" / item_key(prompt["uid"])
+        step = int(prompt["global_steps"])
+        directory = self.output_dir / partition / f"step_{step}" / item_key(prompt["uid"])
         with timed_stage(directory / "timings.jsonl", "group_slot_wait"):
             await self.group_slots.acquire()
         try:
-            with timed_stage(directory / "timings.jsonl", "group", uid=prompt["uid"]) as timing:
-                result = await self._run_group(prompt, sampling_params, trajectory, trace)
-                if result and result["dropped"]:
-                    timing["status"] = "dropped"
-                return result
+            # Run-level index: one start/end pair per group, pointing at its files.
+            # An unmatched start marks a group that was in flight when the job stopped.
+            with timed_stage(
+                self.output_dir / "timings.jsonl",
+                "group",
+                partition=partition,
+                policy_step=step,
+                uid=prompt["uid"],
+                sample_id=prompt["extra_info"]["id"],
+                directory=str(directory),
+            ) as timing:
+                record = await self._run_group(prompt, sampling_params, trajectory, trace, directory)
+                if record["dropped"]:
+                    timing.update(status="dropped", failure_stage=record["stage"], error_type=record["type"])
+                else:
+                    timing["scores"] = [reward["score"] for reward in record["rewards"]]
+                return record
         finally:
             self.group_slots.release()
 
-    async def _run_group(self, prompt, sampling_params, trajectory, trace):
+    async def _run_group(self, prompt, sampling_params, trajectory, trace, directory):
         uid, validate = prompt["uid"], trajectory["validate"]
         partition = "val" if validate else "train"
-        directory = self.output_dir / partition / f"step_{prompt['global_steps']}" / item_key(uid)
         expected_n = 1 if validate else GROUP_SIZE
         n = prompt.pop("__rollout_n__", expected_n)
         if n != expected_n or not prompt.pop("__do_sample__", True):
@@ -290,8 +318,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 output.extra_fields["reward_extra_info"] = reward
                 await super()._agent_loop_postprocess(output, validate, session_id=i, **prompt)
             await tq.async_kv_put(key=uid, partition_id=partition, tag={"status": "finished"})
-            if validate:
-                return {"dropped": False, "validate": True, "uid": uid, "sample_id": sample["id"], "reward": rewards[0]}
+            return {"dropped": False, "uid": uid, "sample_id": sample["id"], "rewards": rewards}
         except BaseException as exc:
             # A held-out prompt that cannot be scored for any reason is excluded
             # and reported in eval-summary.json; evaluation never stops training.
@@ -299,23 +326,19 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 validate
                 or (isinstance(exc, ProviderError) and self.config.trainer.v1.sampler.sync_refill_failed_groups)
             )
-            failure = {
-                "type": type(exc).__name__,
-                "error": str(exc),
-                "stage": getattr(exc, "stage", "internal"),
-                "dropped": bool(drop),
-                "validate": validate,
-                "uid": uid,
-                "sample_id": sample["id"],
-                "policy_step": int(prompt["global_steps"]),
-            }
+            failure = failure_record(
+                exc,
+                dropped=bool(drop),
+                validate=validate,
+                uid=uid,
+                sample_id=sample["id"],
+                policy_step=int(prompt["global_steps"]),
+            )
             write_json(directory / "failure.json", failure)
-            record_event(
-                directory / "timings.jsonl",
-                "group",
-                "dropped" if drop else "failed",
-                provider_stage=failure["stage"],
-                **{key: value for key, value in failure.items() if key not in {"stage", "error"}},
+            log(
+                f"{partition} step {failure['policy_step']} {sample['id']} {'dropped' if drop else 'failed'} "
+                f"at {failure['stage']}: {failure['type']}: {failure['error'][:300]} "
+                f"(see {directory / 'failure.json'})"
             )
             await tq.async_kv_put(key=uid, partition_id=partition, tag={"status": "failure"})
             if drop:
@@ -346,10 +369,11 @@ class TournamentManager(AgentLoopManagerTQ):
         """Use native dispatch and bound replacement work during a service outage."""
         step = int(get_non_tensor_data(prompts, "global_steps", 0))
         validate = bool(get_non_tensor_data(prompts, "validate", False))
+        partition = "val" if validate else "train"
         if self._drop_step != step:
             self._drop_step, self._dropped_groups = step, 0
         timings = Path(self.config.video_rl.output_dir) / "timings.jsonl"
-        with timed_stage(timings, "dispatch", policy_step=step, validate=validate, prompts=len(prompts)):
+        with timed_stage(timings, "dispatch", policy_step=step, validate=validate, prompts=len(prompts)) as timing:
             chunks = prompts.chunk(len(self.agent_loop_workers))
             results = ray.get(
                 [
@@ -357,21 +381,19 @@ class TournamentManager(AgentLoopManagerTQ):
                     for worker, chunk in zip(self.agent_loop_workers, chunks, strict=False)
                 ]
             )
-        records = [record for result in results for record in result]
+            records = [record for result in results for record in result]
+            dropped = Counter(record["stage"] for record in records if record["dropped"])
+            timing["dropped"] = dict(dropped)
+            if not validate:
+                self._dropped_groups += dropped.total()
+                timing["total_dropped_groups"] = self._dropped_groups
+        log(
+            f"{partition} step {step}: {len(records) - dropped.total()}/{len(records)} groups scored"
+            + (f"; dropped by stage {dict(dropped)} (see failure.json in each group)" if dropped else "")
+        )
         if validate:
             self._record_evaluation(step, records)
             return
-        dropped = sum(record["dropped"] for record in records)
-        self._dropped_groups += dropped
-        if dropped:
-            record_event(
-                timings,
-                "group_replacement",
-                "requested",
-                policy_step=step,
-                groups=dropped,
-                total_dropped_groups=self._dropped_groups,
-            )
         limit = self.config.video_rl.max_dropped_groups_per_step
         if self._dropped_groups > limit:
             raise RuntimeError(
@@ -395,6 +417,10 @@ class TournamentManager(AgentLoopManagerTQ):
             policy_step=step,
             **{key: summary[key] for key in ("prompts", "valid", "dropped", "degraded")},
         )
+        log(
+            f"val step {step}: score {summary['score']} over {summary['valid']}/{summary['prompts']} valid prompts"
+            f"{' (degraded)' if summary['degraded'] else ''}; see {path}"
+        )
         if records and all(record["dropped"] for record in records):
             # The native validation loop cannot report an empty batch; this is an outage.
             raise RuntimeError(f"Every held-out prompt in the batch failed at step {step}; inspect {path}")
@@ -402,7 +428,7 @@ class TournamentManager(AgentLoopManagerTQ):
 
 def evaluation_summary(step: int, records: list[dict], min_valid_fraction: float) -> dict:
     """Valid-only held-out means; invalid policy calls stay in the denominator as 0."""
-    valid = [record["reward"] for record in records if not record["dropped"]]
+    valid = [record["rewards"][0] for record in records if not record["dropped"]]
     fraction = len(valid) / len(records) if records else 0.0
 
     def mean(key):
