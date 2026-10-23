@@ -156,6 +156,12 @@ def test_ambiguous_submission_is_never_retried(job):
     assert not hosted.generate_one(task, protocol, client, lambda path: MEDIA)
     assert not hosted.generate_one(task, protocol, client, lambda path: MEDIA)
     assert len(client.posts) == 1
+    timing_path = Path(task["state"]).parent / "timings.jsonl"
+    events = [json.loads(line) for line in timing_path.read_text().splitlines()]
+    requests = [row for row in events if row["stage"] == "h3_submission" and row["event"] == "end"]
+    assert len(requests) == 1 and requests[0]["status"] == "error"
+    assert requests[0]["error_type"] == "TimeoutError"
+    assert requests[0]["timeout_seconds"] == 30
 
 
 def test_interrupted_submission_is_never_retried(job, monkeypatch):

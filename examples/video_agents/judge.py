@@ -85,7 +85,12 @@ def command(run_dir: Path, protocol: dict, order: str) -> list[str]:
     repo = Path(protocol["eval_repo"])
     args = [
         sys.executable,
+        "-m",
+        "examples.video_agents.judge_worker",
+        "--runner",
         str(repo / "scripts/run_gemini_pairwise_eval.py"),
+        "--timings",
+        str(run_dir / "judge" / f"timings-{order}.jsonl"),
         "--manifest",
         str(run_dir / "judge" / f"manifest-{order}.json"),
         "--output",

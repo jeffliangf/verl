@@ -26,6 +26,7 @@ from pathlib import Path
 from uuid import UUID
 
 from .config import MAX_REFERENCE_ENDPOINT, MAX_REFERENCE_SETTINGS
+from .observability import record_event, timed_stage
 from .storage import file_sha256, fingerprint, read_json, write_json
 
 BACKEND = "self-hosted"
@@ -313,14 +314,18 @@ def generate_one(task, protocol, client, probe, poll_interval=1, timeout=1800):
 
     require_backend(protocol.get("h3_backend"))
     path, output = Path(task["state"]), Path(task["output"])
+    timings = path.parent / "timings.jsonl"
     expected = identity(task, protocol)
     state = read_json(path) if path.exists() else {**expected, "status": "pending"}
     if any(state.get(key) != value for key, value in expected.items()):
         raise ValueError(f"Saved H3 task belongs to a different request or worker pool: {path}")
 
     def save(**updates):
+        previous = state.get("status")
         state.update(updates)
         write_json(path, state)
+        if "status" in updates and updates["status"] != previous:
+            record_event(timings, "h3", "status", status=state["status"], job_id=state.get("task_id"))
 
     if state["status"] == "succeeded" and output.exists():
         if file_sha256(output) != state.get("sha256"):
@@ -329,12 +334,15 @@ def generate_one(task, protocol, client, probe, poll_interval=1, timeout=1800):
     if state["status"] in TERMINAL_FAILURES:
         return False
     deadline, error_stage = time.monotonic() + timeout, "provider"
+    request_timeout = protocol.get("timeouts", {}).get("h3_request", 30)
+    if not isfinite(request_timeout) or request_timeout <= 0:
+        raise ValueError("H3 request timeout must be positive and finite")
 
     def remaining():
         seconds = deadline - time.monotonic()
         if seconds <= 0:
             raise TimeoutError("H3 polling/admission timed out; resume uses the saved worker and task ID")
-        return min(30, seconds)
+        return min(request_timeout, seconds)
 
     try:
         if state.get("task_id"):
@@ -344,11 +352,16 @@ def generate_one(task, protocol, client, probe, poll_interval=1, timeout=1800):
                 raise ValueError("Invalid saved H3 job ID")
         while not state.get("task_id"):
             remaining()
-            for origin in available_workers(client, protocol["h3_endpoints"]):
+            with timed_stage(timings, "h3_health"):
+                workers = available_workers(client, protocol["h3_endpoints"])
+            for origin in workers:
                 save(status="submitting", worker_url=origin, request=task["request"])
                 try:
-                    response = client.submit(origin, task["request"], timeout=remaining())
-                    job_id = str(UUID(response["id"]))
+                    limit = remaining()
+                    with timed_stage(timings, "h3_submission", worker=origin, timeout_seconds=limit) as timing:
+                        response = client.submit(origin, task["request"], timeout=limit)
+                        job_id = str(UUID(response["id"]))
+                        timing["job_id"] = job_id
                 except urllib.error.HTTPError as exc:
                     if exc.code in {429, 503}:
                         # These service responses explicitly reject admission.
@@ -367,7 +380,10 @@ def generate_one(task, protocol, client, probe, poll_interval=1, timeout=1800):
                 time.sleep(min(poll_interval, remaining()))
         origin, job_id = state["worker_url"], state["task_id"]
         while True:
-            response = client.get_json(f"{origin}/v1/jobs/{job_id}", timeout=remaining())
+            limit = remaining()
+            with timed_stage(timings, "h3_poll", job_id=job_id, timeout_seconds=limit) as timing:
+                response = client.get_json(f"{origin}/v1/jobs/{job_id}", timeout=limit)
+                timing["job_status"] = response.get("status")
             if response.get("id") != job_id:
                 raise ValueError("H3 status returned a different job ID")
             status = response["status"]
@@ -377,24 +393,38 @@ def generate_one(task, protocol, client, probe, poll_interval=1, timeout=1800):
             if status == "succeeded":
                 save(status="downloading")
                 output.parent.mkdir(parents=True, exist_ok=True)
-                client.download(origin, job_id, output, timeout=remaining())
+                limit = remaining()
+                with timed_stage(timings, "h3_download", job_id=job_id, timeout_seconds=limit):
+                    client.download(origin, job_id, output, timeout=limit)
                 error_stage = "artifact"
-                media = probe(output)
-                remuxed = False
-                # Sol-H3 writes fragmented MP4s. The evaluator's minimal box
-                # parser reads only moov/stts, which are empty in that format.
-                # Repackage the encoded streams; do not decode or re-encode.
-                if media.get("duration_s") == 0 and (media.get("video") or {}).get("frames") == 0:
-                    remux_container(output, remaining())
-                    media, remuxed = probe(output), True
-                if media_profile(media, duration=task["request"]["duration"]) != protocol["media_profile"]:
-                    raise ValueError(f"H3 media format differs from the reference videos: {output}")
+                with timed_stage(timings, "h3_media_validation", job_id=job_id):
+                    media = probe(output)
+                    remuxed = False
+                    # Repackage fragmented MP4s without decoding or re-encoding.
+                    if media.get("duration_s") == 0 and (media.get("video") or {}).get("frames") == 0:
+                        remux_container(output, remaining())
+                        media, remuxed = probe(output), True
+                    if media_profile(media, duration=task["request"]["duration"]) != protocol["media_profile"]:
+                        raise ValueError(f"H3 media format differs from the reference videos: {output}")
+                provider_timings = {
+                    key: response[key]
+                    for key in ("created_at", "started_at", "finished_at", "pipeline_s", "processing_s")
+                    if key in response
+                }
+                if all(key in provider_timings for key in ("created_at", "started_at", "finished_at")):
+                    provider_timings.update(
+                        queued_seconds=response["started_at"] - response["created_at"],
+                        running_seconds=response["finished_at"] - response["started_at"],
+                        total_seconds=response["finished_at"] - response["created_at"],
+                    )
+                record_event(timings, "h3_provider", "completed", job_id=job_id, **provider_timings)
                 save(
                     status="succeeded",
                     sha256=file_sha256(output),
                     media=media,
                     bytes=output.stat().st_size,
                     container_remuxed=remuxed,
+                    provider_timings=provider_timings,
                     error=None,
                 )
                 return True

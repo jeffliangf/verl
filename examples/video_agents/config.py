@@ -10,6 +10,8 @@
 # limitations under the License.
 """Dataset locations, prompts, and judge settings for SFT and video-agent RL."""
 
+import json
+from math import ceil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +20,17 @@ DEFAULT_SELF_HOSTED_REFERENCES = ROOT / "data/prompt_rewrite_h3_eval/outputs_sel
 DEFAULT_EVAL_REPO = Path.home() / "video-generation-eval"
 DEFAULT_SYSTEM_PROMPT = Path(__file__).with_name("system_prompt.txt").read_text(encoding="utf-8").strip()
 DEFAULT_REWRITE_INSTRUCTION = Path(__file__).with_name("rewrite_instruction.txt").read_text(encoding="utf-8").strip()
+LATENCY_BASELINE = json.loads(Path(__file__).with_name("configs").joinpath("latency_baseline.json").read_text())
+DEFAULT_TIMEOUTS = {
+    "llm": 900,
+    "h3_request": 30,
+    "judge_file": 300,
+    "judge_pass": 1800,
+    **{
+        stage: ceil(LATENCY_BASELINE["timeout_multiplier"] * LATENCY_BASELINE[stage]["p99_seconds"])
+        for stage in ("h3", "judge_request")
+    },
+}
 
 # Read-only metadata for existing reference videos; all new generation uses Sol-H3.
 MAX_REFERENCE_ENDPOINT = "/v2/video_generation"

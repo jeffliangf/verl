@@ -30,7 +30,8 @@ video. This is a native tool-calling agent with a deliberately small action spac
 | `tournament.py` | Generate candidates and score training/validation comparisons |
 | `self_hosted_h3.py` | Sol-H3 HTTP client, job recovery, downloads, and health checks |
 | `h3.py` | Generation subprocess entry point and media checks |
-| `judge.py`, `scoring.py` | Gemini manifests, verified result ledgers, and pair scores |
+| `judge.py`, `judge_worker.py`, `scoring.py` | Gemini manifests, timed requests, verified ledgers, and pair scores |
+| `observability.py` | Stage timings, provider failure classification, and latency summaries |
 | `dataset.py` | Validate held-out data and reference-video provenance |
 | `prepare_sft.py` | Convert rewrite examples to SFT conversations |
 | `sft.py`, `sft_dataset.py` | Launch native SFT and mask loss to assistant tokens |
@@ -75,9 +76,64 @@ judgments. A pair earns 1 for two wins, 0.5 for an order disagreement, or 0 for 
 losses. Each candidate's reward is its total points divided by three.
 
 An invalid tool call earns -1 and forfeits its pairings against valid calls.
-Equal-reward groups have no GRPO learning signal. Provider failures, timeouts,
-missing judgments, and corrupt artifacts stop the batch before an optimizer
-update. They never become neutral scores or policy penalties.
+Equal-reward groups have no GRPO learning signal. During training, an H3/Gemini
+service failure, timeout, or missing judgment drops the whole four-rollout prompt
+group. No trajectories or rewards from that group enter the optimizer. Native
+`trainer.v1.sampler.sync_refill_failed_groups=true` replaces it with a fresh group
+under the same policy weights, preserving the training batch size. Sibling
+rollouts settle before the failed group is released. Artifact corruption,
+configuration errors, and LLM failures still abort. Evaluation service failures
+also abort, preserving the held-out denominator.
+
+`video_rl.max_dropped_groups_per_step` defaults to `data.train_batch_size`.
+Exceeding that many dropped groups stops the step before updating weights, so a
+persistent outage cannot cause unlimited replacement. TensorBoard reports
+`training/rollout_failure/evicted_samples`. Dropped groups retain `failure.json`
+with their sample ID, policy step, provider stage, and reason.
+
+Newly prepared runs use the measured latency baseline in
+`configs/latency_baseline.json` from the two-step, four-H200 run at H3 concurrency
+20. Timeouts are twice P99, rounded up to whole seconds:
+
+| Measured stage | Observations | P50 | P99 | Timeout |
+| --- | ---: | ---: | ---: | ---: |
+| H3 accepted job through queue and generation | 64 | 49.34 s | 90.41 s | 181 s |
+| One Gemini judgment, excluding upload | 192 | 11.53 s | 16.84 s | 34 s |
+
+The H3 worker deadline includes admission, polling, download, and media checks;
+its calibration measures the dominant queue/generation portion. Waiting for a
+client concurrency slot is logged separately. Limits for previously unmeasured
+stages remain 30 s per H3 HTTP request, 300 s for Gemini file operations, 1800 s
+per Gemini presentation-order pass, and 900 s for LLM generation. Each limit can
+be overridden during `prepare` using `--h3-timeout`, `--h3-request-timeout`,
+`--judge-request-timeout`, `--judge-file-timeout`, `--judge-pass-timeout`, or
+`--llm-timeout`. Existing frozen protocols retain their saved limits; prepare a
+new run to adopt new settings. These small-sample percentiles describe successful
+requests; failures are counted separately.
+
+Stage logs are append-only JSONL, with UTC start/end times, elapsed seconds,
+outcome, error type, timeout, and correlation IDs. They cover LLM inference,
+concurrency waits, H3 submission/status polling/download/media checks, provider
+queue/generation timings, Gemini upload/file processing/judgments/cleanup,
+complete judge passes, group outcomes, and replacement dispatch. Files live at:
+
+- `<run>/timings.jsonl`: batch dispatch and replacement counts.
+- `<run>/train/step_<N>/<group>/timings.jsonl`: group, LLM, and tool stages.
+- `<run>/videos/<instance>/timings.jsonl`: H3 requests and provider timings.
+- `<run>/train/step_<N>/<group>/judge/timings*.jsonl`: Gemini stages.
+
+Validation uses the same layout under `val/`. An unmatched start identifies
+interrupted work, including a killed subprocess. Timing logs omit credentials,
+prompts, and provider response bodies. Summarize the next run offline with:
+
+```bash
+python -m examples.video_agents.rl timings --run-dir outputs/video_agents/rl
+```
+
+This reports P50/P99 and proposed 2×P99 limits without changing the frozen run,
+alongside errors, dropped groups, incomplete stages, and malformed log lines.
+An accepted remote H3 job may continue after the local timeout; saved IDs remain
+available for inspection and recovery, and ambiguous POSTs are never repeated.
 
 Validation uses one greedy rollout per held-out prompt. It compares the video
 against the saved original-prompt and Context-IR reference videos, each in both
@@ -148,8 +204,10 @@ uv run --frozen --extra fsdp --extra vllm python -m examples.video_agents.rl tra
 ```
 
 The preset uses Qwen3.8-27B, FSDP2, TP=4 vLLM rollout, eight GPUs, sixteen prompts
-per batch, and four samples per prompt. The ten-step pilot saves every five steps
-and validates at step ten. Each batch costs at most 64 videos and 192 judgments;
+per batch, and four samples per prompt. Four agent workers each allow five H3
+requests, giving a client concurrency cap of 20. The ten-step pilot saves every
+five steps and validates at step ten. An initial batch costs at most 64 videos
+and 192 judgments, with additional work for failed-group replacements;
 the 200-prompt validation costs at most 200 videos and 800 judgments. Hardware
 memory fit and live provider behavior still need a GPU smoke run.
 

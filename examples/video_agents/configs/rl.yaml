@@ -12,6 +12,9 @@ video_rl:
 
   output_dir: ???
 
+  # Stop a persistent outage after replacing at most one training batch of groups.
+  max_dropped_groups_per_step: ${data.train_batch_size}
+
 data:
   train_batch_size: 16
 
@@ -145,6 +148,9 @@ trainer:
 
   v1:
     trainer_mode: sync
+
+    sampler:
+      sync_refill_failed_groups: true
 
   project_name: video-agents-rl
 

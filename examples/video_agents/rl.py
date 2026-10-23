@@ -27,11 +27,14 @@ from .config import (
     DEFAULT_EVAL_REPO,
     DEFAULT_SELF_HOSTED_REFERENCES,
     DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_TIMEOUTS,
     JUDGE_SETTINGS,
+    LATENCY_BASELINE,
     ROOT,
 )
 from .dataset import load_samples, reference_inventory, reference_video_fields
 from .judge import EXTERNAL_FILES
+from .observability import summarize_timings
 from .storage import (
     atomic_text,
     file_sha256,
@@ -124,7 +127,9 @@ def prepare(args) -> dict:
     timeouts = {
         "llm": args.llm_timeout,
         "h3": args.h3_timeout,
+        "h3_request": args.h3_request_timeout,
         "judge_request": args.judge_request_timeout,
+        "judge_file": args.judge_file_timeout,
         "judge_pass": args.judge_pass_timeout,
     }
     if any(not isfinite(v) or v <= 0 for v in [*timeouts.values(), args.poll_interval]):
@@ -152,6 +157,7 @@ def prepare(args) -> dict:
         "eval_repo": str(repo),
         "dependencies": dependencies,
         "timeouts": timeouts,
+        "latency_baseline": LATENCY_BASELINE,
         "poll_interval": args.poll_interval,
         "groups_per_worker": args.groups_per_worker,
         "h3_concurrency_per_worker": args.h3_concurrency_per_worker,
@@ -392,16 +398,16 @@ def parse_args(argv=None):
     prep.add_argument("--references", type=Path, default=DEFAULT_SELF_HOSTED_REFERENCES)
     prep.add_argument("--eval-repo", type=Path, default=DEFAULT_EVAL_REPO)
     self_hosted_h3.add_arguments(prep)
-    prep.add_argument("--llm-timeout", type=float, default=300)
-    prep.add_argument("--h3-timeout", type=float, default=1800)
-    prep.add_argument("--judge-request-timeout", type=float, default=300)
-    prep.add_argument("--judge-pass-timeout", type=float, default=1800)
+    for stage, timeout in DEFAULT_TIMEOUTS.items():
+        prep.add_argument(f"--{stage.replace('_', '-')}-timeout", type=float, default=timeout)
     prep.add_argument("--poll-interval", type=float, default=1)
-    prep.add_argument("--groups-per-worker", type=int, default=1)
-    prep.add_argument("--h3-concurrency-per-worker", type=int, default=2)
+    prep.add_argument("--groups-per-worker", type=int, default=5)
+    prep.add_argument("--h3-concurrency-per-worker", type=int, default=5)
     status = commands.add_parser("status", help="Read H3 readiness and any reported model provenance; no generation")
     status.add_argument("--run-dir", type=Path, required=True)
     status.add_argument("--timeout", type=float, default=5)
+    timings = commands.add_parser("timings", help="Summarize stage latency, failures, and interrupted work offline")
+    timings.add_argument("--run-dir", type=Path, required=True)
     for mode in ("train", "evaluate"):
         launch = commands.add_parser(mode)
         launch.add_argument("--run-dir", type=Path, required=True)
@@ -428,6 +434,8 @@ def main(argv=None):
         result = self_hosted_h3.server_status(protocol, timeout=args.timeout)
         print(json.dumps(result, indent=2))
         return 0 if result["all_ready"] else 1
+    elif args.command == "timings":
+        print(json.dumps(summarize_timings(local_path(args.run_dir)), indent=2))
     else:
         train(args)
     return 0

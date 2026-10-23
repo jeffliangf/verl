@@ -17,6 +17,7 @@ from pathlib import Path
 from . import h3, judge, scoring, self_hosted_h3
 from .config import CANDIDATE, REFERENCE_FIELDS
 from .dataset import verify_references
+from .observability import ProviderError, timed_stage
 from .storage import file_sha256, fingerprint, freeze_json, read_json, run_lock, write_json
 
 GROUP_SIZE = 4
@@ -54,17 +55,30 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
         if key in protocol:
             worker_protocol[key] = protocol[key]
     worker_protocol["rl_protocol_sha256"] = fingerprint(protocol)
+    if "h3_request" in protocol["timeouts"]:
+        worker_protocol["timeouts"] = {"h3_request": protocol["timeouts"]["h3_request"]}
     with run_lock(directory):
         freeze_json(directory / "protocol.json", worker_protocol)
         freeze_json(directory / "generation.json", [task])
         timeout = protocol["timeouts"]["h3"]
         # This worker already persists the task ID before polling and refuses to
         # resubmit an uncertain POST. subprocess.run kills and waits on timeout.
-        subprocess.run(
-            h3.worker_command(directory, 1, protocol["poll_interval"], timeout),
-            check=True,
-            timeout=timeout,
-        )
+        try:
+            with timed_stage(directory / "timings.jsonl", "h3_worker", timeout_seconds=timeout):
+                subprocess.run(
+                    h3.worker_command(directory, 1, protocol["poll_interval"], timeout),
+                    check=True,
+                    timeout=timeout,
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise ProviderError("h3", f"H3 exceeded {timeout}s; inspect the saved job in {directory}") from exc
+        except subprocess.CalledProcessError as exc:
+            state = read_json(Path(task["state"])) if Path(task["state"]).exists() else {}
+            if state.get("status") in h3.TERMINAL_FAILURES or (
+                state.get("status") == "error" and state.get("error_stage") == "provider"
+            ):
+                raise ProviderError("h3", f"H3 service failed: {state.get('error')}; inspect {directory}") from exc
+            raise  # Artifact, configuration, and worker-code errors must remain fatal.
         state, path = read_json(Path(task["state"])), Path(task["output"])
         if (
             state.get("status") != "succeeded"
@@ -118,7 +132,7 @@ def tournament_manifests(sample: dict, candidates: list[dict], protocol: dict) -
 def require_judgments(manifest: dict, rows: dict):
     """Missing comparisons are infrastructure failures, never ties or losses."""
     if set(rows) != set(manifest["pairs"]) or any(row.get("status") != "completed" for row in rows.values()):
-        raise RuntimeError("Tournament requires every judgment; missing/fallback results cannot train the policy")
+        raise ProviderError("gemini", "Tournament requires every judgment; missing results cannot train the policy")
 
 
 def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
@@ -139,7 +153,7 @@ def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
                     "--request-timeout",
                     request_timeout,
                     "--file-timeout",
-                    request_timeout,
+                    str(protocol["timeouts"].get("judge_file", protocol["timeouts"]["judge_request"])),
                     "--max-attempts",
                     "1",
                     "--max-errors",
@@ -148,7 +162,19 @@ def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
             )
             for pair_id in sorted(pending):
                 command.extend(["--pair-id", pair_id])
-            subprocess.run(command, check=True, timeout=protocol["timeouts"]["judge_pass"])
+            timeout = protocol["timeouts"]["judge_pass"]
+            try:
+                with timed_stage(
+                    directory / "judge/timings.jsonl", "gemini_pass", order=order, timeout_seconds=timeout
+                ):
+                    subprocess.run(command, check=True, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                raise ProviderError("gemini", f"Gemini {order} pass exceeded {timeout}s") from exc
+            except subprocess.CalledProcessError as exc:
+                _, counts = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
+                if counts.get("error", 0):
+                    raise ProviderError("gemini", f"Gemini failed comparisons; inspect {path}") from exc
+                raise
             completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
         require_judgments(manifest, completed)
         results[order] = completed
