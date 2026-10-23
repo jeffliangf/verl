@@ -12,6 +12,7 @@
 
 import itertools
 import subprocess
+from math import isfinite
 from pathlib import Path
 
 from . import h3, judge, scoring, self_hosted_h3
@@ -22,6 +23,7 @@ from .storage import file_sha256, fingerprint, freeze_json, read_json, run_lock,
 
 GROUP_SIZE = 4
 INVALID_REWARD = -1.0
+TIMEOUT_STAGES = ("llm", "h3", "h3_request", "judge_request", "judge_file", "judge_control", "judge_pass")
 
 
 class GeminiPolicyRefusal(RuntimeError):
@@ -51,6 +53,25 @@ def load_protocol(path: Path) -> dict:
     return protocol
 
 
+def runtime_protocol(protocol: dict, settings) -> dict:
+    """Overlay launch-time provider limits from video_rl; the frozen identity is kept."""
+    timeouts = dict(settings.get("timeouts") or {})
+    if unknown := set(timeouts) - set(TIMEOUT_STAGES):
+        raise ValueError(f"Unknown video_rl.timeouts stages: {sorted(unknown)}")
+    seconds = timeouts.values()
+    if any(isinstance(v, bool) or not isinstance(v, int | float) or not isfinite(v) or v <= 0 for v in seconds):
+        raise ValueError("video_rl.timeouts must be positive, finite seconds")
+    attempts = settings.get("judge_max_attempts", 1)
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+        raise ValueError("video_rl.judge_max_attempts must be a positive integer")
+    return {
+        **protocol,
+        "timeouts": {**protocol["timeouts"], **timeouts},
+        "judge_max_attempts": attempts,
+        "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
+    }
+
+
 def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
     """Execute the policy's complete Sol-H3 request using the existing durable worker."""
     task = {
@@ -63,7 +84,7 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
     for key in ("h3_backend", "h3_endpoints", "h3_token_file", "reference_h3"):
         if key in protocol:
             worker_protocol[key] = protocol[key]
-    worker_protocol["rl_protocol_sha256"] = fingerprint(protocol)
+    worker_protocol["rl_protocol_sha256"] = protocol.get("protocol_sha256") or fingerprint(protocol)
     if "h3_request" in protocol["timeouts"]:
         worker_protocol["timeouts"] = {"h3_request": protocol["timeouts"]["h3_request"]}
     with run_lock(directory):
@@ -174,11 +195,13 @@ def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
                     "--file-timeout",
                     str(protocol["timeouts"].get("judge_file", protocol["timeouts"]["judge_request"])),
                     "--max-attempts",
-                    "1",
+                    str(protocol.get("judge_max_attempts", 1)),
                     "--max-errors",
                     "1",
                 ]
             )
+            if "judge_control" in protocol["timeouts"]:
+                command.extend(["--file-control-timeout", str(protocol["timeouts"]["judge_control"])])
             for pair_id in sorted(pending):
                 command.extend(["--pair-id", pair_id])
             timeout = protocol["timeouts"]["judge_pass"]
@@ -273,31 +296,32 @@ def score_group(directory: Path, protocol: dict, sample: dict, candidates: list[
             judgments = run_judgments(directory, protocol, manifests)
         except GeminiPolicyRefusal as exc:
             # Skip the entire example, including any partial comparisons. Equal
-            # rewards give a training group zero GRPO advantage. Keep the real
-            # error ledger untouched and make neutral evaluation rows explicit.
+            # rewards give a training group zero GRPO advantage. A held-out
+            # example is dropped from the evaluation denominator instead. Keep
+            # the real error ledger untouched.
+            policy = "dropped_example" if validate else "neutral_example"
             refusal = {
                 "sample_id": sample["id"],
                 "reason": "prohibited_content",
-                "policy": "neutral_example",
-                "score": 0.5,
+                "policy": policy,
+                **({} if validate else {"score": 0.5}),
                 "order": exc.order,
                 "pair_ids": exc.pair_ids,
                 "ledger": f"judge/judgments-{exc.order}.jsonl",
                 "validate": validate,
             }
             write_json(directory / "gemini-refusal.json", refusal)
-            record_event(directory / "judge/timings.jsonl", "gemini_refusal", "neutral_example", **refusal)
+            record_event(directory / "judge/timings.jsonl", "gemini_refusal", policy, **refusal)
+            if validate:
+                raise ProviderError("gemini_refusal", f"Gemini refused held-out example {sample['id']}") from exc
             rewards = [
                 {
                     "score": 0.5,
                     "valid_call": float(candidate["status"] == "succeeded"),
                     "judge_comparisons": 0,
                     "gemini_refusal": 1.0,
-                    **(
-                        {f"vs_{ref}": 0.5 for ref in REFERENCE_FIELDS}
-                        if validate
-                        else {"zero_variance_group": 1.0, "order_disagreement": 0.0}
-                    ),
+                    "zero_variance_group": 1.0,
+                    "order_disagreement": 0.0,
                 }
                 for candidate in candidates
             ]

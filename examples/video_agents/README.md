@@ -82,8 +82,20 @@ group. No trajectories or rewards from that group enter the optimizer. Native
 `trainer.v1.sampler.sync_refill_failed_groups=true` replaces it with a fresh group
 under the same policy weights, preserving the training batch size. Sibling
 rollouts settle before the failed group is released. Artifact corruption,
-configuration errors, and LLM failures still abort. Evaluation service failures
-also abort, preserving the held-out denominator.
+configuration errors, and aborted or empty LLM responses still abort during
+training; an LLM turn that exceeds its time limit is dropped like a service
+failure.
+
+Held-out evaluation never stops training. A prompt whose video, Gemini judgments,
+or LLM turn fails for any reason, including a Gemini `prohibited_content`
+refusal, is dropped from the denominator and keeps its `failure.json`. An invalid
+tool call is the policy's failure and still scores 0. Each evaluation writes
+`val/step_<n>/eval-summary.json` with the valid count, valid-only means overall
+and against each reference, invalid calls, and every dropped sample with its
+stage and reason. Native `val-core` metrics cover the valid prompts. The summary
+sets `degraded` below `video_rl.min_valid_eval_fraction` (default 0.9). Because
+checkpoints may drop different prompts, compare them on the prompts valid at both.
+Only a batch in which every prompt failed raises an error.
 
 `video_rl.max_dropped_groups_per_step` defaults to `data.train_batch_size`.
 Exceeding that many dropped groups stops the step before updating weights, so a
@@ -107,9 +119,26 @@ stages remain 30 s per H3 HTTP request, 300 s for Gemini file operations, 1800 s
 per Gemini presentation-order pass, and 900 s for LLM generation. Each limit can
 be overridden during `prepare` using `--h3-timeout`, `--h3-request-timeout`,
 `--judge-request-timeout`, `--judge-file-timeout`, `--judge-pass-timeout`, or
-`--llm-timeout`. Existing frozen protocols retain their saved limits; prepare a
-new run to adopt new settings. These small-sample percentiles describe successful
-requests; failures are counted separately.
+`--llm-timeout`. These small-sample percentiles describe successful requests;
+failures are counted separately.
+
+At launch, `video_rl.timeouts` overrides the frozen protocol's limits without
+changing its identity, so a resumed run can adopt them. The defaults in
+`configs/rl.yaml` are about twice the healthy P99 measured in canary job 2391,
+dropping the slowest ~1% of work instead of waiting for it:
+
+| Stage | Healthy P99 | Limit |
+| --- | ---: | ---: |
+| LLM turn (`llm`) | 130-187 s | 240 s |
+| H3 worker (`h3`) | 80 s | 150 s |
+| One Gemini judgment (`judge_request`) | 20-22 s | 45 s |
+| Gemini upload and file processing (`judge_file`) | 10-12 s | 60 s |
+| Gemini upload start, polling, deletion (`judge_control`) | 3 s | 15 s |
+| One presentation-order pass (`judge_pass`) | 65-132 s | 300 s |
+
+`video_rl.judge_max_attempts` (default 2) gives each Gemini HTTP call one fast
+retry for 408/429/5xx and upload/polling network errors; the runner never
+retries a judgment after a network timeout.
 
 Stage logs are append-only JSONL, with UTC start/end times, elapsed seconds,
 outcome, error type, timeout, and correlation IDs. They cover LLM inference,

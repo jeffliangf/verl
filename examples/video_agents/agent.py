@@ -26,9 +26,10 @@ from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ, AgentLoopWorkerTQBase
 from verl.utils.tensordict_utils import get_non_tensor_data
 
+from .config import REFERENCE_FIELDS
 from .observability import ProviderError, record_event, timed_stage
 from .storage import item_key, write_json
-from .tournament import GROUP_SIZE, generate_video, load_protocol, score_group
+from .tournament import GROUP_SIZE, generate_video, load_protocol, runtime_protocol, score_group
 
 
 class SolH3Tool(BaseTool):
@@ -111,10 +112,14 @@ class H3TerminalLoop(ToolAgentLoop):
         timeout = self.tools["sol_h3"].protocol["timeouts"]["llm"]
         agent_data._video_timing_path = self.timing_path
         with timed_stage(self.timing_path, "llm", **self.timing_fields, timeout_seconds=timeout) as timing:
-            result = await asyncio.wait_for(
-                super()._handle_generating_state(agent_data, sampling_params, ignore_termination),
-                timeout=timeout,
-            )
+            try:
+                result = await asyncio.wait_for(
+                    super()._handle_generating_state(agent_data, sampling_params, ignore_termination),
+                    timeout=timeout,
+                )
+            except TimeoutError as exc:
+                # A slow-tail generation drops its group like a provider failure.
+                raise ProviderError("llm", f"LLM generation exceeded {timeout}s") from exc
             timing["response_tokens"] = len(agent_data.response_ids)
             return result
 
@@ -155,6 +160,7 @@ class H3TerminalLoop(ToolAgentLoop):
         # local to this loop, while sharing the executor's semaphore and protocol.
         tool = copy(self.tools["sol_h3"])
         tool.output_dir = Path(self.config.video_rl.output_dir)
+        tool.protocol = runtime_protocol(tool.protocol, self.config.video_rl)
         tool.tool_schema = OpenAIFunctionToolSchema.model_validate(schemas[0])
         self.tools = {"sol_h3": tool}
         # Render the raw schema so JSON Schema fields such as maxLength survive
@@ -183,7 +189,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
         super().__init__(*args, **kwargs)
         self.protocol_path = Path(self.config.video_rl.protocol)
         self.output_dir = Path(self.config.video_rl.output_dir)
-        self.protocol = load_protocol(self.protocol_path)
+        self.protocol = runtime_protocol(load_protocol(self.protocol_path), self.config.video_rl)
         self.samples = {
             split: {sample["id"]: sample for sample in self.protocol["samples"][split]} for split in ("train", "val")
         }
@@ -214,7 +220,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
         try:
             with timed_stage(directory / "timings.jsonl", "group", uid=prompt["uid"]) as timing:
                 result = await self._run_group(prompt, sampling_params, trajectory, trace)
-                if result:
+                if result and result["dropped"]:
                     timing["status"] = "dropped"
                 return result
         finally:
@@ -284,17 +290,21 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 output.extra_fields["reward_extra_info"] = reward
                 await super()._agent_loop_postprocess(output, validate, session_id=i, **prompt)
             await tq.async_kv_put(key=uid, partition_id=partition, tag={"status": "finished"})
+            if validate:
+                return {"dropped": False, "validate": True, "uid": uid, "sample_id": sample["id"], "reward": rewards[0]}
         except BaseException as exc:
-            drop = (
-                isinstance(exc, ProviderError)
-                and not validate
-                and self.config.trainer.v1.sampler.sync_refill_failed_groups
+            # A held-out prompt that cannot be scored for any reason is excluded
+            # and reported in eval-summary.json; evaluation never stops training.
+            drop = isinstance(exc, Exception) and (
+                validate
+                or (isinstance(exc, ProviderError) and self.config.trainer.v1.sampler.sync_refill_failed_groups)
             )
             failure = {
                 "type": type(exc).__name__,
                 "error": str(exc),
                 "stage": getattr(exc, "stage", "internal"),
                 "dropped": bool(drop),
+                "validate": validate,
                 "uid": uid,
                 "sample_id": sample["id"],
                 "policy_step": int(prompt["global_steps"]),
@@ -310,7 +320,8 @@ class TournamentWorker(AgentLoopWorkerTQBase):
             await tq.async_kv_put(key=uid, partition_id=partition, tag={"status": "failure"})
             if drop:
                 # No trajectory or reward is published. Native sync refill replaces
-                # this entire group, preserving the four-candidate GRPO objective.
+                # a training group, preserving the four-candidate GRPO objective;
+                # the validation sampler skips a failed group without refill.
                 return failure
             raise
 
@@ -329,6 +340,7 @@ class TournamentManager(AgentLoopManagerTQ):
         self.reward_loop_worker_handles = None
         self.agent_loop_workers_class = ray.remote(TournamentWorker)
         self._drop_step, self._dropped_groups = None, 0
+        self._eval_step, self._eval_records = None, []
 
     def generate_sequences(self, prompts):
         """Use native dispatch and bound replacement work during a service outage."""
@@ -345,7 +357,11 @@ class TournamentManager(AgentLoopManagerTQ):
                     for worker, chunk in zip(self.agent_loop_workers, chunks, strict=False)
                 ]
             )
-        dropped = sum(len(result) for result in results)
+        records = [record for result in results for record in result]
+        if validate:
+            self._record_evaluation(step, records)
+            return
+        dropped = sum(record["dropped"] for record in records)
         self._dropped_groups += dropped
         if dropped:
             record_event(
@@ -362,3 +378,57 @@ class TournamentManager(AgentLoopManagerTQ):
                 f"Service failures exceeded {limit} dropped groups at step {step}; "
                 "stopping before an optimizer update. Inspect failure.json and timings.jsonl."
             )
+
+    def _record_evaluation(self, step, records):
+        """Summarize held-out prompts; unscorable ones are excluded, never fatal."""
+        if self._eval_step != step:
+            self._eval_step, self._eval_records = step, []
+        self._eval_records.extend(records)
+        output_dir = Path(self.config.video_rl.output_dir)
+        path = output_dir / "val" / f"step_{step}" / "eval-summary.json"
+        summary = evaluation_summary(step, self._eval_records, self.config.video_rl.min_valid_eval_fraction)
+        write_json(path, summary)
+        record_event(
+            output_dir / "timings.jsonl",
+            "evaluation",
+            "summarized",
+            policy_step=step,
+            **{key: summary[key] for key in ("prompts", "valid", "dropped", "degraded")},
+        )
+        if records and all(record["dropped"] for record in records):
+            # The native validation loop cannot report an empty batch; this is an outage.
+            raise RuntimeError(f"Every held-out prompt in the batch failed at step {step}; inspect {path}")
+
+
+def evaluation_summary(step: int, records: list[dict], min_valid_fraction: float) -> dict:
+    """Valid-only held-out means; invalid policy calls stay in the denominator as 0."""
+    valid = [record["reward"] for record in records if not record["dropped"]]
+    fraction = len(valid) / len(records) if records else 0.0
+
+    def mean(key):
+        return sum(reward[key] for reward in valid) / len(valid) if valid else None
+
+    return {
+        "policy_step": step,
+        "prompts": len(records),
+        "valid": len(valid),
+        "dropped": len(records) - len(valid),
+        "valid_fraction": fraction,
+        "degraded": fraction < min_valid_fraction,
+        "score": mean("score"),
+        **{f"vs_{reference}": mean(f"vs_{reference}") for reference in REFERENCE_FIELDS},
+        "invalid_calls": sum(reward["valid_call"] == 0 for reward in valid),
+        "dropped_examples": sorted(
+            (
+                {
+                    "sample_id": record["sample_id"],
+                    "stage": record["stage"],
+                    "type": record["type"],
+                    "error": record["error"][:500],
+                }
+                for record in records
+                if record["dropped"]
+            ),
+            key=lambda row: row["sample_id"],
+        ),
+    }

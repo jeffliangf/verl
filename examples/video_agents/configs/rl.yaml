@@ -15,6 +15,24 @@ video_rl:
   # Stop a persistent outage after replacing at most one training batch of groups.
   max_dropped_groups_per_step: ${data.train_batch_size}
 
+  # Seconds; override the frozen protocol's limits at launch. About 2x the
+  # healthy P99 of job 2391, so a slow ~1% tail is dropped instead of awaited.
+  # h3_request keeps the protocol value.
+  timeouts:
+    llm: 240
+    h3: 150
+    judge_request: 45
+    judge_file: 60
+    judge_control: 15
+    judge_pass: 300
+
+  # Gemini attempts per HTTP call: one fast retry for 408/429/5xx and
+  # upload/polling network errors. Judgment network timeouts are not retried.
+  judge_max_attempts: 2
+
+  # Held-out evaluation drops unscorable prompts; flag it degraded below this.
+  min_valid_eval_fraction: 0.9
+
 data:
   train_batch_size: 16
 
