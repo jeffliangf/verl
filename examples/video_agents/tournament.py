@@ -17,11 +17,20 @@ from pathlib import Path
 from . import h3, judge, scoring, self_hosted_h3
 from .config import CANDIDATE, REFERENCE_FIELDS
 from .dataset import verify_references
-from .observability import ProviderError, timed_stage
+from .observability import ProviderError, record_event, timed_stage
 from .storage import file_sha256, fingerprint, freeze_json, read_json, run_lock, write_json
 
 GROUP_SIZE = 4
 INVALID_REWARD = -1.0
+
+
+class GeminiPolicyRefusal(RuntimeError):
+    """An identity-verified content-policy rejection for this prompt group."""
+
+    def __init__(self, order: str, pair_ids: list[str]):
+        super().__init__(f"Gemini prohibited_content rejection in {order}: {pair_ids}")
+        self.order = order
+        self.pair_ids = pair_ids
 
 
 def check_dependencies(protocol: dict):
@@ -138,12 +147,22 @@ def require_judgments(manifest: dict, rows: dict):
 def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
     """Reuse the judge CLI and ledgers with strict, bounded failure handling."""
     judge.freeze_manifests(directory, manifests)
+
+    def read_pass(order):
+        manifest = manifests[order]
+        path = directory / "judge" / f"judgments-{order}.jsonl"
+        manifest_path = directory / "judge" / f"manifest-{order}.json"
+        completed, counts = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
+        refusals = judge.read_policy_refusals(path, manifest, manifest_path, protocol["judge"], completed)
+        if refusals:
+            raise GeminiPolicyRefusal(order, sorted({row["pair_id"] for row in refusals}))
+        return completed, counts
+
     results = {}
     for order in judge.ORDERS:
         manifest = manifests[order]
         path = directory / "judge" / f"judgments-{order}.jsonl"
-        manifest_path = directory / "judge" / f"manifest-{order}.json"
-        completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
+        completed, _ = read_pass(order)
         pending = set(manifest["pairs"]) - set(completed)
         if pending:
             command = judge.command(directory, protocol, order)
@@ -157,7 +176,7 @@ def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
                     "--max-attempts",
                     "1",
                     "--max-errors",
-                    str(len(pending) + 1),
+                    "1",
                 ]
             )
             for pair_id in sorted(pending):
@@ -169,13 +188,27 @@ def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
                 ):
                     subprocess.run(command, check=True, timeout=timeout)
             except subprocess.TimeoutExpired as exc:
-                raise ProviderError("gemini", f"Gemini {order} pass exceeded {timeout}s") from exc
+                # The runner writes judgments before deleting its remote files.
+                # subprocess.run has killed and reaped the timed-out process;
+                # complete, identity-validated results remain usable even if
+                # cleanup did not finish. Missing or invalid results still fail.
+                completed, _ = read_pass(order)
+                if set(completed) != set(manifest["pairs"]):
+                    raise ProviderError("gemini", f"Gemini {order} pass exceeded {timeout}s") from exc
+                record_event(
+                    directory / "judge/timings.jsonl",
+                    "gemini_pass",
+                    "timeout_with_complete_ledger",
+                    order=order,
+                    completed_pairs=len(completed),
+                    cleanup_status="unconfirmed",
+                )
             except subprocess.CalledProcessError as exc:
-                _, counts = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
+                _, counts = read_pass(order)
                 if counts.get("error", 0):
                     raise ProviderError("gemini", f"Gemini failed comparisons; inspect {path}") from exc
                 raise
-            completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
+            completed, _ = read_pass(order)
         require_judgments(manifest, completed)
         results[order] = completed
     return results
@@ -234,26 +267,62 @@ def score_group(directory: Path, protocol: dict, sample: dict, candidates: list[
             valid = candidates[0]["status"] == "succeeded"
             eval_protocol = {**protocol, "name": "h3-agent", "samples": [sample]}
             manifests = judge.build_manifests(eval_protocol, {sample["id"]: candidates[0]} if valid else {})
-            judgments = run_judgments(directory, protocol, manifests)
-            result = {"valid_call": float(valid), "judge_comparisons": 4 if valid else 0}
-            for reference in REFERENCE_FIELDS:
-                matches = [
-                    key for key, pair in manifests["original"]["pairs"].items() if pair["reference"] == reference
-                ]
-                result[f"vs_{reference}"] = (
-                    scoring.score_pair(
-                        manifests["original"]["pairs"][matches[0]],
-                        judgments["original"][matches[0]],
-                        judgments["swapped"][matches[0]],
-                        candidate=CANDIDATE,
-                    )["score"]
-                    if valid
-                    else 0.0
-                )
-            result["score"] = sum(result[f"vs_{ref}"] for ref in REFERENCE_FIELDS) / len(REFERENCE_FIELDS)
-            rewards = [result]
         else:
             manifests = tournament_manifests(sample, candidates, protocol)
-            rewards = tournament_rewards(candidates, manifests, run_judgments(directory, protocol, manifests))
+        try:
+            judgments = run_judgments(directory, protocol, manifests)
+        except GeminiPolicyRefusal as exc:
+            # Skip the entire example, including any partial comparisons. Equal
+            # rewards give a training group zero GRPO advantage. Keep the real
+            # error ledger untouched and make neutral evaluation rows explicit.
+            refusal = {
+                "sample_id": sample["id"],
+                "reason": "prohibited_content",
+                "policy": "neutral_example",
+                "score": 0.5,
+                "order": exc.order,
+                "pair_ids": exc.pair_ids,
+                "ledger": f"judge/judgments-{exc.order}.jsonl",
+                "validate": validate,
+            }
+            write_json(directory / "gemini-refusal.json", refusal)
+            record_event(directory / "judge/timings.jsonl", "gemini_refusal", "neutral_example", **refusal)
+            rewards = [
+                {
+                    "score": 0.5,
+                    "valid_call": float(candidate["status"] == "succeeded"),
+                    "judge_comparisons": 0,
+                    "gemini_refusal": 1.0,
+                    **(
+                        {f"vs_{ref}": 0.5 for ref in REFERENCE_FIELDS}
+                        if validate
+                        else {"zero_variance_group": 1.0, "order_disagreement": 0.0}
+                    ),
+                }
+                for candidate in candidates
+            ]
+        else:
+            if validate:
+                result = {"valid_call": float(valid), "judge_comparisons": 4 if valid else 0}
+                for reference in REFERENCE_FIELDS:
+                    matches = [
+                        key for key, pair in manifests["original"]["pairs"].items() if pair["reference"] == reference
+                    ]
+                    result[f"vs_{reference}"] = (
+                        scoring.score_pair(
+                            manifests["original"]["pairs"][matches[0]],
+                            judgments["original"][matches[0]],
+                            judgments["swapped"][matches[0]],
+                            candidate=CANDIDATE,
+                        )["score"]
+                        if valid
+                        else 0.0
+                    )
+                result["score"] = sum(result[f"vs_{ref}"] for ref in REFERENCE_FIELDS) / len(REFERENCE_FIELDS)
+                rewards = [result]
+            else:
+                rewards = tournament_rewards(candidates, manifests, judgments)
+        for reward in rewards:
+            reward.setdefault("gemini_refusal", 0.0)
         write_json(directory / "rewards.json", rewards)
         return rewards

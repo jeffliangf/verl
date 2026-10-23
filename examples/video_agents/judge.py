@@ -182,3 +182,32 @@ def read_judgments(path: Path, manifest: dict, manifest_path: Path, settings: di
             raise ValueError(f"Invalid preferred video/model in {pair_id}")
         completed[pair_id] = row
     return completed, dict(counts)
+
+
+def read_policy_refusals(path: Path, manifest: dict, manifest_path: Path, settings: dict, completed: dict) -> list:
+    """Identify explicit policy refusals, without interpreting other failures as ties."""
+    refusals = []
+    manifest_hash = file_sha256(manifest_path)
+    for row in _ledger_rows(path, Counter()):
+        if (row.get("status"), row.get("stage"), row.get("error_type")) != ("error", "interaction", "HttpFailure"):
+            continue
+        error = row.get("error")
+        if not isinstance(error, str):
+            continue
+        status, _, body = error.partition(": ")
+        if status not in ("HTTP 400", "HTTP 403"):
+            continue
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+            continue
+        if payload["error"].get("code") != "prohibited_content":
+            continue
+        # Error rows need the same identity checks as successful votes. A stale
+        # refusal superseded by a real completed judgment is no longer pending.
+        validate_identity(row, manifest, manifest_hash, settings)
+        if row["pair_id"] not in completed:
+            refusals.append(row)
+    return refusals
