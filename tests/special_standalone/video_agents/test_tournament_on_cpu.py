@@ -1349,6 +1349,7 @@ def test_launch_config_supplies_every_limit_and_keeps_the_frozen_identity(prepar
     runtime = tournament.runtime_protocol(frozen, VIDEO_RL)
     assert runtime["timeouts"] == dict(VIDEO_RL.timeouts) and set(runtime["timeouts"]) == set(tournament.TIMEOUT_STAGES)
     assert runtime["judge_max_attempts"] == VIDEO_RL.judge_max_attempts
+    assert runtime["max_judge_fallback_fraction"] == VIDEO_RL.max_judge_fallback_fraction == 0.75
     assert runtime["protocol_sha256"] == fingerprint(frozen) == read_json(directory / "protocol-sha256.json")
     assert tournament.runtime_protocol(runtime, VIDEO_RL)["protocol_sha256"] == fingerprint(frozen)
     # Limits frozen by older runs are replaced, not merged.
@@ -1541,25 +1542,29 @@ def test_validation_never_uses_training_fallbacks(prepared_rl, tmp_path, monkeyp
     assert not list(group.rglob("fallbacks-*.json")) and not (group / "rewards.json").exists()
 
 
-def test_fallback_guard_counts_groups_once_across_replacements(native_worker, tmp_path):
+@pytest.mark.parametrize("limit", [0.25, 0.75])
+def test_fallback_guard_counts_groups_once_across_replacements(native_worker, tmp_path, limit):
     from examples.video_agents import agent
 
     worker, _, _ = native_worker
     manager = object.__new__(agent.TournamentManager)
     manager.config = worker.config
     manager.config.video_rl.output_dir = str(tmp_path)
-    manager.config.video_rl.max_judge_fallback_fraction = 0.25
+    manager.config.video_rl.max_judge_fallback_fraction = limit
     manager.config.data.train_batch_size = 4
 
     def record(fallbacks):
         return {"dropped": False, "rewards": [{"judge_comparisons": 12, "judge_fallback_comparisons": fallbacks}] * 4}
 
-    manager._check_judge_coverage(1, [record(0)] * 3 + [{"dropped": True}])
-    manager._check_judge_coverage(1, [record(12)])
-    assert (manager._judge_comparisons, manager._judge_fallbacks) == (48, 12)
-    manager._check_judge_coverage(2, [record(12)] * 3)
+    neutral_groups = int(limit * 4)
+    # A partial dispatch can be entirely neutral; the completed batch decides.
+    manager._check_judge_coverage(1, [record(12)] * neutral_groups + [{"dropped": True}])
+    manager._check_judge_coverage(1, [record(0)] * (4 - neutral_groups))
+    assert (manager._judge_comparisons, manager._judge_fallbacks) == (48, 12 * neutral_groups)
+    manager._check_judge_coverage(2, [record(12)] * neutral_groups + [record(0)] * (3 - neutral_groups))
     with pytest.raises(RuntimeError, match="stopping before an optimizer update"):
-        manager._check_judge_coverage(2, [record(0)])
+        # One additional missing judgment crosses the boundary.
+        manager._check_judge_coverage(2, [record(1)])
     manager._check_judge_coverage(3, [record(0)] * 4)
     assert manager._judge_fallbacks == 0
 

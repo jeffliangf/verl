@@ -40,7 +40,7 @@ video_rl:
 
   # Stop before updating if more than this fraction of the step's planned
   # judgments are synthetic. Count successful groups across replacement rounds.
-  max_judge_fallback_fraction: 0.25
+  max_judge_fallback_fraction: 0.75
 
   # Held-out evaluation drops unscorable prompts; flag it degraded below this.
   min_valid_eval_fraction: 0.9

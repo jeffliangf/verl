@@ -107,11 +107,16 @@ persistent outage cannot cause unlimited replacement. TensorBoard reports
 `training/rollout_failure/evicted_samples`. Dropped groups retain `failure.json`
 with their sample ID, policy step, provider stage, reason, and traceback.
 
-`video_rl.max_judge_fallback_fraction` defaults to 0.25. Once the full training
+`video_rl.max_judge_fallback_fraction` defaults to 0.75. Once the full training
 batch has accumulated, exceeding this fraction of neutral judgments stops the
 step before an optimizer update. Counts include successful groups from every
 replacement dispatch, counting each group once. This bounds training on imputed
 judgments during an outage; it does not restart or pause the provider automatically.
+The threshold counts individual presentation-order judgments across the whole
+step, not videos or a minimum per group. With 16 groups of four valid videos,
+there are 192 planned judgments (16 × 6 pairs × 2 orders): at least 48 must be
+real. Exactly 144 fallback judgments are allowed. Four fully judged groups and
+twelve fully neutral groups pass this check; one fully judged group does not.
 An all-neutral group of four valid videos has zero GRPO advantages, although the
 actor's KL loss can still contribute a gradient. Evaluation always requires real
 judgments and never uses training fallback ledgers.

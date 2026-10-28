@@ -425,7 +425,7 @@ class TournamentManager(AgentLoopManagerTQ):
             fallbacks=self._judge_fallbacks,
             fallback_fraction=fraction,
         )
-        limit = self.config.video_rl.get("max_judge_fallback_fraction", 0.25)
+        limit = self.config.video_rl.get("max_judge_fallback_fraction", 0.75)
         if self._judge_groups >= self.config.data.train_batch_size and fraction > limit:
             raise RuntimeError(
                 f"Gemini fallback fraction {fraction:.1%} exceeded {limit:.1%} at step {step}; "

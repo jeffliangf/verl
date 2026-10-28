@@ -60,7 +60,7 @@ def runtime_protocol(protocol: dict, settings) -> dict:
     policy = settings.get("judge_failure_policy", "drop")
     if policy not in {"drop", "neutral"}:
         raise ValueError("video_rl.judge_failure_policy must be drop or neutral")
-    fraction = settings.get("max_judge_fallback_fraction", 0.25)
+    fraction = settings.get("max_judge_fallback_fraction", 0.75)
     if (
         isinstance(fraction, bool)
         or not isinstance(fraction, int | float)
