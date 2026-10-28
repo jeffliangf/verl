@@ -30,9 +30,17 @@ video_rl:
     judge_control: 15
     judge_pass: 300
 
-  # Gemini attempts per HTTP call: one fast retry for 408/429/5xx and
-  # upload/polling network errors. Judgment network timeouts are not retried.
-  judge_max_attempts: 2
+  # Initial request plus two retries, sharing one budget for transient HTTP and
+  # network failures, including judgments. Each pass still has a hard deadline.
+  judge_max_attempts: 3
+
+  # Training only: missing judgments contribute half a vote, with provenance.
+  # Set to drop to restore group replacement. Validation always requires real votes.
+  judge_failure_policy: neutral
+
+  # Stop before updating if more than this fraction of the step's planned
+  # judgments are synthetic. Count successful groups across replacement rounds.
+  max_judge_fallback_fraction: 0.25
 
   # Held-out evaluation drops unscorable prompts; flag it degraded below this.
   min_valid_eval_fraction: 0.9

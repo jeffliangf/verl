@@ -8,12 +8,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Instrument the frozen external evaluator without modifying its judging logic."""
+"""Instrument the frozen evaluator and retry transient judgment transport failures."""
 
 import argparse
 import math
 import socket
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from .observability import record_event, timed_stage
@@ -47,13 +48,24 @@ def gemini_address_family(address_family: str):
 
 def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0):
     """Measure uploads, file processing, interactions, and cleanup independently."""
+    interaction = ContextVar("gemini_interaction", default=None)
 
     class TimedClient(runner.GeminiRestClient):
+        def request_json(self, method, url, **kwargs):
+            # Reuse the uploaded files and the upstream HTTP retry budget. Do
+            # not wrap evaluate() in another loop, which would multiply retries.
+            if method == "POST" and url.endswith("/interactions"):
+                kwargs["retry_network"] = True
+            return super().request_json(method, url, **kwargs)
+
         def _request_once(self, method, url, **kwargs):
             # Payload uploads supply their own longer timeout. Small metadata,
             # polling, and cleanup requests must not consume that entire budget.
             if not url.endswith("/interactions") and kwargs.get("timeout") is None:
                 kwargs["timeout"] = min(self.file_timeout, file_control_timeout)
+            trace = interaction.get()
+            if url.endswith("/interactions") and trace is not None:
+                trace["attempts"] += 1
             with timed_stage(
                 timings,
                 "gemini_http",
@@ -72,8 +84,15 @@ def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0)
                 return super().wait_for_file(file_object)
 
         def evaluate(self, request_payload, *, require_agentic_steps):
-            with timed_stage(timings, "gemini_request", timeout_seconds=self.request_timeout):
-                return super().evaluate(request_payload, require_agentic_steps=require_agentic_steps)
+            with timed_stage(timings, "gemini_request", timeout_seconds=self.request_timeout) as trace:
+                trace.update(attempts=0, recovered=False)
+                token = interaction.set(trace)
+                try:
+                    result = super().evaluate(request_payload, require_agentic_steps=require_agentic_steps)
+                    trace["recovered"] = trace["attempts"] > 1
+                    return result
+                finally:
+                    interaction.reset(token)
 
         def delete_file(self, name):
             with timed_stage(

@@ -12,12 +12,13 @@
 
 import hashlib
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
 
 from .config import CANDIDATE, REFERENCE_FIELDS
-from .storage import file_sha256, freeze_json, item_key
+from .storage import file_sha256, freeze_json, item_key, read_json
 
 ORDERS = ("original", "swapped")
 EXTERNAL_FILES = (
@@ -77,7 +78,7 @@ def freeze_manifests(run_dir: Path, manifests: dict[str, dict]):
         freeze_json(run_dir / "judge" / f"manifest-{order}.json", manifest)
 
 
-def command(run_dir: Path, protocol: dict, order: str, pair_ids) -> list[str]:
+def command(run_dir: Path, protocol: dict, order: str, pair_ids, *, allow_fallback: bool = False) -> list[str]:
     """Explicitly override the runner defaults to match the established comparison runs."""
     if order not in ORDERS:
         raise ValueError("Unknown presentation order")
@@ -115,9 +116,9 @@ def command(run_dir: Path, protocol: dict, order: str, pair_ids) -> list[str]:
         str(timeouts["judge_control"]),
         "--max-attempts",
         str(protocol["judge_max_attempts"]),
-        # Any failed comparison drops the whole example, so stop at the first one.
+        # Training can keep judging other pairs after an exhausted comparison.
         "--max-errors",
-        "1",
+        str(max(1, len(pair_ids)) if allow_fallback else 1),
         "--all",
         "--execute",
     ]
@@ -201,3 +202,81 @@ def judgment_errors(path: Path, pair_ids) -> dict[str, str]:
         if row.get("status") == "error" and row.get("pair_id") in pair_ids:
             errors[row["pair_id"]] = f"{row.get('stage')}: {row.get('error')}"
     return errors
+
+
+def fallback_reason(row: dict) -> str:
+    """Allow missing provider judgments, but never hide auth, input, or code errors."""
+    error_type, message = row.get("error_type"), row.get("error", "")
+    if error_type in {"NetworkFailure", "FileProcessingFailure"}:
+        return "provider_failure"
+    if error_type == "HttpFailure":
+        match = re.match(r"HTTP (\d{3}):\s*(.*)", message, re.DOTALL)
+        if match:
+            status, detail = int(match[1]), match[2]
+            if status in {408, 429, 500, 502, 503, 504}:
+                return "provider_failure"
+            if status == 400:
+                try:
+                    error = json.loads(detail).get("error", {})
+                    if isinstance(error, dict) and error.get("code") == "prohibited_content":
+                        return "content_refusal"
+                except (ValueError, AttributeError):
+                    pass
+    if error_type == "EvalError" and row.get("stage") == "interaction":
+        return "invalid_judge_response"
+    if error_type == "EvalError" and message.startswith("Timed out waiting for Gemini file "):
+        return "provider_failure"
+    raise RuntimeError(f"Nonrecoverable Gemini error ({error_type}): {message}")
+
+
+def read_failure_rows(path: Path, manifest: dict, manifest_path: Path, settings: dict) -> dict:
+    """Read identity-checked errors before deciding whether fallback is allowed."""
+    errors = {}
+    manifest_hash = file_sha256(manifest_path)
+    for row in _ledger_rows(path, Counter()):
+        if row.get("status") == "error":
+            validate_identity(row, manifest, manifest_hash, settings)
+            errors[row["pair_id"]] = row
+    return errors
+
+
+def read_fallbacks(path: Path, manifest: dict, manifest_path: Path, settings: dict) -> dict:
+    """Recover explicit neutral decisions without treating them as Gemini votes."""
+    if not path.exists():
+        return {}
+    rows = read_json(path)
+    if not isinstance(rows, list):
+        raise ValueError(f"Expected a fallback ledger at {path}")
+    result = {}
+    manifest_hash = file_sha256(manifest_path)
+    for row in rows:
+        validate_identity(row, manifest, manifest_hash, settings)
+        key = row["pair_id"]
+        if (
+            key in result
+            or row.get("status") != "fallback"
+            or row.get("fallback_policy") != "neutral-v1"
+            or row.get("fallback_score") != 0.5
+            or row.get("preferred_model") is not None
+            or not row.get("fallback_reason")
+        ):
+            raise ValueError(f"Invalid or duplicate neutral fallback: {path}: {key}")
+        result[key] = row
+    return result
+
+
+def neutral_fallback(key: str, manifest: dict, manifest_path: Path, settings: dict, reason: str, error=None) -> dict:
+    """Bind an imputed half vote to the same identity as the missing real judgment."""
+    pair = manifest["pairs"][key]
+    return {
+        **settings,
+        **{name: pair[name] for name in ("prompt_id", "model_A", "model_B")},
+        "pair_id": key,
+        "manifest_sha256": file_sha256(manifest_path),
+        "evaluation_signature": evaluation_signature(pair, manifest["instructions_how_to_compare"]),
+        "status": "fallback",
+        "fallback_policy": "neutral-v1",
+        "fallback_score": 0.5,
+        "fallback_reason": reason,
+        "error": error,
+    }

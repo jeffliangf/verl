@@ -57,10 +57,23 @@ def runtime_protocol(protocol: dict, settings) -> dict:
     attempts = settings.get("judge_max_attempts")
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
         raise ValueError("video_rl.judge_max_attempts must be a positive integer")
+    policy = settings.get("judge_failure_policy", "drop")
+    if policy not in {"drop", "neutral"}:
+        raise ValueError("video_rl.judge_failure_policy must be drop or neutral")
+    fraction = settings.get("max_judge_fallback_fraction", 0.25)
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, int | float)
+        or not isfinite(fraction)
+        or not 0 <= fraction <= 1
+    ):
+        raise ValueError("video_rl.max_judge_fallback_fraction must be between 0 and 1")
     return {
         **protocol,
         "timeouts": timeouts,
         "judge_max_attempts": attempts,
+        "judge_failure_policy": policy,
+        "max_judge_fallback_fraction": fraction,
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
     }
 
@@ -159,8 +172,8 @@ def tournament_manifests(sample: dict, candidates: list[dict], protocol: dict) -
     }
 
 
-def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
-    """Reuse the judge CLI and ledgers; any missing comparison is a provider failure."""
+def run_judgments(directory: Path, protocol: dict, manifests: dict, *, allow_fallback: bool = False) -> dict:
+    """Reuse real votes; training can persist explicit neutral votes after provider failures."""
     judge.freeze_manifests(directory, manifests)
     results = {}
     for order in judge.ORDERS:
@@ -169,7 +182,15 @@ def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
         manifest_path = directory / "judge" / f"manifest-{order}.json"
         log_path = directory / "judge" / f"runner-{order}.log"
         completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
+        fallback_path = directory / "judge" / f"fallbacks-{order}.json"
+        fallbacks = (
+            judge.read_fallbacks(fallback_path, manifest, manifest_path, protocol["judge"]) if allow_fallback else {}
+        )
+        if set(completed) & set(fallbacks):
+            raise ValueError(f"Conflicting real and fallback judgments: {fallback_path}")
+        completed.update(fallbacks)
         pending = set(manifest["pairs"]) - set(completed)
+        timed_out = False
         if pending:
             timeout = protocol["timeouts"]["judge_pass"]
             try:
@@ -178,35 +199,64 @@ def run_judgments(directory: Path, protocol: dict, manifests: dict) -> dict:
                     log_path.open("ab") as log,
                 ):
                     subprocess.run(
-                        judge.command(directory, protocol, order, pending),
+                        judge.command(directory, protocol, order, pending, allow_fallback=allow_fallback),
                         check=True,
                         timeout=timeout,
                         stdout=log,
                         stderr=subprocess.STDOUT,
                     )
             except subprocess.TimeoutExpired as exc:
+                timed_out = True
                 # The runner writes judgments before deleting its remote files.
                 # subprocess.run has killed and reaped the timed-out process;
                 # complete, identity-validated results remain usable even if
-                # cleanup did not finish. Missing or invalid results still fail.
+                # cleanup did not finish. Only training may neutralize missing
+                # judgments; invalid identities always fail.
                 completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
-                if set(completed) != set(manifest["pairs"]):
+                if set(completed) | set(fallbacks) != set(manifest["pairs"]) and not allow_fallback:
                     detail = judgment_failure(path, set(manifest["pairs"]) - set(completed), log_path)
                     raise ProviderError("gemini", f"Gemini {order} pass exceeded {timeout}s; {detail}") from exc
-                record_event(
-                    directory / "judge/timings.jsonl",
-                    "gemini_pass",
-                    "timeout_with_complete_ledger",
-                    order=order,
-                    completed_pairs=len(completed),
-                    cleanup_status="unconfirmed",
-                )
+                if set(completed) == set(manifest["pairs"]):
+                    record_event(
+                        directory / "judge/timings.jsonl",
+                        "gemini_pass",
+                        "timeout_with_complete_ledger",
+                        order=order,
+                        completed_pairs=len(completed),
+                        cleanup_status="unconfirmed",
+                    )
             except subprocess.CalledProcessError as exc:
                 if not judge.judgment_errors(path, pending):
                     raise RuntimeError(f"Gemini runner crashed without recording an error; see {log_path}") from exc
-                detail = judgment_failure(path, pending, log_path)
-                raise ProviderError("gemini", f"Gemini {order} comparisons failed; {detail}") from exc
+                if not allow_fallback:
+                    detail = judgment_failure(path, pending, log_path)
+                    raise ProviderError("gemini", f"Gemini {order} comparisons failed; {detail}") from exc
             completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
+            if allow_fallback:
+                errors = judge.read_failure_rows(path, manifest, manifest_path, protocol["judge"])
+                # Classify every unfinished recorded error, including auth errors
+                # written before the subprocess reached its outer deadline.
+                reasons = {key: judge.fallback_reason(row) for key, row in errors.items() if key not in completed}
+                for key in sorted(set(manifest["pairs"]) - set(completed) - set(fallbacks)):
+                    reason = reasons.get(key, "pass_timeout" if timed_out else None)
+                    if reason is None:
+                        raise RuntimeError(
+                            f"Gemini runner left {key} without a result or recorded failure; see {log_path}"
+                        )
+                    fallbacks[key] = judge.neutral_fallback(
+                        key, manifest, manifest_path, protocol["judge"], reason, errors.get(key)
+                    )
+                if fallbacks:
+                    write_json(fallback_path, [fallbacks[key] for key in sorted(fallbacks)])
+                    record_event(
+                        directory / "judge/timings.jsonl",
+                        "gemini_fallback",
+                        "recorded",
+                        order=order,
+                        count=len(fallbacks),
+                        policy="neutral-v1",
+                    )
+                completed.update(fallbacks)
         if missing := set(manifest["pairs"]) - set(completed):
             detail = judgment_failure(path, missing, log_path)
             raise ProviderError("gemini", f"Gemini {order} pass left comparisons unjudged; {detail}")
@@ -227,23 +277,29 @@ def tournament_rewards(candidates: list[dict], manifests: dict, judgments: dict)
     invalid_count = GROUP_SIZE - sum(valid)
     points = [float(invalid_count) if ok else 0.0 for ok in valid]
     pairs = manifests["original"]["pairs"]
-    split_count = 0
+    split_count = real_pairs = fallback_count = 0
     for key, pair in pairs.items():
         i, j = (int(value) for value in key.split("_vs_"))
         result = scoring.score_pair(
-            pair, judgments["original"][key], judgments["swapped"][key], candidate=f"candidate_{i}"
+            pair, judgments["original"][key], judgments["swapped"][key], candidate=f"candidate_{i}", allow_fallback=True
         )
         points[i] += result["score"]
         points[j] += 1 - result["score"]
-        split_count += result["outcome"] == "split"
+        fallback_count += result["fallback_count"]
+        if not result["fallback_count"]:
+            real_pairs += 1
+            split_count += result["outcome"] == "split"
     rewards = [point / (GROUP_SIZE - 1) if ok else INVALID_REWARD for point, ok in zip(points, valid, strict=True)]
     return [
         {
             "score": reward,
             "valid_call": float(ok),
             "zero_variance_group": float(len(set(rewards)) == 1),
-            "order_disagreement": split_count / len(pairs) if pairs else 0.0,
+            "order_disagreement": split_count / real_pairs if real_pairs else 0.0,
             "judge_comparisons": 2 * len(pairs),
+            "judge_completed_comparisons": 2 * len(pairs) - fallback_count,
+            "judge_fallback_comparisons": fallback_count,
+            "judge_fallback_fraction": fallback_count / (2 * len(pairs)) if pairs else 0.0,
         }
         for reward, ok in zip(rewards, valid, strict=True)
     ]
@@ -283,6 +339,12 @@ def score_group(directory: Path, protocol: dict, sample: dict, candidates: list[
             rewards = [result]
         else:
             manifests = tournament_manifests(sample, candidates, protocol)
-            rewards = tournament_rewards(candidates, manifests, run_judgments(directory, protocol, manifests))
+            rewards = tournament_rewards(
+                candidates,
+                manifests,
+                run_judgments(
+                    directory, protocol, manifests, allow_fallback=protocol.get("judge_failure_policy") == "neutral"
+                ),
+            )
         write_json(directory / "rewards.json", rewards)
         return rewards

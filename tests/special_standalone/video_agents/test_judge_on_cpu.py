@@ -14,9 +14,9 @@ import json
 
 import pytest
 
-from examples.video_agents import judge, scoring, tournament
+from examples.video_agents import judge, scoring
 from examples.video_agents.config import CANDIDATE, JUDGE_SETTINGS
-from examples.video_agents.storage import file_sha256, read_jsonl, write_json, write_jsonl
+from examples.video_agents.storage import file_sha256, read_jsonl, write_jsonl
 
 
 @pytest.fixture
@@ -71,12 +71,11 @@ def test_interrupted_ledger_keeps_completed_votes_and_can_resume(ledger, fragmen
     completed, counts = judge.read_judgments(*ledger)
     assert len(completed) == 1 and counts["malformed_lines"] == 1
     assert path.read_bytes() == before
-    with pytest.raises(RuntimeError, match="every judgment"):
-        tournament.require_judgments(manifest, completed)
+    assert set(completed) < set(manifest["pairs"])
     with path.open("ab") as handle:
         handle.write(b"\n" + json.dumps(missing).encode() + b"\n")
     completed, counts = judge.read_judgments(*ledger)
-    tournament.require_judgments(manifest, completed)
+    assert set(completed) == set(manifest["pairs"])
     assert counts == {"completed": 2, "malformed_lines": 1}
 
 
@@ -112,10 +111,18 @@ def test_duplicate_votes_cannot_inflate_rewards(ledger):
         judge.read_judgments(*ledger)
 
 
-def test_old_fallback_sidecars_are_rejected(ledger):
-    write_json(ledger[0].with_name("fallbacks-original.json"), {"legacy": {"score": 0.5}})
-    with pytest.raises(ValueError, match="fallback ledgers"):
-        judge.read_judgments(*ledger)
+def test_failure_reports_keep_the_latest_error_for_each_pending_pair(ledger):
+    path = ledger[0]
+    rows = read_jsonl(path)
+    first, second = rows[0]["pair_id"], rows[1]["pair_id"]
+    errors = [
+        {"status": "error", "pair_id": first, "stage": "upload", "error": "HTTP 503"},
+        {"status": "error", "pair_id": first, "stage": "interaction", "error": "HTTP 400: prohibited_content"},
+        {"status": "error", "pair_id": second, "stage": "interaction", "error": "read timed out"},
+    ]
+    write_jsonl(path, rows + errors)
+    assert judge.judgment_errors(path, {first}) == {first: "interaction: HTTP 400: prohibited_content"}
+    assert judge.judgment_errors(path, set()) == {}
 
 
 def test_pair_score_is_invariant_to_display_order(ledger):

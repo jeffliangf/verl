@@ -13,23 +13,41 @@
 from .config import CANDIDATE
 
 
-def score_pair(pair: dict, original: dict, swapped: dict, *, candidate: str = CANDIDATE) -> dict:
-    """Each order contributes half a point; disagreement is a split, not a judge tie."""
-    if any(row.get("status") != "completed" for row in (original, swapped)):
-        raise ValueError("Scoring requires a completed judgment in both orders")
-    winners = [original["preferred_model"], swapped["preferred_model"]]
-    if any(winner not in (candidate, pair["reference"]) for winner in winners):
-        raise ValueError("Unexpected winner in a candidate/reference comparison")
+def score_pair(
+    pair: dict, original: dict, swapped: dict, *, candidate: str = CANDIDATE, allow_fallback: bool = False
+) -> dict:
+    """Average both orders; an explicitly allowed missing judgment contributes 0.5."""
+    winners, values = [], []
+    for row in (original, swapped):
+        if row.get("status") == "completed":
+            winner = row["preferred_model"]
+            if winner not in (candidate, pair["reference"]):
+                raise ValueError("Unexpected winner in a candidate/reference comparison")
+            winners.append(winner)
+            values.append(float(winner == candidate))
+        elif (
+            allow_fallback
+            and row.get("status") == "fallback"
+            and row.get("fallback_policy") == "neutral-v1"
+            and row.get("fallback_score") == 0.5
+            and row.get("preferred_model") is None
+        ):
+            winners.append(None)
+            values.append(0.5)
+        else:
+            raise ValueError("Scoring requires a completed judgment in both orders")
+    fallback_count = winners.count(None)
     first, second = (original, swapped) if pair["model_A"] == candidate else (swapped, original)
-    score = sum(winner == candidate for winner in winners) / 2
+    score = sum(values) / 2
     return {
         "id": pair["prompt_id"],
         "source": pair["source"],
         "reference": pair["reference"],
         "score": score,
-        "outcome": {0.0: "loss", 0.5: "split", 1.0: "win"}[score],
-        "candidate_first_win": first["preferred_model"] == candidate,
-        "candidate_second_win": second["preferred_model"] == candidate,
+        "outcome": "fallback" if fallback_count else {0.0: "loss", 0.5: "split", 1.0: "win"}[score],
+        "fallback_count": fallback_count,
+        "candidate_first_win": first["preferred_model"] == candidate if first["status"] == "completed" else None,
+        "candidate_second_win": second["preferred_model"] == candidate if second["status"] == "completed" else None,
         "original_winner": winners[0],
         "swapped_winner": winners[1],
         "original_reason": original.get("reason"),

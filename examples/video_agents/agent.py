@@ -400,6 +400,37 @@ class TournamentManager(AgentLoopManagerTQ):
                 f"Service failures exceeded {limit} dropped groups at step {step}; "
                 "stopping before an optimizer update. Inspect failure.json and timings.jsonl."
             )
+        self._check_judge_coverage(step, records)
+
+    def _check_judge_coverage(self, step, records):
+        """Bound synthetic judgments over the completed batch, including refill dispatches."""
+        if getattr(self, "_judge_step", None) != step:
+            self._judge_step = step
+            self._judge_groups = self._judge_comparisons = self._judge_fallbacks = 0
+        for record in records:
+            if not record["dropped"]:
+                # Each of the four trajectory rewards repeats these group totals.
+                reward = record["rewards"][0]
+                self._judge_groups += 1
+                self._judge_comparisons += reward["judge_comparisons"]
+                self._judge_fallbacks += reward.get("judge_fallback_comparisons", 0)
+        fraction = self._judge_fallbacks / self._judge_comparisons if self._judge_comparisons else 0.0
+        record_event(
+            Path(self.config.video_rl.output_dir) / "timings.jsonl",
+            "judge_coverage",
+            "summarized",
+            policy_step=step,
+            groups=self._judge_groups,
+            comparisons=self._judge_comparisons,
+            fallbacks=self._judge_fallbacks,
+            fallback_fraction=fraction,
+        )
+        limit = self.config.video_rl.get("max_judge_fallback_fraction", 0.25)
+        if self._judge_groups >= self.config.data.train_batch_size and fraction > limit:
+            raise RuntimeError(
+                f"Gemini fallback fraction {fraction:.1%} exceeded {limit:.1%} at step {step}; "
+                "stopping before an optimizer update. Inspect judge/fallbacks-*.json and timings.jsonl."
+            )
 
     def _record_evaluation(self, step, records):
         """Summarize held-out prompts; unscorable ones are excluded, never fatal."""

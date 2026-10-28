@@ -75,14 +75,20 @@ judgments. A pair earns 1 for two wins, 0.5 for an order disagreement, or 0 for 
 losses. Each candidate's reward is its total points divided by three.
 
 An invalid tool call earns -1 and forfeits its pairings against valid calls.
-Equal-reward groups have no GRPO learning signal. During training, an H3/Gemini
-service failure, timeout, or missing judgment drops the whole four-rollout prompt
-group. No trajectories or rewards from that group enter the optimizer. Native
+Equal-reward groups have no GRPO learning signal. During training, an H3 service
+failure or timeout drops the whole four-rollout prompt group. No trajectories or
+rewards from that group enter the optimizer. Native
 `trainer.v1.sampler.sync_refill_failed_groups=true` replaces it with a fresh group
 under the same policy weights, preserving the training batch size. Sibling
-rollouts settle before the failed group is released. A Gemini `prohibited_content`
-refusal is an ordinary Gemini failure. Artifact corruption, configuration errors,
-and aborted or empty LLM responses still abort during training.
+rollouts settle before the failed group is released. Gemini transport failures
+are retried using the same uploaded videos. With `video_rl.judge_failure_policy=neutral`
+(the default), exhausted transient failures, unscorable judge responses, and
+`prohibited_content` refusals contribute a neutral half vote for that presentation
+order. Other comparisons continue, and successful judgments remain unchanged.
+One actual win plus one neutral order scores 0.75; two neutral orders score 0.5.
+Set the policy to `drop` to restore replacement of unscorable groups. Artifact
+corruption, authentication/configuration errors, and aborted or empty LLM responses
+still abort during training. Invalid policy tool calls retain their penalties.
 
 Held-out evaluation never stops training. A prompt whose video, Gemini judgments,
 or LLM turn fails for any reason, including a Gemini `prohibited_content`
@@ -100,6 +106,15 @@ Exceeding that many dropped groups stops the step before updating weights, so a
 persistent outage cannot cause unlimited replacement. TensorBoard reports
 `training/rollout_failure/evicted_samples`. Dropped groups retain `failure.json`
 with their sample ID, policy step, provider stage, reason, and traceback.
+
+`video_rl.max_judge_fallback_fraction` defaults to 0.25. Once the full training
+batch has accumulated, exceeding this fraction of neutral judgments stops the
+step before an optimizer update. Counts include successful groups from every
+replacement dispatch, counting each group once. This bounds training on imputed
+judgments during an outage; it does not restart or pause the provider automatically.
+An all-neutral group of four valid videos has zero GRPO advantages, although the
+actor's KL loss can still contribute a gradient. Evaluation always requires real
+judgments and never uses training fallback ledgers.
 
 `video_rl.timeouts` in `configs/rl.yaml` is the only source of provider limits.
 They apply at launch without changing the frozen protocol, so a resumed run adopts
@@ -123,9 +138,22 @@ response tokens divided by ~15 tokens/s (r = 0.997 in job 2391), so
 limit would drop the policy's own long outputs, which are invalid calls that must
 be scored. To shorten the LLM tail, lower `max_response_length` instead.
 
-`video_rl.judge_max_attempts` (default 2) gives each Gemini HTTP call one fast
-retry for 408/429/5xx and upload/polling network errors; the runner never
-retries a judgment after a network timeout.
+`video_rl.judge_max_attempts` (default 3) permits an initial Gemini judgment request
+plus two retries for 408/429/500/502/503/504 and network failures, including
+response read timeouts. HTTP and network failures share one judgment retry budget;
+the adapter adds no outer retry loop. The evaluator uses exponential backoff with jitter
+and honors `Retry-After`, while the 300-second presentation-order deadline still
+bounds the subprocess and is not reset by retries. A timed-out interaction may
+already have completed remotely, so its retry can incur a duplicate Gemini charge.
+Retrying a judgment does not regenerate or re-upload its H3 videos.
+
+Neutral decisions are identity-checked and persisted separately in
+`judge/fallbacks-<order>.json`, with the policy version and failure reason. They
+are reused when scoring resumes, preserving the actual Gemini ledgers. A pass
+deadline can leave comparisons unattempted; these record `pass_timeout` rather
+than claiming three failed attempts. Missing results after an unexplained runner
+exit remain fatal. Changing the reward policy affects experiment comparability;
+use a new run for comparisons against the original drop-policy experiments.
 
 ## Debugging failures
 
@@ -144,13 +172,16 @@ Every failure leaves a trail from the job log to its files:
    - `timings.jsonl`: slot waits, LLM turns, and tool calls;
    - `judge/runner-<order>.log`, `judge/judgments-<order>.jsonl`, and
      `judge/timings*.jsonl`: the Gemini runner's own output, its ledger, and timings.
+   - `judge/fallbacks-<order>.json`: explicit training fallback decisions, separate
+     from real judgments. `gemini_request` timing records include `attempts` and
+     `recovered`; the run-level `judge_coverage` records track the batch totals.
 4. Each video directory, `<run>/videos/<instance>/`, holds `h3-worker.log`, the
    job's `state.json`, and, on failure, `failure.json`.
 
 Gemini failures name each failed comparison with its recorded error, such as a
 `prohibited_content` refusal, plus both file paths. Timing logs omit credentials,
-prompts, and provider response bodies; messages and tracebacks live only in
-`failure.json` and the subprocess logs. Summarize stage latencies offline with:
+prompts, and provider response bodies. Error details remain in failure records,
+judgment/fallback ledgers, and subprocess logs. Summarize stage latencies offline with:
 
 ```bash
 python -m examples.video_agents.rl timings --run-dir outputs/video_agents/rl
@@ -169,8 +200,11 @@ zero. `rl.py evaluate` uses this same loop without training.
 Native metrics include `vs_prompt`, `vs_h3_context_ir`, and `valid_call` under
 `val-aux/<source>/<metric>/mean@1`. Training diagnostics are under
 `training/reward_extra/<metric>/mean`, including `zero_variance_group`,
-`order_disagreement`, and `judge_comparisons`. The last metric counts comparisons
-per prompt group, not total API requests.
+`order_disagreement`, `judge_comparisons`, `judge_completed_comparisons`,
+`judge_fallback_comparisons`, and `judge_fallback_fraction`. Comparison counts are
+per prompt group, not total API requests; `judge_comparisons` counts all planned
+orders, and completed counts exclude fallbacks. Order disagreement uses only pairs
+with two real judgments; neutral fallbacks are not measured judge disagreements.
 
 ## Local inputs and services
 

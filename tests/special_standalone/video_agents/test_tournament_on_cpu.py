@@ -18,19 +18,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 
-from examples.video_agents import h3, judge, rl, self_hosted_h3, tournament
-from examples.video_agents.config import (
-    CANDIDATE,
-    DEFAULT_SELF_HOSTED_REFERENCES,
-    DEFAULT_TIMEOUTS,
-    JUDGE_SETTINGS,
-    MAX_REFERENCE_ENDPOINT,
-    MAX_REFERENCE_SETTINGS,
-    MAX_REFERENCE_VIDEO_FIELDS,
-    SELF_HOSTED_REFERENCE_VIDEO_FIELDS,
-)
-from examples.video_agents.dataset import reference_request
+from examples.video_agents import h3, judge, rl, tournament
+from examples.video_agents.config import CANDIDATE, DEFAULT_REFERENCES, JUDGE_SETTINGS, REFERENCE_VIDEO_FIELDS
 from examples.video_agents.judge import EXTERNAL_FILES
 from examples.video_agents.observability import ProviderError
 from examples.video_agents.storage import file_sha256, fingerprint, read_json, read_jsonl, write_json, write_jsonl
@@ -41,6 +32,9 @@ MEDIA = {
     "audio": {"sample_rate": 32000, "channels": 2, "codec": "mp4a"},
 }
 HOST = "https://h3.invalid"
+REFERENCE_GATEWAY = "http://reference-gateway:18080"
+# The launch-time settings every runtime protocol takes from configs/rl.yaml.
+VIDEO_RL = OmegaConf.load(rl.CONFIG_DIR / "rl.yaml").video_rl
 
 
 @pytest.fixture
@@ -54,7 +48,17 @@ def prepared_rl(tmp_path):
         'INSTRUCTIONS_VERSION = 4\nINSTRUCTIONS = "Compare videos."\n'
     )
     (repo / "bestofn/normalize.py").write_text(f"def probe(path):\n    return {MEDIA!r}\n")
-    rows, tasks = [], []
+    manifest = {
+        "h3_backend": h3.BACKEND,
+        "h3_endpoints": [REFERENCE_GATEWAY],
+        "h3": h3.SETTINGS,
+        "settings": h3.SETTINGS,
+        "endpoint": h3.ENDPOINT,
+        "media_profile": h3.media_profile(MEDIA),
+        "context_ir_rewriter_enabled": False,
+        "tasks": [],
+    }
+    rows = []
     for i, source in enumerate(["aa_eval", "movie_gen_video_bench"]):
         row = {"id": f"eval-{i}", "prompt": f"Original {i}", "source": source, "h3_context_ir": f"SECRET {i}"}
         for field in ("prompt", "h3_context_ir"):
@@ -62,40 +66,29 @@ def prepared_rl(tmp_path):
             video.parent.mkdir(parents=True, exist_ok=True)
             video.write_bytes(f"reference {i} {field}".encode())
             state = video.with_suffix(".json")
-            request = reference_request(row[field], {"settings": MAX_REFERENCE_SETTINGS})
+            task = {
+                "item_id": row["id"],
+                "field": field,
+                "request": h3.request_body(row[field], h3.SETTINGS),
+                "output": video.name,
+                "state": state.name,
+            }
             write_json(
                 state,
                 {
+                    **h3.identity(task, manifest),
                     "status": "succeeded",
-                    "request_sha256": fingerprint(request),
-                    "endpoint": MAX_REFERENCE_ENDPOINT,
-                    "host": HOST,
+                    "worker_url": REFERENCE_GATEWAY,
+                    "task_id": f"reference-{i}-{field}",
                     "sha256": file_sha256(video),
                     "bytes": video.stat().st_size,
                     "media": MEDIA,
                 },
             )
-            tasks.append(
-                {
-                    "item_id": row["id"],
-                    "field": field,
-                    "request": request,
-                    "request_sha256": fingerprint(request),
-                    "output": video.name,
-                    "state": state.name,
-                }
-            )
-            row[MAX_REFERENCE_VIDEO_FIELDS[field]] = str(video)
+            manifest["tasks"].append(task)
+            row[REFERENCE_VIDEO_FIELDS[field]] = str(video)
         rows.append(row)
-    write_json(
-        references / "manifest.json",
-        {
-            "settings": MAX_REFERENCE_SETTINGS,
-            "endpoint": MAX_REFERENCE_ENDPOINT,
-            "context_ir_rewriter_enabled": False,
-            "tasks": tasks,
-        },
-    )
+    write_json(references / "manifest.json", manifest)
     train_file, val_file = tmp_path / "train.jsonl", tmp_path / "eval.jsonl"
     write_jsonl(
         train_file,
@@ -125,7 +118,7 @@ def prepared_rl(tmp_path):
         ]
     )
     rl.prepare(args)
-    return directory, tournament.load_protocol(directory / "protocol.json"), args
+    return directory, tournament.runtime_protocol(tournament.load_protocol(directory / "protocol.json"), VIDEO_RL), args
 
 
 def candidates(tmp_path, invalid=()):
@@ -157,7 +150,7 @@ def votes(manifests, *, position_bias=False):
 def install_judge(monkeypatch, *, winner=CANDIDATE):
     calls = []
 
-    def execute(command, *, check, timeout):
+    def execute(command, *, check, timeout, stdout, stderr):
         calls.append(command)
         manifest_path = Path(command[command.index("--manifest") + 1])
         output_path = Path(command[command.index("--output") + 1])
@@ -185,10 +178,11 @@ def install_judge(monkeypatch, *, winner=CANDIDATE):
                 }
             )
         write_jsonl(output_path, rows)
-        assert check is True and timeout == 1800
-        assert command[command.index("--max-attempts") + 1] == "1"
-        assert float(command[command.index("--request-timeout") + 1]) == DEFAULT_TIMEOUTS["judge_request"]
-        assert float(command[command.index("--file-timeout") + 1]) == 300
+        assert check is True and timeout == VIDEO_RL.timeouts.judge_pass
+        assert stderr == subprocess.STDOUT and Path(stdout.name).name.startswith("runner-")
+        assert int(command[command.index("--max-attempts") + 1]) == VIDEO_RL.judge_max_attempts
+        assert float(command[command.index("--request-timeout") + 1]) == VIDEO_RL.timeouts.judge_request
+        assert float(command[command.index("--file-timeout") + 1]) == VIDEO_RL.timeouts.judge_file
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(tournament.subprocess, "run", execute)
@@ -243,20 +237,38 @@ def test_invalid_calls_forfeit_without_video_judgments(prepared_rl, tmp_path, in
     assert all(r["judge_comparisons"] == count for r in rewards)
 
 
-@pytest.mark.parametrize("failure", ["missing", "fallback", "provider"])
-def test_no_incomplete_tournament_can_receive_rewards(prepared_rl, tmp_path, failure):
-    _, protocol, _ = prepared_rl
+@pytest.mark.parametrize("damage", ["error", "fallback", "missing"])
+@pytest.mark.parametrize("policy", ["drop", "neutral"])
+def test_no_incomplete_tournament_can_receive_rewards(prepared_rl, tmp_path, monkeypatch, damage, policy):
+    directory, protocol, _ = prepared_rl
+    protocol = {**protocol, "judge_failure_policy": policy}
+    install_judge(monkeypatch)
+    execute = tournament.subprocess.run
+
+    def incomplete(command, **kwargs):
+        execute(command, **kwargs)
+        path = Path(command[command.index("--output") + 1])
+        rows = read_jsonl(path)
+        if damage == "missing":
+            rows.pop()
+        else:
+            rows[0]["status"] = damage
+        write_jsonl(path, rows)
+
+    monkeypatch.setattr(tournament.subprocess, "run", incomplete)
+    group = directory / "group"
+    with pytest.raises(RuntimeError, match="unjudged" if policy == "drop" else "Nonrecoverable|without a result"):
+        tournament.score_group(group, protocol, protocol["samples"]["train"][0], candidates(tmp_path), validate=False)
+    assert not (group / "rewards.json").exists()
+
+
+def test_failed_candidates_are_never_scored(prepared_rl, tmp_path, monkeypatch):
+    directory, protocol, _ = prepared_rl
+    monkeypatch.setattr(tournament.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected judge request"))
     clips = candidates(tmp_path)
-    manifests = tournament.tournament_manifests(protocol["samples"]["train"][0], clips, protocol)
-    judgments = votes(manifests)
-    if failure == "missing":
-        judgments["swapped"].pop("0_vs_1")
-    elif failure == "fallback":
-        judgments["swapped"]["0_vs_1"]["status"] = "fallback"
-    else:
-        clips[0]["status"] = "infrastructure_error"
-    with pytest.raises(RuntimeError):
-        tournament.tournament_rewards(clips, manifests, judgments)
+    clips[0]["status"] = "infrastructure_error"
+    with pytest.raises(RuntimeError, match="Only generated videos"):
+        tournament.score_group(directory / "group", protocol, protocol["samples"]["train"][0], clips, validate=False)
 
 
 def test_judge_runner_reuses_all_completed_comparisons(prepared_rl, tmp_path, monkeypatch):
@@ -285,9 +297,59 @@ def test_held_out_scoring_uses_both_fixed_references(prepared_rl, tmp_path, monk
     assert all(p["prompt"] == "Original 0" for p in manifest["pairs"].values())
 
 
+@pytest.mark.parametrize("validate", [False, True])
+@pytest.mark.parametrize(
+    "error,exit_mode",
+    [
+        ('HTTP 400: {"error":{"code":"prohibited_content","message":"Input blocked"}}', "error"),
+        ('HTTP 400: {"error":{"code":"prohibited_content","message":"Input blocked"}}', "timeout"),
+        ('HTTP 400: {"error":{"code":"prohibited_content","message":"Input blocked"}}', "success"),
+        ('HTTP 403: {"error":{"code":"PERMISSION_DENIED"}}', "error"),
+        ('HTTP 429: {"error":{"code":"RESOURCE_EXHAUSTED"}}', "error"),
+        ("Network request failed: The read operation timed out", "error"),
+    ],
+)
+def test_gemini_refusals_and_errors_fail_the_example_with_their_reason(
+    prepared_rl, tmp_path, monkeypatch, validate, error, exit_mode
+):
+    directory, protocol, _ = prepared_rl
+    protocol = {**protocol, "judge_failure_policy": "drop"}
+    calls = install_judge(monkeypatch)
+    execute = tournament.subprocess.run
+
+    def fail(command, **kwargs):
+        execute(command, **kwargs)
+        path = Path(command[command.index("--output") + 1])
+        row = read_jsonl(path)[0]
+        for key in ("preferred_video", "preferred_model", "reason"):
+            row.pop(key)
+        row.update(status="error", stage="interaction", error_type="HttpFailure", error=error)
+        write_jsonl(path, [row])
+        if exit_mode == "error":
+            raise subprocess.CalledProcessError(1, command)
+        if exit_mode == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(tournament.subprocess, "run", fail)
+    group = directory / "failed-example"
+    sample = protocol["samples"]["val" if validate else "train"][0]
+    clips = candidates(tmp_path)[: 1 if validate else 4]
+    with pytest.raises(ProviderError) as failure:
+        tournament.score_group(group, protocol, sample, clips, validate=validate)
+    # A refusal is an ordinary provider failure: the example is dropped, never
+    # scored, and the message names the comparison, its error, and both logs.
+    message = str(failure.value)
+    assert failure.value.stage == "gemini" and error[:40] in message
+    assert "judgments-original.jsonl" in message and "runner-original.log" in message
+    assert len(calls) == 1 and (group / "judge/runner-original.log").exists()
+    assert read_jsonl(group / "judge/judgments-original.jsonl")[0]["status"] == "error"
+    assert not (group / "rewards.json").exists()
+
+
 @pytest.mark.parametrize("stage", ["h3", "judge"])
 def test_hard_timeouts_raise_without_neutral_fallbacks(prepared_rl, tmp_path, monkeypatch, stage):
     directory, protocol, _ = prepared_rl
+    protocol = {**protocol, "judge_failure_policy": "drop"}
     calls = []
 
     def timeout(command, **kwargs):
@@ -304,10 +366,68 @@ def test_hard_timeouts_raise_without_neutral_fallbacks(prepared_rl, tmp_path, mo
             tournament.score_group(
                 directory / "group", protocol, protocol["samples"]["train"][0], candidates(tmp_path), validate=False
             )
-    expected_timeout = protocol["timeouts"]["h3" if stage == "h3" else "judge_pass"]
-    assert calls == [{"check": True, "timeout": expected_timeout}]
-    assert not list(directory.rglob("*fallback*"))
+    assert [call["timeout"] for call in calls] == [protocol["timeouts"]["h3" if stage == "h3" else "judge_pass"]]
+    assert calls[0]["check"] is True and calls[0]["stderr"] == subprocess.STDOUT
+    log = "candidate/h3-worker.log" if stage == "h3" else "group/judge/runner-original.log"
+    assert (directory / log).exists()
     assert not list(directory.rglob("rewards.json"))
+
+
+def test_cleanup_timeout_keeps_complete_validated_judgments(prepared_rl, tmp_path, monkeypatch):
+    directory, protocol, _ = prepared_rl
+    calls = install_judge(monkeypatch)
+    execute = tournament.subprocess.run
+
+    def timeout_after_judgments(command, **kwargs):
+        execute(command, **kwargs)
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(tournament.subprocess, "run", timeout_after_judgments)
+    group = directory / "group"
+    rewards = tournament.score_group(
+        group, protocol, protocol["samples"]["train"][0], candidates(tmp_path), validate=False
+    )
+    assert len(calls) == 2
+    assert [r["score"] for r in rewards] == pytest.approx([1, 2 / 3, 1 / 3, 0])
+    records = read_jsonl(group / "judge/timings.jsonl")
+    recovered = [r for r in records if r["event"] == "timeout_with_complete_ledger"]
+    assert len(recovered) == 2 and all(r["completed_pairs"] == 6 for r in recovered)
+    assert all(r["cleanup_status"] == "unconfirmed" for r in recovered)
+
+
+@pytest.mark.parametrize("broken", ["missing", "identity"])
+@pytest.mark.parametrize("policy", ["drop", "neutral"])
+def test_cleanup_timeout_preserves_real_votes_and_rejects_mismatched_judgments(
+    prepared_rl, tmp_path, monkeypatch, broken, policy
+):
+    directory, protocol, _ = prepared_rl
+    protocol = {**protocol, "judge_failure_policy": policy}
+    install_judge(monkeypatch)
+    execute = tournament.subprocess.run
+
+    def timeout_after_bad_ledger(command, **kwargs):
+        execute(command, **kwargs)
+        path = Path(command[command.index("--output") + 1])
+        rows = read_jsonl(path)
+        if broken == "missing":
+            rows.pop()
+        else:
+            rows[0]["manifest_sha256"] = "wrong"
+        write_jsonl(path, rows)
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(tournament.subprocess, "run", timeout_after_bad_ledger)
+    group = directory / "group"
+    if broken == "missing" and policy == "neutral":
+        rewards = tournament.score_group(
+            group, protocol, protocol["samples"]["train"][0], candidates(tmp_path), validate=False
+        )
+        assert [r["score"] for r in rewards] == pytest.approx([1, 2 / 3, 1 / 6, 1 / 6])
+        assert all(r["judge_completed_comparisons"] == 10 and r["judge_fallback_comparisons"] == 2 for r in rewards)
+        return
+    with pytest.raises(ProviderError if broken == "missing" else ValueError):
+        tournament.score_group(group, protocol, protocol["samples"]["train"][0], candidates(tmp_path), validate=False)
+    assert not (group / "rewards.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -331,9 +451,12 @@ def test_h3_worker_exit_only_classifies_service_failures_as_droppable(
         raise subprocess.CalledProcessError(1, command)
 
     monkeypatch.setattr(tournament.subprocess, "run", fail)
-    expected = ProviderError if provider_failure else subprocess.CalledProcessError
-    with pytest.raises(expected):
+    with pytest.raises(RuntimeError) as error:
         tournament.generate_video(directory / "candidate", protocol, {"prompt": "A video", "duration": 10, "seed": 42})
+    assert isinstance(error.value, ProviderError) == provider_failure
+    assert "h3-worker.log" in str(error.value)
+    if state is not None:
+        assert state["error"] in str(error.value)
 
 
 def test_gemini_failed_judgment_is_droppable_but_runner_crash_is_fatal(prepared_rl, tmp_path, monkeypatch):
@@ -345,15 +468,17 @@ def test_gemini_failed_judgment_is_droppable_but_runner_crash_is_fatal(prepared_
     def fail(command, **kwargs):
         if write_error:
             write_jsonl(
-                output / "judge/judgments-original.jsonl", [{"status": "error", "error_type": "NetworkFailure"}]
+                output / "judge/judgments-original.jsonl",
+                [{"status": "error", "pair_id": "0_vs_1", "stage": "upload", "error": "HTTP 503"}],
             )
         raise subprocess.CalledProcessError(1, command)
 
     monkeypatch.setattr(tournament.subprocess, "run", fail)
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(RuntimeError, match="crashed without recording an error") as crash:
         tournament.run_judgments(output, protocol, manifest)
+    assert not isinstance(crash.value, ProviderError)
     write_error = True
-    with pytest.raises(ProviderError, match="failed comparisons"):
+    with pytest.raises(ProviderError, match="0_vs_1: upload: HTTP 503"):
         tournament.run_judgments(output, protocol, manifest)
 
 
@@ -375,9 +500,7 @@ def test_h3_adapter_reuses_existing_worker_and_validates_artifacts(prepared_rl, 
     def run(command, **kwargs):
         work = Path(command[command.index("--run-dir") + 1])
         task = read_json(work / "generation.json")[0]
-        assert self_hosted_h3.generate_one(
-            task, protocol, client, lambda path: {**MEDIA, "duration_s": duration + 0.125}
-        )
+        assert h3.generate_one(task, protocol, client, lambda path: {**MEDIA, "duration_s": duration + 0.125})
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(tournament.subprocess, "run", run)
@@ -408,7 +531,7 @@ def test_prepare_has_no_teacher_leakage_and_is_immutable(prepared_rl):
         assert read_json(args.data_dir / f"{split}.preview.json") == rows[0]
     assert "tool_schema" not in read_json(directory / "tools.json")["tools"][0]
     changed = copy.copy(args)
-    changed.h3_timeout = 1
+    changed.poll_interval = 2
     with pytest.raises(ValueError, match="Frozen input changed"):
         rl.prepare(changed)
     protocol["group_size"] = 8
@@ -426,97 +549,51 @@ def test_prepare_rejects_train_eval_overlap(prepared_rl):
         rl.prepare(args)
 
 
-def test_prepare_self_hosted_rl_keeps_tool_and_max_reference_provenance(prepared_rl, tmp_path):
-    _, original, args = prepared_rl
-    args = copy.copy(args)
-    args.run_dir = tmp_path / "self-hosted-rl"
-    args.data_dir = tmp_path / "self-hosted-data"
-    args.h3_backend = "self-hosted"
+def test_prepare_records_tool_schema_and_reference_provenance(prepared_rl, fresh_args):
+    _, original, _ = prepared_rl
+    args = fresh_args
     args.h3_endpoints = "http://worker-a:18080,http://worker-b:18080"
-    args.poll_interval = 1
     args.h3_concurrency_per_worker = 2
     assert rl.prepare(args)["network_requests"] == 0
     protocol = tournament.load_protocol(args.run_dir / "protocol.json")
-    schema = read_jsonl(args.data_dir / "train.jsonl")[0]["tools"][0]
-    assert schema["function"]["name"] == "sol_h3"
-    assert schema["function"]["parameters"]["properties"]["prompt"]["maxLength"] == 8000
     assert protocol["h3"]["model"] == "MiniMax-H3-Base-FL2VA"
-    assert protocol["reference_h3"]["settings"] == MAX_REFERENCE_SETTINGS
-    assert protocol["reference_h3"]["backend"] == "max"
-    assert protocol["reference_video_fields"] == MAX_REFERENCE_VIDEO_FIELDS
-    assert protocol["samples"]["val"] == original["samples"]["val"]
-    assert "duration" not in protocol["h3"] and "seed" not in protocol["h3"]
-
-
-def test_rl_defaults_use_self_hosted_references(tmp_path):
-    args = rl.parse_args(["prepare", "--run-dir", str(tmp_path)])
-    assert args.references == DEFAULT_SELF_HOSTED_REFERENCES
-    assert args.h3_backend == "self-hosted"
-    assert (args.groups_per_worker, args.h3_concurrency_per_worker, args.poll_interval) == (5, 5, 1)
-
-
-@pytest.fixture
-def hosted_references(prepared_rl, tmp_path):
-    _, _, args = prepared_rl
-    args = copy.copy(args)
-    args.run_dir, args.data_dir = tmp_path / "hosted-run", tmp_path / "hosted-data"
-    manifest = read_json(args.references / "manifest.json")
-    manifest.update(
-        h3_backend="self-hosted",
-        h3_endpoints=["http://reference-gateway:18080"],
-        h3=self_hosted_h3.SETTINGS,
-        settings=self_hosted_h3.SETTINGS,
-        endpoint=self_hosted_h3.ENDPOINT,
-        media_profile=h3.media_profile(MEDIA),
-    )
-    rows = read_jsonl(args.eval_dataset)
-    by_id = {row["id"]: row for row in rows}
-    for index, task in enumerate(manifest["tasks"]):
-        row = by_id[task["item_id"]]
-        task["request"] = self_hosted_h3.request_body(row[task["field"]], manifest["settings"])
-        task["request_sha256"] = fingerprint(task["request"])
-        state_path = args.references / task["state"]
-        state = read_json(state_path)
-        state.update(
-            self_hosted_h3.identity(task, manifest),
-            worker_url=manifest["h3_endpoints"][0],
-            task_id=f"reference-job-{index}",
-        )
-        write_json(state_path, state)
-        row[SELF_HOSTED_REFERENCE_VIDEO_FIELDS[task["field"]]] = str(args.references / task["output"])
-    write_json(args.references / "manifest.json", manifest)
-    write_jsonl(args.eval_dataset, rows)
-    return args
-
-
-def test_prepare_rl_records_self_hosted_reference_provenance(hosted_references):
-    args = hosted_references
-    assert rl.prepare(args)["network_requests"] == 0
-    protocol = tournament.load_protocol(args.run_dir / "protocol.json")
-    assert protocol["reference_video_fields"] == SELF_HOSTED_REFERENCE_VIDEO_FIELDS
+    assert protocol["h3_endpoints"] == ["http://worker-a:18080", "http://worker-b:18080"]
     assert protocol["reference_h3"] == {
         "backend": "self-hosted",
-        "settings": self_hosted_h3.SETTINGS,
+        "settings": h3.SETTINGS,
         "endpoint": "/v1/videos",
-        "endpoints": ["http://reference-gateway:18080"],
+        "endpoints": [REFERENCE_GATEWAY],
     }
-    assert protocol["h3_endpoints"] == [HOST]
-    assert protocol["h3"] == {
-        key: value for key, value in protocol["reference_h3"]["settings"].items() if key not in {"duration", "seed"}
-    }
+    assert protocol["h3"] == {k: v for k, v in h3.SETTINGS.items() if k not in {"duration", "seed"}}
+    assert protocol["samples"]["val"] == original["samples"]["val"]
+    # Provider limits come from the launch config; none are frozen at preparation.
+    assert not {"timeouts", "latency_baseline", "h3_host", "reference_video_fields"} & set(protocol)
     for split in ("train", "val"):
         row = read_jsonl(args.data_dir / f"{split}.jsonl")[0]
         schema = row["tools"][0]["function"]
-        assert "Sol-H3" in schema["description"]
-        assert "10 seconds" not in schema["description"]
+        assert "Sol-H3" in schema["description"] and "10 seconds" not in schema["description"]
         assert set(schema["parameters"]["properties"]) == {"prompt", "duration", "seed"}
         assert schema["parameters"]["properties"]["prompt"]["maxLength"] == 8000
         assert "SECRET" not in json.dumps(row)
 
 
+def test_rl_defaults_use_self_hosted_references(tmp_path):
+    args = rl.parse_args(["prepare", "--run-dir", str(tmp_path)])
+    assert args.references == DEFAULT_REFERENCES
+    assert (args.groups_per_worker, args.h3_concurrency_per_worker, args.poll_interval) == (5, 5, 1)
+
+
+@pytest.fixture
+def fresh_args(prepared_rl, tmp_path):
+    """Preparation arguments for a second run over the same inputs."""
+    args = copy.copy(prepared_rl[2])
+    args.run_dir, args.data_dir = tmp_path / "second-run", tmp_path / "second-data"
+    return args
+
+
 @pytest.mark.parametrize("invalid", ["backend", "settings", "pool", "request", "state_media", "video_path", "bytes"])
-def test_prepare_rejects_mismatched_reference_provenance(hosted_references, invalid):
-    args = hosted_references
+def test_prepare_rejects_mismatched_reference_provenance(fresh_args, invalid):
+    args = fresh_args
     manifest = read_json(args.references / "manifest.json")
     task = manifest["tasks"][0]
     state_path = args.references / task["state"]
@@ -533,7 +610,7 @@ def test_prepare_rejects_mismatched_reference_provenance(hosted_references, inva
     elif invalid == "state_media":
         state["media"]["video"]["width"] = 1280
     elif invalid == "video_path":
-        rows[0][SELF_HOSTED_REFERENCE_VIDEO_FIELDS[task["field"]]] = "/wrong/video.mp4"
+        rows[0][REFERENCE_VIDEO_FIELDS[task["field"]]] = "/wrong/video.mp4"
     else:
         (args.references / task["output"]).write_bytes(b"changed reference clip")
     write_json(args.references / "manifest.json", manifest)
@@ -594,7 +671,13 @@ def test_invalid_held_out_call_scores_zero_without_judge_requests(prepared_rl, m
         validate=True,
     )
     assert rewards == [
-        {"valid_call": 0.0, "judge_comparisons": 0, "vs_prompt": 0.0, "vs_h3_context_ir": 0.0, "score": 0.0}
+        {
+            "valid_call": 0.0,
+            "judge_comparisons": 0,
+            "vs_prompt": 0.0,
+            "vs_h3_context_ir": 0.0,
+            "score": 0.0,
+        }
     ]
 
 
@@ -761,8 +844,7 @@ def loop_factory(prepared_rl, monkeypatch):
             ids = list(text.encode())
             return TokenOutput(token_ids=ids, log_probs=[-0.1] * len(ids), stop_reason=stop_reason)
 
-        if hang:
-            tool_list[0].protocol["timeouts"]["llm"] = 0.01
+        config.video_rl.timeouts.llm = 0.01 if hang else VIDEO_RL.timeouts.llm
         return agent.H3TerminalLoop(
             trainer_config=DictConfigWrap(config),
             server_manager=SimpleNamespace(generate=generate),
@@ -865,7 +947,8 @@ async def test_invalid_sol_h3_arguments_are_policy_errors(loop_factory, model_re
     make, generated = loop_factory
     text = VALID_CALL.replace("</function>", f"<parameter={name}>{value}</parameter></function>")
     output = await make(text).run({}, **model_request)
-    assert output.extra_fields["h3_result"] == {"status": "invalid_call"}
+    result = output.extra_fields["h3_result"]
+    assert result["status"] == "invalid_call" and result["reason"].startswith("invalid arguments: ")
     assert not generated
 
 
@@ -901,20 +984,23 @@ def test_token_check_and_previews_render_the_saved_row(prepared_rl, monkeypatch)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "text",
+    "text,reason",
     [
-        "I cannot generate a video.",
-        VALID_CALL.replace("function=sol_h3", "function=unknown"),
-        VALID_CALL.replace("function=sol_h3", "function=h3_max"),
-        VALID_CALL.replace("A clear scene", " "),
-        VALID_CALL.replace("<parameter=prompt>", "<parameter=unexpected>"),
-        VALID_CALL + VALID_CALL,
+        ("I cannot generate a video.", "no tool call"),
+        (VALID_CALL.replace("function=sol_h3", "function=unknown"), "unknown tool 'unknown'"),
+        (VALID_CALL.replace("function=sol_h3", "function=h3_max"), "unknown tool 'h3_max'"),
+        (VALID_CALL.replace("A clear scene", " "), "invalid arguments: Sol-H3 requires nonblank prompt"),
+        (VALID_CALL.replace("<parameter=prompt>", "<parameter=unexpected>"), "invalid arguments: "),
+        (VALID_CALL + VALID_CALL, "expected one tool call, got 2"),
     ],
 )
-async def test_invalid_native_calls_never_invoke_h3(loop_factory, model_request, text):
+async def test_invalid_native_calls_never_invoke_h3(loop_factory, model_request, text, reason):
     make, generated = loop_factory
     output = await make(text).run({}, **model_request)
-    assert output.extra_fields["h3_result"] == {"status": "invalid_call"}
+    result = output.extra_fields["h3_result"]
+    # The reason and the model's own output tail make invalid calls debuggable.
+    assert result["status"] == "invalid_call" and result["reason"].startswith(reason)
+    assert result["response_tail"] == text[-512:]
     assert not generated
 
 
@@ -924,7 +1010,11 @@ async def test_token_budget_exhaustion_is_a_policy_failure(loop_factory, model_r
     loop = make("Still reasoning", stop_reason="length")
     loop.response_length = len("Still reasoning")
     output = await loop.run({}, **model_request)
-    assert output.extra_fields["h3_result"] == {"status": "invalid_call"}
+    assert output.extra_fields["h3_result"] == {
+        "status": "invalid_call",
+        "reason": "no tool call before the length limit",
+        "response_tail": "Still reasoning",
+    }
     assert not generated
 
 
@@ -945,9 +1035,12 @@ async def test_infrastructure_errors_are_not_invalid_policy_calls(loop_factory, 
         stop_reason="aborted" if failure == "aborted" else "completed",
         hang=failure == "timeout",
     )
-    with pytest.raises((RuntimeError, TimeoutError)):
+    with pytest.raises((RuntimeError, TimeoutError)) as error:
         await loop.run({}, **model_request)
     assert not generated
+    if failure == "timeout":
+        # A slow-tail LLM turn drops its group instead of stopping training.
+        assert isinstance(error.value, ProviderError) and error.value.stage == "llm"
 
 
 @pytest.fixture
@@ -1037,15 +1130,23 @@ async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(n
         assert settled == set(range(4))
         assert not published and events[-1] == "failure"
         assert not list(worker.output_dir.rglob("rewards.json"))
-        assert read_json(next(worker.output_dir.rglob("failure.json")))["dropped"] is True
+        failure = read_json(next(worker.output_dir.rglob("failure.json")))
+        assert failure["dropped"] is True and "ProviderError" in failure["traceback"]
+        end = [row for row in read_jsonl(worker.output_dir / "timings.jsonl") if row["event"] == "end"][-1]
+        assert (end["stage"], end["status"], end["sample_id"]) == ("group", "dropped", "train-0")
+        assert end["failure_stage"] == failure["stage"] and Path(end["directory"]).is_dir()
     elif failure:
         with pytest.raises((RuntimeError, ValueError), match="Corrupted|interrupted"):
             await worker.generate_sequences(batch)
         assert settled == set(range(4))
         assert not published and events[-1] == "failure"
     else:
-        await worker.generate_sequences(batch)
+        records = await worker.generate_sequences(batch)
+        assert [(r["dropped"], r["sample_id"]) for r in records] == [(False, "train-0")]
+        assert [r["score"] for r in records[0]["rewards"]] == pytest.approx([1, 2 / 3, 1 / 3, -1])
         assert events == ["running", "score", *(["publish"] * 4), "finished"]
+        end = [row for row in read_jsonl(worker.output_dir / "timings.jsonl") if row["event"] == "end"][-1]
+        assert end["status"] == "succeeded" and end["scores"] == pytest.approx([1, 2 / 3, 1 / 3, -1])
         for i, row in enumerate(published):
             assert row["keys"] == [f"uid0_{i}_0"]
             fields = row["fields"]
@@ -1056,23 +1157,161 @@ async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(n
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("validate,refill", [(True, True), (False, False)])
-async def test_provider_failure_cannot_silently_pad_evaluation_or_disabled_refill(native_worker, validate, refill):
+async def test_provider_failure_cannot_silently_pad_disabled_refill(native_worker):
     worker, events, published = native_worker
-    worker.config.trainer.v1.sampler.sync_refill_failed_groups = refill
+    worker.config.trainer.v1.sampler.sync_refill_failed_groups = False
 
     async def rollout(*args, **kwargs):
         raise ProviderError("h3", "H3 timed out")
 
     worker._run_agent_loop = rollout
-    prompt = {"uid": "test", "global_steps": 1, "extra_info": {"id": "eval-0" if validate else "train-0"}}
+    prompt = {"uid": "test", "global_steps": 1, "extra_info": {"id": "train-0"}}
     with pytest.raises(ProviderError):
-        await worker._run_prompt(prompt, {}, {"validate": validate})
+        await worker._run_prompt(prompt, {}, {"validate": False})
     assert not published and events[-1] == "failure"
     assert read_json(next(worker.output_dir.rglob("failure.json")))["dropped"] is False
 
 
-def test_manager_bounds_failed_group_replacements(native_worker, monkeypatch):
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProviderError("h3", "H3 timed out"),
+        ProviderError("gemini", "Gemini failed comparisons"),
+        ProviderError("gemini_refusal", "Gemini refused held-out example"),
+        RuntimeError("Incomplete or mismatched H3 result"),
+        TimeoutError(),
+    ],
+)
+@pytest.mark.parametrize("stage", ["rollout", "judge"])
+async def test_any_held_out_failure_drops_the_prompt_without_publishing(native_worker, monkeypatch, error, stage):
+    from examples.video_agents import agent
+    from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
+
+    worker, events, published = native_worker
+
+    async def rollout(*args, **kwargs):
+        if stage == "rollout":
+            raise error
+        return AgentLoopOutput(
+            prompt_ids=[1],
+            response_ids=[2],
+            response_mask=[1],
+            metrics=AgentLoopMetrics(),
+            extra_fields={"h3_result": {"status": "succeeded"}},
+        )
+
+    def score(*args, **kwargs):
+        raise error
+
+    worker._run_agent_loop = rollout
+    monkeypatch.setattr(agent, "score_group", score)
+    prompt = {"uid": "test", "global_steps": 5, "extra_info": {"id": "eval-0"}}
+    record = await worker._run_prompt(prompt, {}, {"validate": True})
+    assert record["dropped"] is True and record["validate"] is True and record["sample_id"] == "eval-0"
+    assert record["stage"] == getattr(error, "stage", "internal")
+    assert not published and events[-1] == "failure"
+    assert read_json(next(worker.output_dir.rglob("failure.json")))["dropped"] is True
+
+
+@pytest.mark.asyncio
+async def test_held_out_success_returns_its_reward_record(native_worker, monkeypatch):
+    from examples.video_agents import agent
+    from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
+
+    worker, events, published = native_worker
+    reward = {"score": 0.75, "valid_call": 1.0, "vs_prompt": 1.0, "vs_h3_context_ir": 0.5}
+
+    async def rollout(*args, **kwargs):
+        return AgentLoopOutput(
+            prompt_ids=[1],
+            response_ids=[2],
+            response_mask=[1],
+            metrics=AgentLoopMetrics(),
+            extra_fields={"h3_result": {"status": "succeeded"}},
+        )
+
+    async def publish(*args, **kwargs):
+        published.append(kwargs)
+
+    worker._run_agent_loop = rollout
+    monkeypatch.setattr(agent, "score_group", lambda *a, **k: [dict(reward)])
+    monkeypatch.setattr(agent.AgentLoopWorkerTQBase, "_agent_loop_postprocess", publish)
+    prompt = {"uid": "test", "global_steps": 5, "extra_info": {"id": "eval-0"}}
+    record = await worker._run_prompt(prompt, {}, {"validate": True})
+    assert record == {"dropped": False, "uid": "test", "sample_id": "eval-0", "rewards": [reward]}
+    assert len(published) == 1 and events[-1] == "finished"
+
+
+def held_out_records(valid_scores, dropped):
+    records = [
+        {
+            "dropped": False,
+            "sample_id": f"eval-{i}",
+            "rewards": [{"score": s, "valid_call": float(s > 0), "vs_prompt": s, "vs_h3_context_ir": s}],
+        }
+        for i, s in enumerate(valid_scores)
+    ]
+    records += [
+        {
+            "dropped": True,
+            "validate": True,
+            "sample_id": f"dropped-{i}",
+            "stage": "gemini",
+            "type": "ProviderError",
+            "error": "x" * 900,
+        }
+        for i in range(dropped)
+    ]
+    return records
+
+
+def test_evaluation_summary_reports_valid_only_means_and_dropped_reasons():
+    from examples.video_agents.agent import evaluation_summary
+
+    summary = evaluation_summary(5, held_out_records([1.0, 0.5, 0.0], dropped=1), 0.9)
+    assert (summary["prompts"], summary["valid"], summary["dropped"]) == (4, 3, 1)
+    assert summary["score"] == summary["vs_prompt"] == summary["vs_h3_context_ir"] == pytest.approx(0.5)
+    # Invalid policy calls stay in the denominator with their zero score.
+    assert summary["invalid_calls"] == 1
+    assert summary["valid_fraction"] == 0.75 and summary["degraded"] is True
+    assert summary["dropped_examples"] == [
+        {"sample_id": "dropped-0", "stage": "gemini", "type": "ProviderError", "error": "x" * 500}
+    ]
+    assert evaluation_summary(5, held_out_records([1.0] * 9, dropped=1), 0.9)["degraded"] is False
+
+
+def test_manager_summarizes_evaluation_without_counting_training_drops(native_worker, monkeypatch, tmp_path):
+    import numpy as np
+
+    from examples.video_agents import agent
+    from verl.utils.tensordict_utils import assign_non_tensor_data, get_tensordict
+
+    worker, _, _ = native_worker
+    manager = object.__new__(agent.TournamentManager)
+    manager.config = worker.config
+    manager.config.video_rl.output_dir = str(tmp_path)
+    manager.config.video_rl.max_dropped_groups_per_step = 1
+    manager._drop_step, manager._dropped_groups = None, 0
+    manager._eval_step, manager._eval_records = None, []
+    manager.agent_loop_workers = [SimpleNamespace(generate_sequences=SimpleNamespace(remote=lambda chunk: 0))]
+    batch = get_tensordict({"uid": np.array(["test"], dtype=object)})
+    assign_non_tensor_data(batch, "global_steps", 5)
+    assign_non_tensor_data(batch, "validate", True)
+    replies = [held_out_records([1.0], dropped=2), held_out_records([0.0], dropped=0)]
+    monkeypatch.setattr(agent.ray, "get", lambda refs: [replies.pop(0)])
+    manager.generate_sequences(batch)
+    manager.generate_sequences(batch)
+    summary = read_json(tmp_path / "val/step_5/eval-summary.json")
+    assert (summary["prompts"], summary["valid"], summary["dropped"]) == (4, 2, 2)
+    assert summary["score"] == 0.5
+    assert manager._dropped_groups == 0
+    monkeypatch.setattr(agent.ray, "get", lambda refs: [held_out_records([], dropped=2)])
+    with pytest.raises(RuntimeError, match="Every held-out prompt"):
+        manager.generate_sequences(batch)
+
+
+def test_manager_bounds_failed_group_replacements(native_worker, monkeypatch, tmp_path):
     import numpy as np
 
     from examples.video_agents import agent
@@ -1084,7 +1323,8 @@ def test_manager_bounds_failed_group_replacements(native_worker, monkeypatch):
     manager.config.video_rl.max_dropped_groups_per_step = 1
     manager._drop_step, manager._dropped_groups = None, 0
     manager.agent_loop_workers = [SimpleNamespace(generate_sequences=SimpleNamespace(remote=lambda chunk: 0))]
-    monkeypatch.setattr(agent.ray, "get", lambda refs: [[{"dropped": True}]])
+    manager.config.video_rl.output_dir = str(tmp_path)
+    monkeypatch.setattr(agent.ray, "get", lambda refs: [[{"dropped": True, "stage": "h3"}]])
     batch = get_tensordict({"uid": np.array(["test"], dtype=object)})
     assign_non_tensor_data(batch, "global_steps", 1)
     manager.generate_sequences(batch)
@@ -1093,16 +1333,240 @@ def test_manager_bounds_failed_group_replacements(native_worker, monkeypatch):
     assign_non_tensor_data(batch, "global_steps", 2)
     manager.generate_sequences(batch)
     assert manager._dropped_groups == 1
+    ends = [row for row in read_jsonl(tmp_path / "timings.jsonl") if row["event"] == "end"]
+    # The dispatch itself completes; the drop limit stops the step afterwards.
+    assert [(row["status"], row["dropped"], row["total_dropped_groups"]) for row in ends] == [
+        ("succeeded", {"h3": 1}, 1),
+        ("succeeded", {"h3": 1}, 2),
+        ("succeeded", {"h3": 1}, 1),
+    ]
 
 
-def test_timeouts_use_measured_p99_and_keep_unmeasured_limits(prepared_rl):
-    from math import ceil
+def test_launch_config_supplies_every_limit_and_keeps_the_frozen_identity(prepared_rl):
+    directory, _, _ = prepared_rl
+    frozen = tournament.load_protocol(directory / "protocol.json")
+    assert "timeouts" not in frozen
+    runtime = tournament.runtime_protocol(frozen, VIDEO_RL)
+    assert runtime["timeouts"] == dict(VIDEO_RL.timeouts) and set(runtime["timeouts"]) == set(tournament.TIMEOUT_STAGES)
+    assert runtime["judge_max_attempts"] == VIDEO_RL.judge_max_attempts
+    assert runtime["protocol_sha256"] == fingerprint(frozen) == read_json(directory / "protocol-sha256.json")
+    assert tournament.runtime_protocol(runtime, VIDEO_RL)["protocol_sha256"] == fingerprint(frozen)
+    # Limits frozen by older runs are replaced, not merged.
+    legacy = {**frozen, "timeouts": {"llm": 1, "unmeasured": 2}}
+    assert tournament.runtime_protocol(legacy, VIDEO_RL)["timeouts"] == dict(VIDEO_RL.timeouts)
 
-    from examples.video_agents.config import LATENCY_BASELINE
 
-    _, protocol, _ = prepared_rl
-    for stage in ("h3", "judge_request"):
-        assert protocol["timeouts"][stage] == ceil(2 * LATENCY_BASELINE[stage]["p99_seconds"])
-    assert protocol["timeouts"]["h3_request"] == 30
-    assert protocol["timeouts"]["judge_file"] == 300
-    assert protocol["timeouts"]["judge_pass"] == 1800
+@pytest.mark.parametrize(
+    "timeouts,attempts",
+    [
+        ({"unknown": 1}, 2),
+        ({"llm": None}, 2),
+        ({"llm": 0}, 2),
+        ({"llm": float("inf")}, 2),
+        ({"llm": True}, 2),
+        ({"llm": "240"}, 2),
+        ({}, 0),
+        ({}, 1.5),
+    ],
+)
+def test_runtime_settings_are_validated(prepared_rl, timeouts, attempts):
+    complete = {**dict(VIDEO_RL.timeouts), **timeouts}
+    if timeouts.get("llm", 0) is None:
+        complete.pop("llm")
+    with pytest.raises(ValueError, match="video_rl"):
+        tournament.runtime_protocol(prepared_rl[1], {"timeouts": complete, "judge_max_attempts": attempts})
+
+
+def test_rl_config_timeouts_reach_the_judge_runner(prepared_rl, tmp_path, monkeypatch):
+    directory, protocol, prepared_args = prepared_rl
+    config, _ = rl.training_config(
+        rl.parse_args(["train", "--run-dir", str(directory), "--data-dir", str(prepared_args.data_dir)])
+    )
+    runtime = tournament.runtime_protocol(tournament.load_protocol(directory / "protocol.json"), config.video_rl)
+    assert runtime["timeouts"] == protocol["timeouts"] and runtime["judge_max_attempts"] == 3
+    assert runtime["judge_failure_policy"] == "neutral"
+    runtime["judge_failure_policy"] = "drop"
+    calls = []
+
+    def execute(command, **kwargs):
+        calls.append((command, kwargs["timeout"]))
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(tournament.subprocess, "run", execute)
+    with pytest.raises(ProviderError, match="exceeded 300s"):
+        tournament.score_group(
+            directory / "group", runtime, protocol["samples"]["train"][0], candidates(tmp_path), validate=False
+        )
+    command, timeout = calls[0]
+    assert timeout == 300
+    assert command[command.index("--max-attempts") + 1] == "3"
+    assert float(command[command.index("--request-timeout") + 1]) == 45
+    assert float(command[command.index("--file-timeout") + 1]) == 60
+    assert float(command[command.index("--file-control-timeout") + 1]) == 15
+
+
+def test_h3_worker_receives_runtime_limit_and_frozen_protocol_identity(prepared_rl, monkeypatch):
+    directory, protocol, _ = prepared_rl
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(tournament.subprocess, "run", run)
+    with pytest.raises(ProviderError, match="150"):
+        tournament.generate_video(
+            directory / "candidate", protocol, {"prompt": "A valid video prompt", "duration": 10, "seed": 42}
+        )
+    assert calls == [150]
+    worker_protocol = read_json(directory / "candidate/protocol.json")
+    assert worker_protocol["rl_protocol_sha256"] == read_json(directory / "protocol-sha256.json")
+    assert worker_protocol["timeouts"] == {"h3_request": 30}
+    expected = {"h3", "h3_endpoints", "media_profile", "eval_repo", "timeouts", "rl_protocol_sha256"}
+    assert set(worker_protocol) == expected
+
+
+@pytest.mark.parametrize(
+    "error_type,error,reason",
+    [
+        ("NetworkFailure", "Network request failed: The read operation timed out", "provider_failure"),
+        ("HttpFailure", 'HTTP 400: {"error":{"code":"prohibited_content"}}', "content_refusal"),
+    ],
+)
+def test_training_preserves_votes_and_videos_with_a_persisted_neutral_order(
+    prepared_rl, tmp_path, monkeypatch, error_type, error, reason
+):
+    directory, protocol, _ = prepared_rl
+    clips = candidates(tmp_path)
+    before = {c["path"]: Path(c["path"]).read_bytes() for c in clips}
+    calls = install_judge(monkeypatch)
+    execute = tournament.subprocess.run
+
+    def fail_one(command, **kwargs):
+        assert command[command.index("--max-errors") + 1] == "6"
+        execute(command, **kwargs)
+        path = Path(command[command.index("--output") + 1])
+        if path.name == "judgments-original.jsonl":
+            rows = read_jsonl(path)
+            row = next(r for r in rows if r["pair_id"] == "0_vs_1")
+            for field in ("preferred_video", "preferred_model", "reason"):
+                row.pop(field)
+            row.update(status="error", stage="interaction", error_type=error_type, error=error)
+            write_jsonl(path, rows)
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(tournament.subprocess, "run", fail_one)
+    monkeypatch.setattr(tournament, "generate_video", lambda *a, **k: pytest.fail("must reuse existing H3 videos"))
+    group = directory / "neutral-group"
+    rewards = tournament.score_group(group, protocol, protocol["samples"]["train"][0], clips, validate=False)
+    assert [r["score"] for r in rewards] == pytest.approx([11 / 12, 3 / 4, 1 / 3, 0])
+    assert all(r["judge_fallback_comparisons"] == 1 and r["judge_completed_comparisons"] == 11 for r in rewards)
+    assert all(r["order_disagreement"] == 0 for r in rewards)
+    fallback = read_json(group / "judge/fallbacks-original.json")
+    assert len(fallback) == 1 and fallback[0]["fallback_reason"] == reason
+    assert fallback[0]["status"] == "fallback" and "preferred_model" not in fallback[0]
+    assert fallback[0]["error"]["error"] == error
+    assert len(calls) == 2
+    assert tournament.score_group(group, protocol, protocol["samples"]["train"][0], clips, validate=False) == rewards
+    assert len(calls) == 2
+    assert before == {c["path"]: Path(c["path"]).read_bytes() for c in clips}
+    # Fallback identity is verified just like an actual vote before resuming.
+    fallback[0]["manifest_sha256"] = "wrong-manifest"
+    write_json(group / "judge/fallbacks-original.json", fallback)
+    with pytest.raises(ValueError, match="frozen manifest"):
+        tournament.score_group(group, protocol, protocol["samples"]["train"][0], clips, validate=False)
+
+
+@pytest.mark.parametrize("invalid", [(), (3,)])
+def test_pass_deadlines_neutralize_only_judging_and_keep_invalid_call_penalties(
+    prepared_rl, tmp_path, monkeypatch, invalid
+):
+    directory, protocol, _ = prepared_rl
+    calls = []
+
+    def timeout(command, **kwargs):
+        calls.append(command)
+        assert kwargs["timeout"] == 300
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(tournament.subprocess, "run", timeout)
+    clips = candidates(tmp_path, invalid)
+    group = directory / "timeout-group"
+    rewards = tournament.score_group(group, protocol, protocol["samples"]["train"][0], clips, validate=False)
+    assert [r["score"] for r in rewards] == pytest.approx([2 / 3] * 3 + [-1] if invalid else [0.5] * 4)
+    assert all(r["judge_fallback_fraction"] == 1 and r["order_disagreement"] == 0 for r in rewards)
+    assert all(r["zero_variance_group"] == (not invalid) for r in rewards)
+    assert len(calls) == 2
+    assert tournament.score_group(group, protocol, protocol["samples"]["train"][0], clips, validate=False) == rewards
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("exit_mode", ["error", "timeout"])
+def test_auth_failure_is_fatal_even_when_the_pass_later_times_out(prepared_rl, tmp_path, monkeypatch, exit_mode):
+    directory, protocol, _ = prepared_rl
+    install_judge(monkeypatch)
+    execute = tournament.subprocess.run
+
+    def unauthorized(command, **kwargs):
+        execute(command, **kwargs)
+        path = Path(command[command.index("--output") + 1])
+        rows = read_jsonl(path)
+        row = rows[0]
+        for field in ("preferred_video", "preferred_model", "reason"):
+            row.pop(field)
+        row.update(status="error", stage="interaction", error_type="HttpFailure", error="HTTP 401: unauthorized")
+        write_jsonl(path, rows)
+        if exit_mode == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(tournament.subprocess, "run", unauthorized)
+    group = directory / "auth-error"
+    with pytest.raises(RuntimeError, match="Nonrecoverable Gemini error"):
+        tournament.score_group(group, protocol, protocol["samples"]["train"][0], candidates(tmp_path), validate=False)
+    assert not list(group.rglob("fallbacks-*.json")) and not (group / "rewards.json").exists()
+
+
+def test_validation_never_uses_training_fallbacks(prepared_rl, tmp_path, monkeypatch):
+    directory, protocol, _ = prepared_rl
+
+    def timeout(command, **kwargs):
+        assert command[command.index("--max-errors") + 1] == "1"
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(tournament.subprocess, "run", timeout)
+    group = directory / "eval-timeout"
+    with pytest.raises(ProviderError):
+        tournament.score_group(group, protocol, protocol["samples"]["val"][0], candidates(tmp_path)[:1], validate=True)
+    assert not list(group.rglob("fallbacks-*.json")) and not (group / "rewards.json").exists()
+
+
+def test_fallback_guard_counts_groups_once_across_replacements(native_worker, tmp_path):
+    from examples.video_agents import agent
+
+    worker, _, _ = native_worker
+    manager = object.__new__(agent.TournamentManager)
+    manager.config = worker.config
+    manager.config.video_rl.output_dir = str(tmp_path)
+    manager.config.video_rl.max_judge_fallback_fraction = 0.25
+    manager.config.data.train_batch_size = 4
+
+    def record(fallbacks):
+        return {"dropped": False, "rewards": [{"judge_comparisons": 12, "judge_fallback_comparisons": fallbacks}] * 4}
+
+    manager._check_judge_coverage(1, [record(0)] * 3 + [{"dropped": True}])
+    manager._check_judge_coverage(1, [record(12)])
+    assert (manager._judge_comparisons, manager._judge_fallbacks) == (48, 12)
+    manager._check_judge_coverage(2, [record(12)] * 3)
+    with pytest.raises(RuntimeError, match="stopping before an optimizer update"):
+        manager._check_judge_coverage(2, [record(0)])
+    manager._check_judge_coverage(3, [record(0)] * 4)
+    assert manager._judge_fallbacks == 0
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.1, True, float("nan"), "0.25"])
+def test_fallback_fraction_limit_is_validated(prepared_rl, value):
+    settings = OmegaConf.to_container(VIDEO_RL, resolve=False)
+    settings["max_judge_fallback_fraction"] = value
+    with pytest.raises(ValueError, match="fallback_fraction"):
+        tournament.runtime_protocol(prepared_rl[1], settings)
