@@ -70,6 +70,7 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         raise ValueError("video_rl.max_judge_fallback_fraction must be between 0 and 1")
     return {
         **protocol,
+        **h3.recovery_settings(settings),
         "timeouts": timeouts,
         "judge_max_attempts": attempts,
         "judge_failure_policy": policy,
@@ -97,15 +98,21 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
         freeze_json(directory / "protocol.json", worker_protocol)
         freeze_json(directory / "generation.json", [task])
         timeout = protocol["timeouts"]["h3"]
-        # This worker already persists the task ID before polling and refuses to
-        # resubmit an uncertain POST. subprocess.run kills and waits on timeout.
+        # Recovery settings are launch-time flags, not new frozen inputs. The
+        # outer deadline includes every retry and regeneration in the subprocess.
         try:
             with (
                 timed_stage(directory / "timings.jsonl", "h3_worker", timeout_seconds=timeout),
                 log_path.open("ab") as log,
             ):
                 subprocess.run(
-                    h3.worker_command(directory, protocol["poll_interval"], timeout),
+                    h3.worker_command(
+                        directory,
+                        protocol["poll_interval"],
+                        timeout,
+                        max_request_attempts=protocol.get("h3_max_request_attempts", 3),
+                        max_generation_attempts=protocol.get("h3_max_generation_attempts", 2),
+                    ),
                     check=True,
                     timeout=timeout,
                     stdout=log,
@@ -116,6 +123,8 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
         except subprocess.CalledProcessError as exc:
             state = read_json(Path(task["state"])) if Path(task["state"]).exists() else {}
             detail = f"{state.get('status')}: {state.get('error')}; see {log_path}"
+            if state.get("error_stage") in {"artifact", "configuration", "protocol"}:
+                raise RuntimeError(f"H3 worker failed ({detail})") from exc
             if state.get("status") in h3.TERMINAL_FAILURES or (
                 state.get("status") == "error" and state.get("error_stage") == "provider"
             ):

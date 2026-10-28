@@ -1349,6 +1349,8 @@ def test_launch_config_supplies_every_limit_and_keeps_the_frozen_identity(prepar
     runtime = tournament.runtime_protocol(frozen, VIDEO_RL)
     assert runtime["timeouts"] == dict(VIDEO_RL.timeouts) and set(runtime["timeouts"]) == set(tournament.TIMEOUT_STAGES)
     assert runtime["judge_max_attempts"] == VIDEO_RL.judge_max_attempts
+    assert {key: runtime[key] for key in h3.RECOVERY_DEFAULTS} == dict(h3.RECOVERY_DEFAULTS)
+    assert all(VIDEO_RL[key] == default for key, default in h3.RECOVERY_DEFAULTS.items())
     assert runtime["max_judge_fallback_fraction"] == VIDEO_RL.max_judge_fallback_fraction == 0.75
     assert runtime["protocol_sha256"] == fingerprint(frozen) == read_json(directory / "protocol-sha256.json")
     assert tournament.runtime_protocol(runtime, VIDEO_RL)["protocol_sha256"] == fingerprint(frozen)
@@ -1408,10 +1410,13 @@ def test_rl_config_timeouts_reach_the_judge_runner(prepared_rl, tmp_path, monkey
 
 def test_h3_worker_receives_runtime_limit_and_frozen_protocol_identity(prepared_rl, monkeypatch):
     directory, protocol, _ = prepared_rl
+    protocol = {**protocol, "h3_max_request_attempts": 5, "h3_max_generation_attempts": 3}
     calls = []
 
     def run(command, **kwargs):
         calls.append(kwargs["timeout"])
+        assert command[command.index("--max-request-attempts") + 1] == "5"
+        assert command[command.index("--max-generation-attempts") + 1] == "3"
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 
     monkeypatch.setattr(tournament.subprocess, "run", run)
@@ -1425,6 +1430,20 @@ def test_h3_worker_receives_runtime_limit_and_frozen_protocol_identity(prepared_
     assert worker_protocol["timeouts"] == {"h3_request": 30}
     expected = {"h3", "h3_endpoints", "media_profile", "eval_repo", "timeouts", "rl_protocol_sha256"}
     assert set(worker_protocol) == expected
+
+
+@pytest.mark.parametrize("error_stage", ["configuration", "protocol", "artifact"])
+def test_h3_fatal_errors_cannot_be_hidden_by_unknown_submission_status(prepared_rl, monkeypatch, error_stage):
+    directory, protocol, _ = prepared_rl
+
+    def run(command, **kwargs):
+        write_json(directory / "candidate/state.json", {"status": "submit_unknown", "error_stage": error_stage})
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(tournament.subprocess, "run", run)
+    with pytest.raises(RuntimeError) as raised:
+        tournament.generate_video(directory / "candidate", protocol, {"prompt": "Video", "duration": 10, "seed": 42})
+    assert not isinstance(raised.value, ProviderError)
 
 
 @pytest.mark.parametrize(

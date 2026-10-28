@@ -28,6 +28,7 @@ from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ, AgentLoopWorke
 from verl.utils.tensordict_utils import get_non_tensor_data
 
 from .config import REFERENCE_FIELDS
+from .h3 import generation_slot
 from .observability import ProviderError, failure_record, record_event, timed_stage
 from .storage import item_key, write_json
 from .tournament import GROUP_SIZE, generate_video, load_protocol, runtime_protocol, score_group
@@ -83,7 +84,14 @@ class SolH3Tool(BaseTool):
             await self.slots.acquire()
         try:
             try:
-                result = await asyncio.to_thread(generate_video, directory, self.protocol, request)
+
+                def generate():
+                    # Keep the shared slot in the executor thread until its H3
+                    # subprocess has exited, including if this coroutine is cancelled.
+                    with generation_slot(self.output_dir, self.protocol["h3_max_inflight"], timing_path):
+                        return generate_video(directory, self.protocol, request)
+
+                result = await asyncio.to_thread(generate)
             except Exception as exc:
                 # The native tool loop catches exceptions. Preserve their class so
                 # only service failures can be dropped; code/artifact errors abort.

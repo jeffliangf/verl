@@ -30,6 +30,16 @@ video_rl:
     judge_control: 15
     judge_pass: 300
 
+  # H3 retries share the 150-second in-flight deadline. A new generation is
+  # allowed only after a confirmed terminal failure, keeping the original inputs.
+  h3_max_request_attempts: 3
+  h3_max_generation_attempts: 2
+
+  # Shared across all agent workers in this run. Two concurrent training jobs
+  # therefore occupy at most four client slots. Use 4 when running only one job.
+  # Waiting for this slot does not consume the H3 in-flight deadline.
+  h3_max_inflight: 2
+
   # Initial request plus two retries, sharing one budget for transient HTTP and
   # network failures, including judgments. Each pass still has a hard deadline.
   judge_max_attempts: 3

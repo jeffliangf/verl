@@ -137,6 +137,38 @@ of waiting for it:
 | One presentation-order pass (`judge_pass`) | 65-132 s | 300 s |
 | LLM turn (`llm`) | 130-187 s | 900 s |
 
+H3 recovery keeps the **150-second in-flight limit**, including admission,
+polling, retries, regeneration, download, and media checks. On a gateway whose
+health response advertises `idempotency_key: true`, the client persists a caller
+UUID before submitting it as `Idempotency-Key`. An uncertain response is retried
+with the same key, exact inputs, and gateway. A 502 carrying an accepted job ID
+switches directly to polling. Saved attempts bypass new-admission readiness
+checks; a full queue does not prevent recovering an existing job.
+
+`video_rl.h3_max_request_attempts` defaults to 3: the first operation and two
+retries for transient HTTP/network failures, with 1/2-second backoff plus jitter
+and `Retry-After`. Poll and download retries keep the original job. Downloaded
+gateway artifacts must match `video_sha256` and `video_bytes` before any MP4
+remuxing; both the original and final local checksums are retained. Authentication,
+invalid inputs, conflicting IDs, and persistent artifact corruption remain fatal.
+
+`video_rl.h3_max_generation_attempts` defaults to 2. Only a confirmed terminal
+`worker_restarted`, `inference_failed`, `storage_failure`, or `worker_lost` permits
+the second generation, with a new UUID and the same prompt, duration, and seed.
+It preserves the policy response and successful sibling videos. The original
+deadline and generation history survive client restarts; retries never renew the
+budget. A timeout or unknown failure code does not authorize regeneration. Older
+keyless ambiguous submissions remain unresolved rather than receiving a new key.
+The gateway's 600-second worker-loss detection can outlast this client budget;
+such a candidate still fails at 150 seconds and leaves its job identity available.
+
+`video_rl.h3_max_inflight` defaults to 2 across all agent workers in a run, using
+advisory locks in the shared output directory. With both training jobs running,
+this permits four client operations in total. Set it to 4 for a single job using
+the four-worker H3 pool. Slot waiting occurs before the generation subprocess
+starts, outside its in-flight deadline. Recovery budgets are launch-time settings
+and do not rewrite frozen experiment or candidate inputs.
+
 The LLM limit is a stall guard, not a tail cut. An LLM turn takes about its
 response tokens divided by ~15 tokens/s (r = 0.997 in job 2391), so
 `data.max_response_length` (8,192) already bounds it near 540 s. A lower wall-clock
@@ -181,7 +213,10 @@ Every failure leaves a trail from the job log to its files:
      from real judgments. `gemini_request` timing records include `attempts` and
      `recovered`; the run-level `judge_coverage` records track the batch totals.
 4. Each video directory, `<run>/videos/<instance>/`, holds `h3-worker.log`, the
-   job's `state.json`, and, on failure, `failure.json`.
+   job's `state.json`, and, on failure, `failure.json`. State includes the caller
+   ID, original deadline, request retries, previous generation attempts, and
+   download/local checksums. `h3_recovery` events distinguish transport retries
+   from actual regenerations; `h3_global_slot_wait` measures the shared slot wait.
 
 Gemini failures name each failed comparison with its recorded error, such as a
 `prohibited_content` refusal, plus both file paths. Timing logs omit credentials,
@@ -195,7 +230,8 @@ python -m examples.video_agents.rl timings --run-dir outputs/video_agents/rl
 This reports P50/P99 and proposed 2×P99 limits without changing the frozen run,
 alongside errors, group outcomes, incomplete stages, and malformed log lines.
 An accepted remote H3 job may continue after the local timeout; saved IDs remain
-available for inspection and recovery, and ambiguous POSTs are never repeated.
+available for inspection. Ambiguous POSTs are replayed only with a previously
+persisted key for a gateway that advertised idempotency support.
 
 Validation uses one greedy rollout per held-out prompt. It compares the video
 against the saved original-prompt and Context-IR reference videos, each in both
@@ -270,7 +306,8 @@ uv run --frozen --extra fsdp --extra vllm python -m examples.video_agents.rl tra
 
 The preset uses Qwen3.8-27B, FSDP2, TP=4 vLLM rollout, eight GPUs, sixteen prompts
 per batch, and four samples per prompt. Four agent workers each allow five H3
-requests, giving a client concurrency cap of 20. The ten-step pilot saves every
+tasks locally, while the run-wide `video_rl.h3_max_inflight` limit defaults to two
+active H3 operations. The ten-step pilot saves every
 five steps and validates at step ten. An initial batch costs at most 64 videos
 and 192 judgments, with additional work for failed-group replacements;
 the 200-prompt validation costs at most 200 videos and 800 judgments. Hardware
