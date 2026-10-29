@@ -47,10 +47,16 @@ def test_neutral_order_preserves_the_observed_vote(first, second, expected):
         ("FileProcessingFailure", "video not ACTIVE", "provider_failure"),
         ("HttpFailure", "HTTP 503: unavailable", "provider_failure"),
         ("HttpFailure", 'HTTP 400: {"error":{"code":"prohibited_content"}}', "content_refusal"),
+        (
+            "HttpFailure",
+            'HTTP 400: {"error":{"message":"Request contains an invalid argument.","code":"invalid_request"}}',
+            "judge_request_rejected",
+        ),
         ("EvalError", "Gemini output is not valid JSON", "invalid_judge_response"),
         ("HttpFailure", "HTTP 401: unauthorized", None),
         ("HttpFailure", "HTTP 403: permission denied", None),
         ("HttpFailure", "HTTP 400: invalid argument", None),
+        ("HttpFailure", 'HTTP 400: {"error":{"code":"invalid_request","message":"Unknown field: typo"}}', None),
         ("OSError", "missing local video", None),
         ("UnknownError", "programming error", None),
     ],
@@ -62,6 +68,17 @@ def test_fallback_only_accepts_unscorable_provider_responses(kind, message, expe
     else:
         with pytest.raises(RuntimeError, match="Nonrecoverable"):
             judge.fallback_reason(row)
+
+
+@pytest.mark.parametrize("stage", ["upload", "file_processing", "cleanup", None])
+def test_generic_invalid_argument_outside_interaction_remains_fatal(stage):
+    row = {
+        "stage": stage,
+        "error_type": "HttpFailure",
+        "error": 'HTTP 400: {"error":{"code":"invalid_request","message":"Request contains an invalid argument."}}',
+    }
+    with pytest.raises(RuntimeError, match="Nonrecoverable"):
+        judge.fallback_reason(row)
 
 
 def test_network_retry_opt_in_is_scoped_to_judgment_posts(tmp_path):

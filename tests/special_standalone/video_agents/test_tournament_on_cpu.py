@@ -1537,6 +1537,11 @@ def test_h3_fatal_errors_cannot_be_hidden_by_unknown_submission_status(prepared_
     [
         ("NetworkFailure", "Network request failed: The read operation timed out", "provider_failure"),
         ("HttpFailure", 'HTTP 400: {"error":{"code":"prohibited_content"}}', "content_refusal"),
+        (
+            "HttpFailure",
+            'HTTP 400: {"error":{"message":"Request contains an invalid argument.","code":"invalid_request"}}',
+            "judge_request_rejected",
+        ),
     ],
 )
 def test_training_preserves_votes_and_videos_with_a_persisted_neutral_order(

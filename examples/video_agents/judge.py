@@ -205,7 +205,7 @@ def judgment_errors(path: Path, pair_ids) -> dict[str, str]:
 
 
 def fallback_reason(row: dict) -> str:
-    """Allow missing provider judgments, but never hide auth, input, or code errors."""
+    """Allow unscorable provider responses; explicit input, auth, and code errors stay fatal."""
     error_type, message = row.get("error_type"), row.get("error", "")
     if error_type in {"NetworkFailure", "FileProcessingFailure"}:
         return "provider_failure"
@@ -220,6 +220,13 @@ def fallback_reason(row: dict) -> str:
                     error = json.loads(detail).get("error", {})
                     if isinstance(error, dict) and error.get("code") == "prohibited_content":
                         return "content_refusal"
+                    # Individual interactions can fail with this generic response
+                    # while the other comparisons of the same videos succeed.
+                    if row.get("stage") == "interaction" and error == {
+                        "code": "invalid_request",
+                        "message": "Request contains an invalid argument.",
+                    }:
+                        return "judge_request_rejected"
                 except (ValueError, AttributeError):
                     pass
     if error_type == "EvalError" and row.get("stage") == "interaction":
