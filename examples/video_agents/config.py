@@ -19,7 +19,7 @@ DEFAULT_EVAL_REPO = Path.home() / "video-generation-eval"
 DEFAULT_SYSTEM_PROMPT = Path(__file__).with_name("system_prompt.txt").read_text(encoding="utf-8").strip()
 DEFAULT_REWRITE_INSTRUCTION = Path(__file__).with_name("rewrite_instruction.txt").read_text(encoding="utf-8").strip()
 JUDGE_SETTINGS = {
-    "judge_model": "gemini-3.7-flash",
+    "judge_model": "gemini-3.8-flash",
     "thinking_level": "high",
     "video_processing": "standard",
     "seed": 0,
