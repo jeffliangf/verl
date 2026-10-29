@@ -34,6 +34,45 @@ def load_samples(path: Path) -> list[dict]:
     return rows
 
 
+def best_of_4_reference(row: dict, profile: dict, probe) -> dict:
+    """Verify the winner exported by run_candidate41_best_of_4.py.
+
+    These exports use videos/<item>/best_of_4.mp4 and items/<item>.json,
+    rather than the fixed-seed Context-IR reference manifest.
+    """
+    field = REFERENCE_VIDEO_FIELDS["best_of_4"]
+    if not isinstance(row.get(field), str) or not row[field].strip():
+        raise ValueError(f"Missing reference video field: {row['id']}/{field}")
+    path = Path(row[field]).expanduser().resolve()
+    record = read_json(path.parent.parent.parent / "items" / f"{path.parent.name}.json")
+    if record.get("id") != row["id"] or record.get("prompt") != row["prompt"] or record.get("status") != "succeeded":
+        raise ValueError(f"Best-of-4 job is incomplete or differs from dataset: {row['id']}")
+    lanes = record.get("lanes", [])
+    model_ids = {lane.get("model_id") for lane in lanes}
+    winner = record.get("winner_model_id")
+    if (
+        len(lanes) != 4
+        or len(model_ids) != 4
+        or winner is None
+        or winner not in model_ids
+        or (record.get("selection") or {}).get("selected_model") != winner
+        or any(
+            lane.get("status") != "completed" or lane.get("processing_path") != "context-ir-sol-h3-native"
+            for lane in lanes
+        )
+    ):
+        raise ValueError(f"Best-of-4 reference requires four completed self-hosted H3 lanes and a winner: {row['id']}")
+    video = record.get("video") or {}
+    if Path(video.get("path", "")).expanduser().resolve() != path:
+        raise ValueError(f"Dataset video path differs from best-of-4 record: {row['id']}")
+    digest = file_sha256(path)
+    if video.get("sha256") != digest or video.get("bytes") != path.stat().st_size:
+        raise ValueError(f"Reference video has changed: {path}")
+    if h3.media_profile(probe(path)) != profile or h3.media_profile(video.get("media", {})) != profile:
+        raise ValueError(f"Reference media differs from its best-of-4 record or Context-IR reference: {path}")
+    return {"path": str(path), "sha256": digest}
+
+
 def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[list[dict], dict]:
     """Verify request texts, completed state, bytes, checksums, and media formats.
 
@@ -65,6 +104,9 @@ def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[l
     for row in rows:
         references = {}
         for field in REFERENCE_FIELDS:
+            if field == "best_of_4":
+                references[field] = best_of_4_reference(row, manifest["media_profile"], probe)
+                continue
             task = tasks.get((row["id"], field))
             if task is None or task["request"] != h3.request_body(row[field], manifest["settings"]):
                 raise ValueError(f"Reference request differs from dataset: {row['id']}/{field}")

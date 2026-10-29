@@ -30,7 +30,7 @@ def ledger(tmp_path):
                 "id": "sample",
                 "prompt": "The original request",
                 "source": "aa_eval",
-                "references": {name: {"path": name + ".mp4"} for name in ("prompt", "h3_context_ir")},
+                "references": {name: {"path": name + ".mp4"} for name in ("h3_context_ir", "best_of_4")},
             }
         ],
     }

@@ -42,6 +42,8 @@ def load_protocol(path: Path) -> dict:
         raise ValueError("Expected a four-candidate H3 tournament protocol")
     if protocol.get("h3_backend") != h3.BACKEND:
         raise ValueError("Expected a self-hosted Sol-H3 protocol; the H3 Max API is disabled")
+    if any(set(sample.get("references", {})) != set(REFERENCE_FIELDS) for sample in protocol["samples"]["val"]):
+        raise ValueError("Evaluation references changed; prepare a new run directory with Context-IR and best-of-4")
     check_dependencies(protocol)
     return protocol
 

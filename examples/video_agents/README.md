@@ -234,11 +234,11 @@ available for inspection. Ambiguous POSTs are replayed only with a previously
 persisted key for a gateway that advertised idempotency support.
 
 Validation uses one greedy rollout per held-out prompt. It compares the video
-against the saved original-prompt and Context-IR reference videos, each in both
+against the saved Context-IR and best-of-4 reference videos, each in both
 orders. The validation reward averages those two scores; an invalid call scores
 zero. `rl.py evaluate` uses this same loop without training.
 
-Native metrics include `vs_prompt`, `vs_h3_context_ir`, and `valid_call` under
+Native metrics include `vs_h3_context_ir`, `vs_best_of_4`, and `valid_call` under
 `val-aux/<source>/<metric>/mean@1`. Training diagnostics are under
 `training/reward_extra/<metric>/mean`, including `zero_variance_group`,
 `order_disagreement`, `judge_comparisons`, `judge_completed_comparisons`,
@@ -254,9 +254,13 @@ These runtime assets are supplied separately:
 - Training JSONL with nonempty `id` and `prompt`; optional `source`. SFT also
   requires `h3_context_ir`. Train/evaluation IDs and prompt text must not overlap.
 - Evaluation JSONL with `id`, `prompt`, `source`, `h3_context_ir`,
-  `prompt_h3_self_hosted_video`, and `h3_context_ir_h3_self_hosted_video`.
-- The reference directory, including `manifest.json`, both videos per prompt,
+  `h3_context_ir_h3_self_hosted_video`, and `best_of_4_h3_self_hosted_video`.
+- The Context-IR reference directory, including `manifest.json`, its videos,
   and their generation state files. Keep its relative paths intact.
+- Best-of-4 exports from `run_candidate41_best_of_4.py`: the JSONL video paths
+  point to `videos/<item>/best_of_4.mp4`, with matching `items/<item>.json` records
+  under the same export directory. Preparation checks the original prompt, all
+  four completed self-hosted lanes, the selected winner, checksums, and media.
 - `~/video-generation-eval`, containing `scripts/run_gemini_pairwise_eval.py`,
   `scripts/build_pairwise_manifest.py`, and `bestofn/normalize.py`.
   `--eval-repo` selects another checkout. Its source hashes and v4 rubric are
@@ -267,7 +271,7 @@ These runtime assets are supplied separately:
   token paths. MP4 remuxing needs `ffmpeg` or `imageio-ffmpeg`.
 
 All generation uses the self-hosted Sol-H3 service. Reference videos must come
-from it too; preparation verifies their manifest, job states, checksums, and media.
+from it too; preparation verifies their provenance records, checksums, and media.
 The client saves job IDs before polling and does not repeat an uncertain POST.
 
 ## Run agent RL
@@ -284,9 +288,13 @@ uv run --no-project --python 3.12 python -m examples.video_agents.rl prepare \
 The defaults use the existing `data/prompt_rewrite_rl.jsonl`, the 200-prompt
 `data/prompt_rewrite_aa_moviegen_eval_200.jsonl`, and references in
 `data/prompt_rewrite_h3_eval/outputs_self_hosted_gateway_768p`.
+Best-of-4 videos and their item records are loaded from the paths in the evaluation
+JSONL, currently under `data/prompt_rewrite_h3_eval/outputs_best_of_4_h3_self_hosted_768p`.
 `--train-file`, `--eval-dataset`, and `--references` select different inputs.
 Prepared JSONL and readable previews go to `data/prompt_rewrite_rl`.
 If you use `--data-dir`, pass the same value to preparation, training, and evaluation.
+Runs prepared with the original-prompt reference need a new run directory and
+another `prepare` before using this reference pair; existing protocols are frozen.
 
 Preview the resolved command in the GPU environment:
 

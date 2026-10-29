@@ -86,7 +86,36 @@ def prepared_rl(tmp_path):
                 },
             )
             manifest["tasks"].append(task)
-            row[REFERENCE_VIDEO_FIELDS[field]] = str(video)
+            row[f"{field}_h3_self_hosted_video"] = str(video)
+        best_of_4 = tmp_path / "best-of-4"
+        video = best_of_4 / "videos" / row["id"] / "best_of_4.mp4"
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.write_bytes(f"best-of-4 {i}".encode())
+        write_json(
+            best_of_4 / "items" / f"{row['id']}.json",
+            {
+                "id": row["id"],
+                "prompt": row["prompt"],
+                "status": "succeeded",
+                "winner_model_id": "minimax-h3-sol-repeat4",
+                "selection": {"selected_model": "minimax-h3-sol-repeat4"},
+                "lanes": [
+                    {
+                        "model_id": f"minimax-h3-sol-repeat{j}",
+                        "status": "completed",
+                        "processing_path": "context-ir-sol-h3-native",
+                    }
+                    for j in range(1, 5)
+                ],
+                "video": {
+                    "path": str(video),
+                    "sha256": file_sha256(video),
+                    "bytes": video.stat().st_size,
+                    "media": MEDIA,
+                },
+            },
+        )
+        row[REFERENCE_VIDEO_FIELDS["best_of_4"]] = str(video)
         rows.append(row)
     write_json(references / "manifest.json", manifest)
     train_file, val_file = tmp_path / "train.jsonl", tmp_path / "eval.jsonl"
@@ -290,10 +319,11 @@ def test_held_out_scoring_uses_both_fixed_references(prepared_rl, tmp_path, monk
     rewards = tournament.score_group(
         directory / "eval-group", protocol, protocol["samples"]["val"][0], candidates(tmp_path)[:1], validate=True
     )
-    assert rewards[0]["vs_prompt"] == rewards[0]["vs_h3_context_ir"] == 1
+    assert rewards[0]["vs_best_of_4"] == rewards[0]["vs_h3_context_ir"] == rewards[0]["score"] == 1
+    assert "vs_prompt" not in rewards[0]
     assert sum(c.count("--pair-id") for c in calls) == 4
     manifest = read_json(directory / "eval-group/judge/manifest-original.json")
-    assert {p["reference"] for p in manifest["pairs"].values()} == {"prompt", "h3_context_ir"}
+    assert {p["reference"] for p in manifest["pairs"].values()} == {"h3_context_ir", "best_of_4"}
     assert all(p["prompt"] == "Original 0" for p in manifest["pairs"].values())
 
 
@@ -595,7 +625,7 @@ def fresh_args(prepared_rl, tmp_path):
 def test_prepare_rejects_mismatched_reference_provenance(fresh_args, invalid):
     args = fresh_args
     manifest = read_json(args.references / "manifest.json")
-    task = manifest["tasks"][0]
+    task = next(task for task in manifest["tasks"] if task["field"] == "h3_context_ir")
     state_path = args.references / task["state"]
     state = read_json(state_path)
     rows = read_jsonl(args.eval_dataset)
@@ -621,6 +651,62 @@ def test_prepare_rejects_mismatched_reference_provenance(fresh_args, invalid):
     assert not (args.run_dir / "protocol.json").exists()
 
 
+def test_prepare_excludes_original_prompt_videos(fresh_args):
+    args = fresh_args
+    rows = read_jsonl(args.eval_dataset)
+    for row in rows:
+        Path(row.pop("prompt_h3_self_hosted_video")).unlink()
+    write_jsonl(args.eval_dataset, rows)
+    rl.prepare(args)
+    samples = tournament.load_protocol(args.run_dir / "protocol.json")["samples"]["val"]
+    assert all(set(sample["references"]) == {"h3_context_ir", "best_of_4"} for sample in samples)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["missing", "id", "prompt", "status", "winner", "lanes", "backend", "path", "sha256", "bytes", "media"],
+)
+def test_prepare_rejects_mismatched_best_of_4_provenance(fresh_args, invalid):
+    args = fresh_args
+    rows = read_jsonl(args.eval_dataset)
+    video = Path(rows[0][REFERENCE_VIDEO_FIELDS["best_of_4"]])
+    record_path = video.parent.parent.parent / "items" / f"{video.parent.name}.json"
+    record = read_json(record_path)
+    if invalid == "missing":
+        del rows[0][REFERENCE_VIDEO_FIELDS["best_of_4"]]
+    elif invalid in {"id", "prompt", "status"}:
+        record[invalid] = "different"
+    elif invalid == "winner":
+        record["selection"]["selected_model"] = "minimax-h3-sol-repeat1"
+    elif invalid == "lanes":
+        record["lanes"].pop()
+    elif invalid == "backend":
+        record["lanes"][0]["processing_path"] = "other-provider"
+    elif invalid == "media":
+        record["video"]["media"]["video"]["width"] = 1280
+    else:
+        record["video"][invalid] = 0 if invalid == "bytes" else "different"
+    write_json(record_path, record)
+    write_jsonl(args.eval_dataset, rows)
+    with pytest.raises(ValueError):
+        rl.prepare(args)
+    assert not (args.run_dir / "protocol.json").exists()
+
+
+def test_launcher_rejects_old_reference_pair_before_launch(prepared_rl, monkeypatch):
+    directory, _, prepared_args = prepared_rl
+    path = directory / "protocol.json"
+    protocol = read_json(path)
+    for sample in protocol["samples"]["val"]:
+        sample["references"]["prompt"] = sample["references"].pop("best_of_4")
+    write_json(path, protocol)
+    write_json(path.with_name("protocol-sha256.json"), fingerprint(protocol))
+    monkeypatch.setattr(rl.subprocess, "run", lambda *a, **k: pytest.fail("Must not launch with old references"))
+    args = rl.parse_args(["train", "--run-dir", str(directory), "--data-dir", str(prepared_args.data_dir)])
+    with pytest.raises(ValueError, match="Evaluation references changed; prepare a new run directory"):
+        rl.train(args)
+
+
 @pytest.mark.parametrize("changed", ["candidate", "reference", "evaluator"])
 def test_changed_artifacts_stop_before_judging(prepared_rl, tmp_path, monkeypatch, changed):
     directory, protocol, _ = prepared_rl
@@ -629,7 +715,7 @@ def test_changed_artifacts_stop_before_judging(prepared_rl, tmp_path, monkeypatc
     if changed == "candidate":
         path = Path(clips[0]["path"])
     elif changed == "reference":
-        path = Path(sample["references"]["prompt"]["path"])
+        path = Path(sample["references"]["best_of_4"]["path"])
     else:
         path = Path(protocol["eval_repo"]) / EXTERNAL_FILES[0]
     path.write_bytes(b"changed artifact")
@@ -674,7 +760,7 @@ def test_invalid_held_out_call_scores_zero_without_judge_requests(prepared_rl, m
         {
             "valid_call": 0.0,
             "judge_comparisons": 0,
-            "vs_prompt": 0.0,
+            "vs_best_of_4": 0.0,
             "vs_h3_context_ir": 0.0,
             "score": 0.0,
         }
@@ -1220,7 +1306,7 @@ async def test_held_out_success_returns_its_reward_record(native_worker, monkeyp
     from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
 
     worker, events, published = native_worker
-    reward = {"score": 0.75, "valid_call": 1.0, "vs_prompt": 1.0, "vs_h3_context_ir": 0.5}
+    reward = {"score": 0.75, "valid_call": 1.0, "vs_best_of_4": 1.0, "vs_h3_context_ir": 0.5}
 
     async def rollout(*args, **kwargs):
         return AgentLoopOutput(
@@ -1248,7 +1334,7 @@ def held_out_records(valid_scores, dropped):
         {
             "dropped": False,
             "sample_id": f"eval-{i}",
-            "rewards": [{"score": s, "valid_call": float(s > 0), "vs_prompt": s, "vs_h3_context_ir": s}],
+            "rewards": [{"score": s, "valid_call": float(s > 0), "vs_best_of_4": s, "vs_h3_context_ir": s}],
         }
         for i, s in enumerate(valid_scores)
     ]
@@ -1271,7 +1357,7 @@ def test_evaluation_summary_reports_valid_only_means_and_dropped_reasons():
 
     summary = evaluation_summary(5, held_out_records([1.0, 0.5, 0.0], dropped=1), 0.9)
     assert (summary["prompts"], summary["valid"], summary["dropped"]) == (4, 3, 1)
-    assert summary["score"] == summary["vs_prompt"] == summary["vs_h3_context_ir"] == pytest.approx(0.5)
+    assert summary["score"] == summary["vs_best_of_4"] == summary["vs_h3_context_ir"] == pytest.approx(0.5)
     # Invalid policy calls stay in the denominator with their zero score.
     assert summary["invalid_calls"] == 1
     assert summary["valid_fraction"] == 0.75 and summary["degraded"] is True
