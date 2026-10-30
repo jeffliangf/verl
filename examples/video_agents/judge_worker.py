@@ -13,6 +13,8 @@
 import argparse
 import math
 import socket
+import threading
+from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -103,12 +105,57 @@ def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0)
     runner.GeminiRestClient = TimedClient
 
 
+@contextmanager
+def parallel_pairs(runner, *, keep_uploaded_files=False):
+    """Schedule individual pairs, sharing uploads until all comparisons have settled."""
+    original_client, original_batches = runner.GeminiRestClient, runner.group_into_prompt_batches
+    uploads, lock = {}, threading.Lock()
+
+    class SharedUploads(original_client):
+        def upload_video(self, path):
+            key = str(Path(path).resolve())
+            with lock:
+                owner = key not in uploads
+                if owner:
+                    uploads[key] = Future()
+                future = uploads[key]
+            if owner:
+                try:
+                    future.set_result((self, super().upload_video(path)))
+                except BaseException as exc:
+                    future.set_exception(exc)
+            return future.result()[1]
+
+        def delete_file(self, name):
+            # The runner calls this after each batch. Other pairs still need the
+            # file, so cleanup belongs after its thread pool has joined.
+            return None
+
+    def batches(pairs, batch_size):
+        return [([pair[1]["prompt_id"]], [pair]) for pair in pairs]
+
+    runner.GeminiRestClient, runner.group_into_prompt_batches = SharedUploads, batches
+    try:
+        yield
+    finally:
+        runner.GeminiRestClient, runner.group_into_prompt_batches = original_client, original_batches
+        if not keep_uploaded_files:
+            for future in uploads.values():
+                if future.done() and future.exception() is None:
+                    client, file_object = future.result()
+                    try:
+                        original_client.delete_file(client, file_object["name"])
+                    except runner.EvalError:
+                        print("Warning: Gemini file cleanup failed after the comparisons settled.", flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--timings", type=Path, required=True)
     parser.add_argument("--file-control-timeout", type=float, default=30.0)
     parser.add_argument("--address-family", choices=("ipv4", "auto"), default="ipv4")
+    parser.add_argument("--parallel-pairs", action="store_true")
     args, forwarded = parser.parse_known_args(argv)
     if not math.isfinite(args.file_control_timeout) or args.file_control_timeout <= 0:
         parser.error("--file-control-timeout must be finite and positive")
@@ -116,6 +163,9 @@ def main(argv=None):
     instrument_client(runner, args.timings, args.file_control_timeout)
     record_event(args.timings, "gemini_network", "configured", address_family=args.address_family)
     with gemini_address_family(args.address_family):
+        if args.parallel_pairs:
+            with parallel_pairs(runner, keep_uploaded_files="--keep-uploaded-files" in forwarded):
+                return runner.main(forwarded)
         return runner.main(forwarded)
 
 

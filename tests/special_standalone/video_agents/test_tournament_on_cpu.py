@@ -150,9 +150,9 @@ def prepared_rl(tmp_path):
     return directory, tournament.runtime_protocol(tournament.load_protocol(directory / "protocol.json"), VIDEO_RL), args
 
 
-def candidates(tmp_path, invalid=()):
+def candidates(tmp_path, invalid=(), group_size=4):
     result = []
-    for i in range(4):
+    for i in range(group_size):
         if i in invalid:
             result.append({"status": "invalid_call"})
         else:
@@ -238,6 +238,66 @@ def test_six_pairs_twelve_votes_and_native_grpo(prepared_rl, tmp_path):
         torch.tensor(scores).unsqueeze(-1), torch.ones(4, 1), np.array(["same"] * 4)
     )
     assert advantages[:, 0].tolist() == pytest.approx([1.161895, 0.387298, -0.387298, -1.161895], abs=1e-5)
+
+
+@pytest.mark.parametrize("invalid", [(), (5,), (1, 2, 3, 4, 5), (0, 1, 2, 3, 4, 5)])
+def test_six_candidates_have_thirty_votes_and_normalized_forfeits(prepared_rl, tmp_path, invalid):
+    _, original, _ = prepared_rl
+    protocol = {**original, "group_size": 6}
+    clips = candidates(tmp_path, invalid, group_size=6)
+    manifests = tournament.tournament_manifests(protocol["samples"]["train"][0], clips, protocol)
+    count = (6 - len(invalid)) * (5 - len(invalid))
+    assert sum(len(m["pairs"]) for m in manifests.values()) == count
+    rewards = tournament.tournament_rewards(clips, manifests, votes(manifests))
+    assert [r["score"] for r in rewards] == pytest.approx([1 - i / 5 if i not in invalid else -1 for i in range(6)])
+    assert all(r["judge_comparisons"] == r["judge_completed_comparisons"] == count for r in rewards)
+    with pytest.raises(ValueError, match="exactly 6"):
+        tournament.tournament_manifests(protocol["samples"]["train"][0], clips[:4], protocol)
+
+
+def test_six_candidate_preparation_preview_and_parallel_judging(fresh_args, monkeypatch):
+    args = fresh_args
+    args.group_size = 6
+    rl.prepare(args)
+    monkeypatch.setattr(rl.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected paid work"))
+    launch = rl.parse_args(
+        [
+            "train",
+            "--run-dir",
+            str(args.run_dir),
+            "--data-dir",
+            str(args.data_dir),
+            "--",
+            "actor_rollout_ref.rollout.n=6",
+            "video_rl.judge_concurrency=15",
+        ]
+    )
+    summary = rl.train(launch)
+    assert (summary["videos_per_training_batch"], summary["judgments_per_training_batch"]) == (96, 480)
+    config, _ = rl.training_config(launch)
+    runtime = tournament.runtime_protocol(tournament.load_protocol(args.run_dir / "protocol.json"), config.video_rl)
+    for pairs, expected in [(set(range(15)), "15"), ({"remaining"}, "1")]:
+        command = judge.command(args.run_dir, runtime, "original", pairs, allow_fallback=True)
+        assert command[command.index("--concurrency") + 1] == expected
+        assert "--parallel-pairs" in command
+    launch.overrides = ["actor_rollout_ref.rollout.n=4"]
+    with pytest.raises(ValueError, match="6 training rollouts"):
+        rl.training_config(launch)
+
+
+@pytest.mark.parametrize("value", [0, 1, True, 6.0, "6", None])
+def test_invalid_group_sizes_are_rejected(fresh_args, value):
+    fresh_args.group_size = value
+    with pytest.raises(ValueError, match="group_size"):
+        rl.prepare(fresh_args)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "15"])
+def test_invalid_judge_concurrency_is_rejected(prepared_rl, value):
+    settings = OmegaConf.to_container(VIDEO_RL, resolve=False)
+    settings["judge_concurrency"] = value
+    with pytest.raises(ValueError, match="judge_concurrency"):
+        tournament.runtime_protocol(prepared_rl[1], settings)
 
 
 def test_order_disagreement_is_split_and_equal_groups_have_no_signal(prepared_rl, tmp_path):
@@ -782,7 +842,7 @@ def test_launcher_preview_uses_base_model_and_never_executes(prepared_rl, monkey
     assert config.trainer.use_v1 and config.trainer.v1.trainer_mode == "sync"
     assert config.actor_rollout_ref.rollout.agent.agent_loop_manager_class.endswith("TournamentManager")
     args.overrides = ["actor_rollout_ref.rollout.n=8"]
-    with pytest.raises(ValueError, match="four training rollouts"):
+    with pytest.raises(ValueError, match="4 training rollouts"):
         rl.training_config(args)
 
 
@@ -1161,8 +1221,11 @@ def native_worker(prepared_rl, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("group_size", [4, 6])
 @pytest.mark.parametrize("failure", [None, "rollout", "judge", "h3_provider", "judge_provider", "mixed"])
-async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(native_worker, monkeypatch, failure):
+async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(
+    native_worker, monkeypatch, failure, group_size
+):
     import numpy as np
 
     from examples.video_agents import agent
@@ -1170,6 +1233,9 @@ async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(n
     from verl.utils.tensordict_utils import assign_non_tensor_data, get_tensordict
 
     worker, events, published = native_worker
+    worker.protocol["group_size"] = group_size
+    worker.config.actor_rollout_ref.rollout.n = group_size
+    scores = [1 - i / (group_size - 1) for i in range(group_size - 1)] + [-1]
     settled = set()
 
     async def rollout(*args, session_id, **kwargs):
@@ -1192,13 +1258,13 @@ async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(n
         )
 
     def score(*args, **kwargs):
-        assert settled == set(range(4)) and not published
+        assert settled == set(range(group_size)) and not published
         events.append("score")
         if failure == "judge":
             raise RuntimeError("Gemini interrupted")
         if failure == "judge_provider":
             raise ProviderError("gemini", "Gemini timed out")
-        return [{"score": s, "valid_call": 1.0} for s in [1, 2 / 3, 1 / 3, -1]]
+        return [{"score": s, "valid_call": 1.0} for s in scores]
 
     monkeypatch.setattr(worker, "_run_agent_loop", rollout)
     monkeypatch.setattr(agent, "score_group", score)
@@ -1213,7 +1279,7 @@ async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(n
     if failure in {"h3_provider", "judge_provider"}:
         dropped = await worker.generate_sequences(batch)
         assert len(dropped) == 1 and dropped[0]["dropped"] is True
-        assert settled == set(range(4))
+        assert settled == set(range(group_size))
         assert not published and events[-1] == "failure"
         assert not list(worker.output_dir.rglob("rewards.json"))
         failure = read_json(next(worker.output_dir.rglob("failure.json")))
@@ -1224,19 +1290,19 @@ async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(n
     elif failure:
         with pytest.raises((RuntimeError, ValueError), match="Corrupted|interrupted"):
             await worker.generate_sequences(batch)
-        assert settled == set(range(4))
+        assert settled == set(range(group_size))
         assert not published and events[-1] == "failure"
     else:
         records = await worker.generate_sequences(batch)
         assert [(r["dropped"], r["sample_id"]) for r in records] == [(False, "train-0")]
-        assert [r["score"] for r in records[0]["rewards"]] == pytest.approx([1, 2 / 3, 1 / 3, -1])
-        assert events == ["running", "score", *(["publish"] * 4), "finished"]
+        assert [r["score"] for r in records[0]["rewards"]] == pytest.approx(scores)
+        assert events == ["running", "score", *(["publish"] * group_size), "finished"]
         end = [row for row in read_jsonl(worker.output_dir / "timings.jsonl") if row["event"] == "end"][-1]
-        assert end["status"] == "succeeded" and end["scores"] == pytest.approx([1, 2 / 3, 1 / 3, -1])
+        assert end["status"] == "succeeded" and end["scores"] == pytest.approx(scores)
         for i, row in enumerate(published):
             assert row["keys"] == [f"uid0_{i}_0"]
             fields = row["fields"]
-            assert fields["rm_scores"][0].sum().item() == pytest.approx([1, 2 / 3, 1 / 3, -1][i])
+            assert fields["rm_scores"][0].sum().item() == pytest.approx(scores[i])
             assert fields["loss_mask"][0].tolist() == [1, 1, 0]
             assert fields["rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2, 0])
             assert fields["extra_fields"][0]["reward_extra_info"]["valid_call"] == 1

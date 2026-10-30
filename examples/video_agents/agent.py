@@ -31,7 +31,7 @@ from .config import REFERENCE_FIELDS
 from .h3 import generation_slot
 from .observability import ProviderError, failure_record, record_event, timed_stage
 from .storage import item_key, write_json
-from .tournament import GROUP_SIZE, generate_video, load_protocol, runtime_protocol, score_group
+from .tournament import generate_video, load_protocol, runtime_protocol, score_group
 
 # Decoded tokens kept with an invalid call, so the policy's actual output can be read.
 RESPONSE_TAIL_TOKENS = 512
@@ -266,10 +266,12 @@ class TournamentWorker(AgentLoopWorkerTQBase):
     async def _run_group(self, prompt, sampling_params, trajectory, trace, directory):
         uid, validate = prompt["uid"], trajectory["validate"]
         partition = "val" if validate else "train"
-        expected_n = 1 if validate else GROUP_SIZE
+        expected_n = 1 if validate else self.protocol["group_size"]
         n = prompt.pop("__rollout_n__", expected_n)
         if n != expected_n or not prompt.pop("__do_sample__", True):
-            raise ValueError("Use four sampled training rollouts and one held-out rollout")
+            raise ValueError(
+                f"Use {expected_n} sampled rollouts for this {'validation' if validate else 'training'} group"
+            )
         sample = self.samples[partition][prompt["extra_info"]["id"]]
         await tq.async_kv_put(key=uid, partition_id=partition, tag={"status": "running"})
         try:
@@ -364,8 +366,9 @@ class TournamentManager(AgentLoopManagerTQ):
         super().__init__(*args, **kwargs)
         if not self.config.trainer.use_v1 or self.config.trainer.v1.trainer_mode != "sync":
             raise ValueError("H3 tournaments require the native synchronous V1 trainer")
-        if self.rollout_config.n != GROUP_SIZE or self.rollout_config.val_kwargs.n != 1:
-            raise ValueError("Use rollout.n=4 and rollout.val_kwargs.n=1")
+        group_size = load_protocol(Path(self.config.video_rl.protocol))["group_size"]
+        if self.rollout_config.n != group_size or self.rollout_config.val_kwargs.n != 1:
+            raise ValueError(f"Use rollout.n={group_size} and rollout.val_kwargs.n=1")
         if self.config.video_rl.max_dropped_groups_per_step < 1:
             raise ValueError("video_rl.max_dropped_groups_per_step must be positive")
         self.reward_loop_worker_handles = None

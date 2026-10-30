@@ -107,7 +107,7 @@ def command(run_dir: Path, protocol: dict, order: str, pair_ids, *, allow_fallba
         "--seed",
         str(settings["seed"]),
         "--concurrency",
-        "1",
+        str(min(protocol.get("judge_concurrency", 1), max(1, len(pair_ids)))),
         "--request-timeout",
         str(timeouts["judge_request"]),
         "--file-timeout",
@@ -122,6 +122,8 @@ def command(run_dir: Path, protocol: dict, order: str, pair_ids, *, allow_fallba
         "--all",
         "--execute",
     ]
+    if protocol.get("judge_concurrency", 1) > 1:
+        args.append("--parallel-pairs")
     if settings["max_output_tokens"] is not None:
         args.extend(["--max-output-tokens", str(settings["max_output_tokens"])])
     for pair_id in sorted(pair_ids):

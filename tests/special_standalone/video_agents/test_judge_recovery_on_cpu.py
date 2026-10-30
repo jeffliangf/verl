@@ -10,6 +10,8 @@
 # limitations under the License.
 """Check neutral scoring and real evaluator retry behavior without provider calls."""
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +19,51 @@ import pytest
 from examples.video_agents import judge, judge_worker, scoring
 from examples.video_agents.config import CANDIDATE, DEFAULT_EVAL_REPO
 from examples.video_agents.storage import load_external, read_jsonl
+
+
+@pytest.mark.parametrize("fail_upload,keep", [(False, False), (True, False), (False, True)])
+def test_parallel_pairs_share_uploads_and_wait_to_delete(tmp_path, fail_upload, keep):
+    uploads, deleted, entered = [], [], threading.Barrier(2)
+
+    class Client:
+        def upload_video(self, path):
+            uploads.append(path)
+            if fail_upload:
+                raise RuntimeError("upload failed")
+            return {"name": "shared-file"}
+
+        def delete_file(self, name):
+            deleted.append(name)
+
+    original_batches = object()
+    runner = SimpleNamespace(
+        GeminiRestClient=Client, group_into_prompt_batches=original_batches, EvalError=RuntimeError
+    )
+    pairs = [(str(i), {"prompt_id": "same-prompt"}, "signature") for i in range(15)]
+    with judge_worker.parallel_pairs(runner, keep_uploaded_files=keep):
+        batches = runner.group_into_prompt_batches(pairs, 4)
+        assert len(batches) == 15
+        assert [pair for _, batch in batches for pair in batch] == pairs
+        client = runner.GeminiRestClient()
+
+        def compare():
+            entered.wait(timeout=5)
+            result = client.upload_video(tmp_path / "shared.mp4")
+            client.delete_file(result["name"])
+            assert not deleted
+            return result
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(compare) for _ in range(2)]
+            for future in futures:
+                if fail_upload:
+                    with pytest.raises(RuntimeError, match="upload failed"):
+                        future.result(timeout=10)
+                else:
+                    assert future.result(timeout=10) == {"name": "shared-file"}
+        assert len(uploads) == 1 and not deleted
+    assert deleted == ([] if fail_upload or keep else ["shared-file"])
+    assert runner.GeminiRestClient is Client and runner.group_into_prompt_batches is original_batches
 
 
 @pytest.mark.parametrize("first,second,expected", [(1, None, 0.75), (0, None, 0.25), (None, None, 0.5)])

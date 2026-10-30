@@ -37,7 +37,7 @@ from .storage import (
     run_lock,
     write_json,
 )
-from .tournament import GROUP_SIZE, load_protocol
+from .tournament import GROUP_SIZE, load_protocol, validate_group_size
 
 CONFIG_DIR = Path(__file__).with_name("configs")
 DEFAULT_DATA_DIR = ROOT / "data/prompt_rewrite_rl"
@@ -105,6 +105,7 @@ def tool_config(directory: Path, train_file: Path) -> dict:
 
 def prepare(args) -> dict:
     """Freeze data, tool schema, evaluation references, and provider settings offline."""
+    group_size = validate_group_size(args.group_size)
     directory = local_path(args.run_dir)
     data_dir = local_path(args.data_dir)
     train_file, val_file = local_path(args.train_file), local_path(args.eval_dataset)
@@ -126,7 +127,7 @@ def prepare(args) -> dict:
     protocol = {
         "schema_version": 2,
         "task": "h3_tournament",
-        "group_size": GROUP_SIZE,
+        "group_size": group_size,
         "samples": {"train": train, "val": val},
         "source_files": {str(path): file_sha256(path) for path in (train_file, val_file, references / "manifest.json")},
         "reference_manifest": str(references / "manifest.json"),
@@ -219,14 +220,15 @@ def training_config(args):
         or config.actor_rollout_ref.model.path != args.model
     ):
         raise ValueError("Evaluation loads --model and requires val_only, val_before_train, and resume_mode=disable")
+    group_size = load_protocol(directory / "protocol.json")["group_size"]
     if (
         not config.trainer.use_v1
         or config.trainer.v1.trainer_mode != "sync"
         or config.algorithm.adv_estimator != "grpo"
-        or config.actor_rollout_ref.rollout.n != GROUP_SIZE
+        or config.actor_rollout_ref.rollout.n != group_size
         or config.actor_rollout_ref.rollout.val_kwargs.n != 1
     ):
-        raise ValueError("Keep synchronous V1 GRPO, four training rollouts, and one validation rollout")
+        raise ValueError(f"Keep synchronous V1 GRPO, {group_size} training rollouts, and one validation rollout")
     multi_turn = config.actor_rollout_ref.rollout.multi_turn
     if multi_turn.max_assistant_turns is not None or multi_turn.max_user_turns is not None:
         raise ValueError("The terminal H3 loop enforces its own turn limit after executing the tool")
@@ -335,8 +337,10 @@ def train(args) -> dict:
         "reference_h3": protocol["reference_h3"],
         "train_prompts": len(protocol["samples"]["train"]),
         "eval_prompts": len(protocol["samples"]["val"]),
-        "videos_per_training_batch": 0 if evaluation else GROUP_SIZE * batch,
-        "judgments_per_training_batch": 0 if evaluation else GROUP_SIZE * (GROUP_SIZE - 1) * batch,
+        "videos_per_training_batch": 0 if evaluation else protocol["group_size"] * batch,
+        "judgments_per_training_batch": 0
+        if evaluation
+        else protocol["group_size"] * (protocol["group_size"] - 1) * batch,
         "videos_per_evaluation": len(protocol["samples"]["val"]),
         "judgments_per_evaluation": 4 * len(protocol["samples"]["val"]),
         "execute": args.execute,
@@ -367,6 +371,7 @@ def parse_args(argv=None):
     prep.add_argument("--eval-repo", type=Path, default=DEFAULT_EVAL_REPO)
     h3.add_arguments(prep)
     prep.add_argument("--poll-interval", type=float, default=1)
+    prep.add_argument("--group-size", type=int, default=GROUP_SIZE)
     prep.add_argument("--groups-per-worker", type=int, default=5)
     prep.add_argument("--h3-concurrency-per-worker", type=int, default=5)
     status = commands.add_parser("status", help="Read H3 readiness and any reported model provenance; no generation")

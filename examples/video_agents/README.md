@@ -69,14 +69,19 @@ service settings, not policy arguments.
 
 ## Rewards and validation
 
-For each training prompt, sample four trajectories. Compare every valid pair of
+For each training prompt, sample four trajectories by default. Compare every valid pair of
 videos in both presentation orders, giving at most six pairs and twelve Gemini
 judgments. A pair earns 1 for two wins, 0.5 for an order disagreement, or 0 for two
-losses. Each candidate's reward is its total points divided by three.
+losses. Each candidate's reward is its total points divided by the group size minus one.
+To use six candidates, prepare a new run with `--group-size 6` and train with
+`actor_rollout_ref.rollout.n=6`. This produces 15 pairs and 30 judgments per prompt,
+or 96 videos and 480 judgments for 16 prompt groups. The frozen protocol and rollout
+count must agree. Existing model and optimizer checkpoints can be restored with the
+new group size; keep the per-GPU microbatch and inference memory limits unchanged.
 
 An invalid tool call earns -1 and forfeits its pairings against valid calls.
 Equal-reward groups have no GRPO learning signal. During training, an H3 service
-failure or timeout drops the whole four-rollout prompt group. No trajectories or
+failure or timeout drops the whole prompt group. No trajectories or
 rewards from that group enter the optimizer. Native
 `trainer.v1.sampler.sync_refill_failed_groups=true` replaces it with a fresh group
 under the same policy weights, preserving the training batch size. Sibling
@@ -183,6 +188,13 @@ and honors `Retry-After`, while the 300-second presentation-order deadline still
 bounds the subprocess and is not reset by retries. A timed-out interaction may
 already have completed remotely, so its retry can incur a duplicate Gemini charge.
 Retrying a judgment does not regenerate or re-upload its H3 videos.
+
+`video_rl.judge_concurrency` defaults to 1. Set it to 15 to run the matchups of a
+six-candidate group concurrently within each presentation order. The adapter splits
+the evaluator's prompt batches into individual comparisons, shares each video upload,
+and deletes uploaded files after all comparisons settle. This is a per-subprocess
+limit; 16 active groups can make up to 240 comparisons concurrently. Both orders,
+retry budgets, fallback rules, and the pass deadline remain in effect.
 
 Neutral decisions are identity-checked and persisted separately in
 `judge/fallbacks-<order>.json`, with the policy version and failure reason. They

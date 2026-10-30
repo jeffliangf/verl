@@ -44,6 +44,10 @@ video_rl:
   # network failures, including judgments. Each pass still has a hard deadline.
   judge_max_attempts: 3
 
+  # Comparisons run concurrently within each presentation order of a group.
+  # This limit is per judge subprocess, not shared across rollout groups.
+  judge_concurrency: 1
+
   # Training only: missing judgments contribute half a vote, with provenance.
   # Set to drop to restore group replacement. Validation always requires real votes.
   judge_failure_policy: neutral

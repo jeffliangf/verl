@@ -38,14 +38,22 @@ def load_protocol(path: Path) -> dict:
     protocol = read_json(path)
     if read_json(path.with_name("protocol-sha256.json")) != fingerprint(protocol):
         raise ValueError("RL protocol changed; prepare a new run directory")
-    if protocol.get("task") != "h3_tournament" or protocol.get("group_size") != GROUP_SIZE:
-        raise ValueError("Expected a four-candidate H3 tournament protocol")
+    if protocol.get("task") != "h3_tournament":
+        raise ValueError("Expected an H3 tournament protocol")
+    validate_group_size(protocol.get("group_size"))
     if protocol.get("h3_backend") != h3.BACKEND:
         raise ValueError("Expected a self-hosted Sol-H3 protocol; the H3 Max API is disabled")
     if any(set(sample.get("references", {})) != set(REFERENCE_FIELDS) for sample in protocol["samples"]["val"]):
         raise ValueError("Evaluation references changed; prepare a new run directory with Context-IR and best-of-4")
     check_dependencies(protocol)
     return protocol
+
+
+def validate_group_size(value) -> int:
+    """Require at least two siblings so every valid candidate has an opponent."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+        raise ValueError("Tournament group_size must be an integer of at least 2")
+    return value
 
 
 def runtime_protocol(protocol: dict, settings) -> dict:
@@ -59,6 +67,9 @@ def runtime_protocol(protocol: dict, settings) -> dict:
     attempts = settings.get("judge_max_attempts")
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
         raise ValueError("video_rl.judge_max_attempts must be a positive integer")
+    concurrency = settings.get("judge_concurrency", 1)
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+        raise ValueError("video_rl.judge_concurrency must be a positive integer")
     policy = settings.get("judge_failure_policy", "drop")
     if policy not in {"drop", "neutral"}:
         raise ValueError("video_rl.judge_failure_policy must be drop or neutral")
@@ -75,6 +86,7 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         **h3.recovery_settings(settings),
         "timeouts": timeouts,
         "judge_max_attempts": attempts,
+        "judge_concurrency": concurrency,
         "judge_failure_policy": policy,
         "max_judge_fallback_fraction": fraction,
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
@@ -154,11 +166,12 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
 
 
 def tournament_manifests(sample: dict, candidates: list[dict], protocol: dict) -> dict:
-    """Build six unordered matchups and their reverse orientations."""
-    if len(candidates) != GROUP_SIZE:
-        raise ValueError("Training requires exactly four candidate trajectories")
+    """Build every unordered matchup and its reverse orientation."""
+    group_size = validate_group_size(protocol["group_size"])
+    if len(candidates) != group_size:
+        raise ValueError(f"Training requires exactly {group_size} candidate trajectories")
     pairs = {}
-    for i, j in itertools.combinations(range(GROUP_SIZE), 2):
+    for i, j in itertools.combinations(range(group_size), 2):
         if candidates[i]["status"] != "succeeded" or candidates[j]["status"] != "succeeded":
             continue
         pairs[f"{i}_vs_{j}"] = {
@@ -284,8 +297,9 @@ def judgment_failure(path: Path, pair_ids: set, log_path: Path) -> str:
 
 def tournament_rewards(candidates: list[dict], manifests: dict, judgments: dict) -> list[dict]:
     """Average pair wins, with explicit forfeits for invalid policy calls."""
+    group_size = validate_group_size(len(candidates))
     valid = [c["status"] == "succeeded" for c in candidates]
-    invalid_count = GROUP_SIZE - sum(valid)
+    invalid_count = group_size - sum(valid)
     points = [float(invalid_count) if ok else 0.0 for ok in valid]
     pairs = manifests["original"]["pairs"]
     split_count = real_pairs = fallback_count = 0
@@ -300,7 +314,7 @@ def tournament_rewards(candidates: list[dict], manifests: dict, judgments: dict)
         if not result["fallback_count"]:
             real_pairs += 1
             split_count += result["outcome"] == "split"
-    rewards = [point / (GROUP_SIZE - 1) if ok else INVALID_REWARD for point, ok in zip(points, valid, strict=True)]
+    rewards = [point / (group_size - 1) if ok else INVALID_REWARD for point, ok in zip(points, valid, strict=True)]
     return [
         {
             "score": reward,
