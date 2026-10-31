@@ -30,7 +30,7 @@ def ledger(tmp_path):
                 "id": "sample",
                 "prompt": "The original request",
                 "source": "aa_eval",
-                "references": {name: {"path": name + ".mp4"} for name in ("h3_context_ir", "best_of_4")},
+                "references": {name: {"path": name + ".mp4"} for name in ("h3_context_ir", "best_of_4", "best_of_16")},
             }
         ],
     }
@@ -69,14 +69,14 @@ def test_interrupted_ledger_keeps_completed_votes_and_can_resume(ledger, fragmen
         handle.write(fragment)
     before = path.read_bytes()
     completed, counts = judge.read_judgments(*ledger)
-    assert len(completed) == 1 and counts["malformed_lines"] == 1
+    assert len(completed) == len(rows) and counts["malformed_lines"] == 1
     assert path.read_bytes() == before
     assert set(completed) < set(manifest["pairs"])
     with path.open("ab") as handle:
         handle.write(b"\n" + json.dumps(missing).encode() + b"\n")
     completed, counts = judge.read_judgments(*ledger)
     assert set(completed) == set(manifest["pairs"])
-    assert counts == {"completed": 2, "malformed_lines": 1}
+    assert counts == {"completed": len(manifest["pairs"]), "malformed_lines": 1}
 
 
 @pytest.mark.parametrize(

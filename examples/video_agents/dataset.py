@@ -8,7 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Read evaluation samples and verify the provenance of both reference videos."""
+"""Read evaluation samples and verify the provenance of their reference videos."""
 
 from pathlib import Path
 
@@ -73,6 +73,86 @@ def best_of_4_reference(row: dict, profile: dict, probe) -> dict:
     return {"path": str(path), "sha256": digest}
 
 
+def best_of_16_reference(row: dict, profile: dict, probe) -> dict:
+    """Verify the exported final winner and its four groups of four H3 lanes.
+
+    The exporter selects each group's winner, then compares those four winners.
+    This is a hierarchical best-of-16, not a full 16-way round robin.
+    """
+    field = REFERENCE_VIDEO_FIELDS["best_of_16"]
+    if not isinstance(row.get(field), str) or not row[field].strip():
+        raise ValueError(f"Missing reference video field: {row['id']}/{field}")
+    path = Path(row[field]).expanduser().resolve()
+    root, item = path.parent.parent.parent, path.parent.name
+    record = read_json(root / "finals" / item / "best_of_16.json")
+    if (
+        record.get("id") != row["id"]
+        or record.get("prompt") != row["prompt"]
+        or record.get("status") != "succeeded"
+        or record.get("best_of") != 16
+    ):
+        raise ValueError(f"Best-of-16 final is incomplete or differs from dataset: {row['id']}")
+    candidates = record.get("candidates", [])
+    if len(candidates) != 4 or [c.get("group") for c in candidates] != [1, 2, 3, 4]:
+        raise ValueError(f"Best-of-16 requires four ordered group winners: {row['id']}")
+    all_models = set()
+    for candidate in candidates:
+        group = candidate["group"]
+        group_path = root / "items" / f"{item}.json" if group == 1 else root / "groups" / item / f"g{group}.json"
+        source = read_json(group_path)
+        lanes = source.get("lanes", [])
+        models = {lane.get("model_id") for lane in lanes}
+        winner = candidate.get("model_id")
+        if (
+            source.get("id") != row["id"]
+            or source.get("prompt") != row["prompt"]
+            or source.get("status") != "succeeded"
+            or source.get("group", 1) != group
+            or len(lanes) != 4
+            or len(models) != 4
+            or not all(isinstance(model, str) and model for model in models)
+            or all_models & models
+            or winner not in models
+            or source.get("winner_model_id") != winner
+            or (source.get("selection") or {}).get("selected_model") != winner
+            or any(
+                lane.get("status") != "completed" or lane.get("processing_path") != "context-ir-sol-h3-native"
+                for lane in lanes
+            )
+        ):
+            raise ValueError(f"Best-of-16 group {group} has invalid provenance: {row['id']}")
+        all_models.update(models)
+        clip = root / "artifacts" / item / winner / "sol-h3.mp4"
+        source_video = source.get("video" if group == 1 else "winner_clip") or {}
+        if (
+            Path(candidate.get("path", "")).expanduser().resolve() != clip
+            or candidate.get("sha256") != file_sha256(clip)
+            or source_video.get("sha256") != candidate["sha256"]
+            or (group != 1 and Path(source_video.get("path", "")).expanduser().resolve() != clip)
+        ):
+            raise ValueError(f"Best-of-16 group {group} winner clip changed: {row['id']}")
+    winner = record.get("winner_model_id")
+    selected = next((c for c in candidates if c["model_id"] == winner), None)
+    if (
+        selected is None
+        or record.get("winner_group") != selected["group"]
+        or (record.get("selection") or {}).get("selected_model") != winner
+    ):
+        raise ValueError(f"Best-of-16 final winner differs from selection: {row['id']}")
+    video = record.get("video") or {}
+    digest = file_sha256(path)
+    if (
+        Path(video.get("path", "")).expanduser().resolve() != path
+        or video.get("sha256") != digest
+        or selected["sha256"] != digest
+        or video.get("bytes") != path.stat().st_size
+    ):
+        raise ValueError(f"Best-of-16 reference differs from its winner: {path}")
+    if h3.media_profile(probe(path)) != profile or h3.media_profile(video.get("media", {})) != profile:
+        raise ValueError(f"Best-of-16 media differs from its record or Context-IR reference: {path}")
+    return {"path": str(path), "sha256": digest}
+
+
 def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[list[dict], dict]:
     """Verify request texts, completed state, bytes, checksums, and media formats.
 
@@ -106,6 +186,9 @@ def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[l
         for field in REFERENCE_FIELDS:
             if field == "best_of_4":
                 references[field] = best_of_4_reference(row, manifest["media_profile"], probe)
+                continue
+            if field == "best_of_16":
+                references[field] = best_of_16_reference(row, manifest["media_profile"], probe)
                 continue
             task = tasks.get((row["id"], field))
             if task is None or task["request"] != h3.request_body(row[field], manifest["settings"]):

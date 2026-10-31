@@ -116,6 +116,50 @@ def prepared_rl(tmp_path):
             },
         )
         row[REFERENCE_VIDEO_FIELDS["best_of_4"]] = str(video)
+        group_one = read_json(best_of_4 / "items" / f"{row['id']}.json")
+        finalists = []
+        for group in range(1, 5):
+            winner = f"minimax-h3-sol-repeat{group * 4}"
+            clip = best_of_4 / "artifacts" / row["id"] / winner / "sol-h3.mp4"
+            clip.parent.mkdir(parents=True, exist_ok=True)
+            clip.write_bytes(video.read_bytes() if group == 1 else f"group {group} winner {i}".encode())
+            candidate = {"group": group, "model_id": winner, "path": str(clip), "sha256": file_sha256(clip)}
+            finalists.append(candidate)
+            if group > 1:
+                record = copy.deepcopy(group_one)
+                record.pop("video")
+                record.update(
+                    group=group,
+                    winner_model_id=winner,
+                    selection={"selected_model": winner},
+                    winner_clip={"path": str(clip), "sha256": candidate["sha256"]},
+                )
+                for index, lane in enumerate(record["lanes"], start=(group - 1) * 4 + 1):
+                    lane["model_id"] = f"minimax-h3-sol-repeat{index}"
+                write_json(best_of_4 / "groups" / row["id"] / f"g{group}.json", record)
+        selected = finalists[1]
+        final_video = video.with_name("best_of_16.mp4")
+        final_video.write_bytes(Path(selected["path"]).read_bytes())
+        write_json(
+            best_of_4 / "finals" / row["id"] / "best_of_16.json",
+            {
+                "id": row["id"],
+                "prompt": row["prompt"],
+                "status": "succeeded",
+                "best_of": 16,
+                "candidates": finalists,
+                "winner_model_id": selected["model_id"],
+                "winner_group": 2,
+                "selection": {"selected_model": selected["model_id"]},
+                "video": {
+                    "path": str(final_video),
+                    "sha256": file_sha256(final_video),
+                    "bytes": final_video.stat().st_size,
+                    "media": MEDIA,
+                },
+            },
+        )
+        row[REFERENCE_VIDEO_FIELDS["best_of_16"]] = str(final_video)
         rows.append(row)
     write_json(references / "manifest.json", manifest)
     train_file, val_file = tmp_path / "train.jsonl", tmp_path / "eval.jsonl"
@@ -300,6 +344,41 @@ def test_invalid_judge_concurrency_is_rejected(prepared_rl, value):
         tournament.runtime_protocol(prepared_rl[1], settings)
 
 
+def test_eight_candidate_two_node_batch_and_rewards(fresh_args, monkeypatch, tmp_path):
+    args = fresh_args
+    args.group_size = 8
+    rows = read_jsonl(args.train_file)
+    write_jsonl(args.train_file, rows + [{**r, "id": r["id"] + "-repeat"} for r in rows])
+    rl.prepare(args)
+    monkeypatch.setattr(rl.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected paid work"))
+    launch = rl.parse_args(
+        [
+            "train",
+            "--run-dir",
+            str(args.run_dir),
+            "--data-dir",
+            str(args.data_dir),
+            "--",
+            "actor_rollout_ref.rollout.n=8",
+            "video_rl.judge_concurrency=28",
+            "data.train_batch_size=32",
+            "actor_rollout_ref.actor.ppo_mini_batch_size=32",
+            "trainer.nnodes=2",
+        ]
+    )
+    summary = rl.train(launch)
+    assert (summary["videos_per_training_batch"], summary["judgments_per_training_batch"]) == (256, 1792)
+    config, _ = rl.training_config(launch)
+    protocol = tournament.runtime_protocol(tournament.load_protocol(args.run_dir / "protocol.json"), config.video_rl)
+    clips = candidates(tmp_path, group_size=8)
+    manifests = tournament.tournament_manifests(protocol["samples"]["train"][0], clips, protocol)
+    assert all(len(manifest["pairs"]) == 28 for manifest in manifests.values())
+    rewards = tournament.tournament_rewards(clips, manifests, votes(manifests))
+    assert [r["score"] for r in rewards] == pytest.approx([1 - i / 7 for i in range(8)])
+    command = judge.command(args.run_dir, protocol, "original", manifests["original"]["pairs"], allow_fallback=True)
+    assert command[command.index("--concurrency") + 1] == "28"
+
+
 def test_order_disagreement_is_split_and_equal_groups_have_no_signal(prepared_rl, tmp_path):
     _, protocol, _ = prepared_rl
     clips = candidates(tmp_path)
@@ -373,17 +452,23 @@ def test_judge_runner_reuses_all_completed_comparisons(prepared_rl, tmp_path, mo
     assert [r["score"] for r in first] == pytest.approx([1, 2 / 3, 1 / 3, 0])
 
 
-def test_held_out_scoring_uses_both_fixed_references(prepared_rl, tmp_path, monkeypatch):
+def test_held_out_scoring_uses_three_fixed_references(prepared_rl, tmp_path, monkeypatch):
     directory, protocol, _ = prepared_rl
     calls = install_judge(monkeypatch)
     rewards = tournament.score_group(
         directory / "eval-group", protocol, protocol["samples"]["val"][0], candidates(tmp_path)[:1], validate=True
     )
-    assert rewards[0]["vs_best_of_4"] == rewards[0]["vs_h3_context_ir"] == rewards[0]["score"] == 1
+    assert (
+        rewards[0]["vs_best_of_16"]
+        == rewards[0]["vs_best_of_4"]
+        == rewards[0]["vs_h3_context_ir"]
+        == rewards[0]["score"]
+        == 1
+    )
     assert "vs_prompt" not in rewards[0]
-    assert sum(c.count("--pair-id") for c in calls) == 4
+    assert sum(c.count("--pair-id") for c in calls) == 6
     manifest = read_json(directory / "eval-group/judge/manifest-original.json")
-    assert {p["reference"] for p in manifest["pairs"].values()} == {"h3_context_ir", "best_of_4"}
+    assert {p["reference"] for p in manifest["pairs"].values()} == {"h3_context_ir", "best_of_4", "best_of_16"}
     assert all(p["prompt"] == "Original 0" for p in manifest["pairs"].values())
 
 
@@ -719,7 +804,7 @@ def test_prepare_excludes_original_prompt_videos(fresh_args):
     write_jsonl(args.eval_dataset, rows)
     rl.prepare(args)
     samples = tournament.load_protocol(args.run_dir / "protocol.json")["samples"]["val"]
-    assert all(set(sample["references"]) == {"h3_context_ir", "best_of_4"} for sample in samples)
+    assert all(set(sample["references"]) == {"h3_context_ir", "best_of_4", "best_of_16"} for sample in samples)
 
 
 @pytest.mark.parametrize(
@@ -751,6 +836,79 @@ def test_prepare_rejects_mismatched_best_of_4_provenance(fresh_args, invalid):
     with pytest.raises(ValueError):
         rl.prepare(args)
     assert not (args.run_dir / "protocol.json").exists()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_field",
+        "id",
+        "prompt",
+        "status",
+        "best_of",
+        "finalists",
+        "winner",
+        "winner_group",
+        "group_prompt",
+        "group_lanes",
+        "group_backend",
+        "duplicate_lane",
+        "group_selection",
+        "candidate_hash",
+        "candidate_path",
+        "winner_clip",
+        "final_clip",
+        "media",
+        "missing_group",
+    ],
+)
+def test_best_of_16_requires_complete_linked_provenance(fresh_args, damage):
+    rows = read_jsonl(fresh_args.eval_dataset)
+    row = rows[0]
+    video = Path(row[REFERENCE_VIDEO_FIELDS["best_of_16"]])
+    root, item = video.parent.parent.parent, video.parent.name
+    final_path = root / "finals" / item / "best_of_16.json"
+    group_path = root / "groups" / item / "g2.json"
+    final, group = read_json(final_path), read_json(group_path)
+    if damage == "missing_field":
+        row.pop(REFERENCE_VIDEO_FIELDS["best_of_16"])
+    elif damage in {"id", "prompt", "status", "best_of"}:
+        final[damage] = "wrong"
+    elif damage == "finalists":
+        final["candidates"].pop()
+    elif damage == "winner":
+        final["selection"]["selected_model"] = "minimax-h3-sol-repeat4"
+    elif damage == "winner_group":
+        final["winner_group"] = 1
+    elif damage == "group_prompt":
+        group["prompt"] = "different request"
+    elif damage == "group_lanes":
+        group["lanes"].pop()
+    elif damage == "group_backend":
+        group["lanes"][0]["processing_path"] = "wrong backend"
+    elif damage == "duplicate_lane":
+        group["lanes"][0]["model_id"] = "minimax-h3-sol-repeat1"
+    elif damage == "group_selection":
+        group["selection"]["selected_model"] = "minimax-h3-sol-repeat5"
+    elif damage == "candidate_hash":
+        final["candidates"][1]["sha256"] = "wrong"
+    elif damage == "candidate_path":
+        final["candidates"][1]["path"] = str(video)
+    elif damage == "winner_clip":
+        Path(final["candidates"][1]["path"]).write_bytes(b"changed")
+    elif damage == "final_clip":
+        video.write_bytes(b"a different clip with a self-consistent record")
+        final["video"].update(sha256=file_sha256(video), bytes=video.stat().st_size)
+    elif damage == "media":
+        final["video"]["media"]["video"]["width"] = 1280
+    write_jsonl(fresh_args.eval_dataset, rows)
+    write_json(final_path, final)
+    write_json(group_path, group)
+    if damage == "missing_group":
+        group_path.unlink()
+    with pytest.raises((ValueError, FileNotFoundError)):
+        rl.prepare(fresh_args)
+    assert not (fresh_args.run_dir / "protocol.json").exists()
 
 
 def test_launcher_rejects_old_reference_pair_before_launch(prepared_rl, monkeypatch):
@@ -821,6 +979,7 @@ def test_invalid_held_out_call_scores_zero_without_judge_requests(prepared_rl, m
             "valid_call": 0.0,
             "judge_comparisons": 0,
             "vs_best_of_4": 0.0,
+            "vs_best_of_16": 0.0,
             "vs_h3_context_ir": 0.0,
             "score": 0.0,
         }
@@ -891,7 +1050,7 @@ def test_evaluate_uses_the_training_agent_and_isolates_checkpoint_artifacts(prep
     monkeypatch.setattr(rl.subprocess, "run", lambda command, **kwargs: calls.append((command, kwargs)))
     summary = rl.train(args)
     assert summary["videos_per_training_batch"] == summary["judgments_per_training_batch"] == 0
-    assert summary["videos_per_evaluation"] == 2 and summary["judgments_per_evaluation"] == 8
+    assert summary["videos_per_evaluation"] == 2 and summary["judgments_per_evaluation"] == 12
     assert len(calls) == 1 and "verl.trainer.main_ppo" in calls[0][0]
     assert calls[0][1]["env"]["TENSORBOARD_DIR"] == str(output / "tensorboard")
     assert read_json(output / "evaluation-config.json") == OmegaConf.to_container(evaluation, resolve=True)
@@ -1400,7 +1559,9 @@ def held_out_records(valid_scores, dropped):
         {
             "dropped": False,
             "sample_id": f"eval-{i}",
-            "rewards": [{"score": s, "valid_call": float(s > 0), "vs_best_of_4": s, "vs_h3_context_ir": s}],
+            "rewards": [
+                {"score": s, "valid_call": float(s > 0), "vs_best_of_4": s, "vs_best_of_16": s, "vs_h3_context_ir": s}
+            ],
         }
         for i, s in enumerate(valid_scores)
     ]
@@ -1423,7 +1584,13 @@ def test_evaluation_summary_reports_valid_only_means_and_dropped_reasons():
 
     summary = evaluation_summary(5, held_out_records([1.0, 0.5, 0.0], dropped=1), 0.9)
     assert (summary["prompts"], summary["valid"], summary["dropped"]) == (4, 3, 1)
-    assert summary["score"] == summary["vs_best_of_4"] == summary["vs_h3_context_ir"] == pytest.approx(0.5)
+    assert (
+        summary["score"]
+        == summary["vs_best_of_4"]
+        == summary["vs_best_of_16"]
+        == summary["vs_h3_context_ir"]
+        == pytest.approx(0.5)
+    )
     # Invalid policy calls stay in the denominator with their zero score.
     assert summary["invalid_calls"] == 1
     assert summary["valid_fraction"] == 0.75 and summary["degraded"] is True

@@ -8,7 +8,7 @@
       "properties": {
         "prompt": {
           "type": "string",
-          "description": "The complete video-generation prompt (1-8000 characters).",
+          "description": "Describe the video and audio while preserving the user's intent (1-8000 characters). Context-IR uses integrated_multimodal_description for visuals over time, overall_soundscape for sounds, and non_diegetic_music for music; use this structure when helpful.",
           "minLength": 1,
           "maxLength": 8000
         },

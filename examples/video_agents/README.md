@@ -61,6 +61,10 @@ schema from `configs/sol_h3_tool.json`), and `chat_template_kwargs` (thinking en
 reasoning effort `xhigh`). Training and evaluation consume those saved fields.
 Teacher rewrites and reference-video paths never enter the policy input.
 
+The tool's prompt argument briefly describes Context-IR's visual, soundscape,
+and music sections as optional guidance. It does not require that format or
+add a formatting reward.
+
 The only tool is `sol_h3(prompt, duration=10, seed=42)`. Its prompt must contain
 1–8,000 characters; duration is 5 or 10 seconds; seed is an integer from 0 through
 9223372036854775807. The model's chat template and verl's native `qwen3_coder`
@@ -78,6 +82,10 @@ To use six candidates, prepare a new run with `--group-size 6` and train with
 or 96 videos and 480 judgments for 16 prompt groups. The frozen protocol and rollout
 count must agree. Existing model and optimizer checkpoints can be restored with the
 new group size; keep the per-GPU microbatch and inference memory limits unchanged.
+Eight candidates produce 28 pairs and 56 judgments per prompt. With 32 prompt
+groups, each update uses up to 256 videos and 1,792 judgments. Set
+`--group-size 8`, `actor_rollout_ref.rollout.n=8`, and
+`video_rl.judge_concurrency=28` to judge all pairs concurrently within each order.
 
 An invalid tool call earns -1 and forfeits its pairings against valid calls.
 Equal-reward groups have no GRPO learning signal. During training, an H3 service
@@ -246,11 +254,11 @@ available for inspection. Ambiguous POSTs are replayed only with a previously
 persisted key for a gateway that advertised idempotency support.
 
 Validation uses one greedy rollout per held-out prompt. It compares the video
-against the saved Context-IR and best-of-4 reference videos, each in both
+against the saved Context-IR, best-of-4, and best-of-16 reference videos, each in both
 orders. The validation reward averages those two scores; an invalid call scores
 zero. `rl.py evaluate` uses this same loop without training.
 
-Native metrics include `vs_h3_context_ir`, `vs_best_of_4`, and `valid_call` under
+Native metrics include `vs_h3_context_ir`, `vs_best_of_4`, `vs_best_of_16`, and `valid_call` under
 `val-aux/<source>/<metric>/mean@1`. Training diagnostics are under
 `training/reward_extra/<metric>/mean`, including `zero_variance_group`,
 `order_disagreement`, `judge_comparisons`, `judge_completed_comparisons`,
@@ -266,13 +274,19 @@ These runtime assets are supplied separately:
 - Training JSONL with nonempty `id` and `prompt`; optional `source`. SFT also
   requires `h3_context_ir`. Train/evaluation IDs and prompt text must not overlap.
 - Evaluation JSONL with `id`, `prompt`, `source`, `h3_context_ir`,
-  `h3_context_ir_h3_self_hosted_video`, and `best_of_4_h3_self_hosted_video`.
+  `h3_context_ir_h3_self_hosted_video`, `best_of_4_h3_self_hosted_video`, and
+  `best_of_16_h3_self_hosted_video`.
 - The Context-IR reference directory, including `manifest.json`, its videos,
   and their generation state files. Keep its relative paths intact.
 - Best-of-4 exports from `run_candidate41_best_of_4.py`: the JSONL video paths
   point to `videos/<item>/best_of_4.mp4`, with matching `items/<item>.json` records
   under the same export directory. Preparation checks the original prompt, all
   four completed self-hosted lanes, the selected winner, checksums, and media.
+- Best-of-16 exports from the same runner: `finals/<item>/best_of_16.json`,
+  `groups/<item>/g2.json` through `g4.json`, and the four winning lane artifacts.
+  Preparation verifies 16 distinct completed lanes and links the delivered clip
+  to the final winner. This baseline compares four group winners in a second
+  round, rather than comparing all 16 original videos against each other.
 - `~/video-generation-eval`, containing `scripts/run_gemini_pairwise_eval.py`,
   `scripts/build_pairwise_manifest.py`, and `bestofn/normalize.py`.
   `--eval-repo` selects another checkout. Its source hashes and v4 rubric are
@@ -330,7 +344,7 @@ tasks locally, while the run-wide `video_rl.h3_max_inflight` limit defaults to t
 active H3 operations. The ten-step pilot saves every
 five steps and validates at step ten. An initial batch costs at most 64 videos
 and 192 judgments, with additional work for failed-group replacements;
-the 200-prompt validation costs at most 200 videos and 800 judgments. Hardware
+the 200-prompt validation costs at most 200 videos and 1,200 judgments. Hardware
 memory fit and live provider behavior still need a GPU smoke run.
 
 Evaluate a base model or exported checkpoint in its own output directory:

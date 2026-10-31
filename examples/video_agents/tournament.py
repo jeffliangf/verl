@@ -44,7 +44,9 @@ def load_protocol(path: Path) -> dict:
     if protocol.get("h3_backend") != h3.BACKEND:
         raise ValueError("Expected a self-hosted Sol-H3 protocol; the H3 Max API is disabled")
     if any(set(sample.get("references", {})) != set(REFERENCE_FIELDS) for sample in protocol["samples"]["val"]):
-        raise ValueError("Evaluation references changed; prepare a new run directory with Context-IR and best-of-4")
+        raise ValueError(
+            "Evaluation references changed; prepare a new run directory with Context-IR, best-of-4 and best-of-16"
+        )
     check_dependencies(protocol)
     return protocol
 
@@ -331,7 +333,7 @@ def tournament_rewards(candidates: list[dict], manifests: dict, judgments: dict)
 
 
 def score_group(directory: Path, protocol: dict, sample: dict, candidates: list[dict], *, validate: bool) -> list[dict]:
-    """Score a training tournament or a held-out candidate against both references."""
+    """Score a training tournament or a held-out candidate against the frozen references."""
     check_dependencies(protocol)
     if any(c["status"] not in {"succeeded", "invalid_call"} for c in candidates):
         raise RuntimeError(f"Only generated videos and invalid calls can be scored; inspect {directory}")

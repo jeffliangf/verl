@@ -22,7 +22,15 @@ from math import isfinite
 from pathlib import Path
 
 from . import h3
-from .config import DEFAULT_DATASET, DEFAULT_EVAL_REPO, DEFAULT_REFERENCES, DEFAULT_SYSTEM_PROMPT, JUDGE_SETTINGS, ROOT
+from .config import (
+    DEFAULT_DATASET,
+    DEFAULT_EVAL_REPO,
+    DEFAULT_REFERENCES,
+    DEFAULT_SYSTEM_PROMPT,
+    JUDGE_SETTINGS,
+    REFERENCE_FIELDS,
+    ROOT,
+)
 from .dataset import load_samples, reference_inventory
 from .judge import EXTERNAL_FILES
 from .observability import summarize_timings
@@ -342,7 +350,7 @@ def train(args) -> dict:
         if evaluation
         else protocol["group_size"] * (protocol["group_size"] - 1) * batch,
         "videos_per_evaluation": len(protocol["samples"]["val"]),
-        "judgments_per_evaluation": 4 * len(protocol["samples"]["val"]),
+        "judgments_per_evaluation": 2 * len(REFERENCE_FIELDS) * len(protocol["samples"]["val"]),
         "execute": args.execute,
         "command": shlex.join(command),
     }

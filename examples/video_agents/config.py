@@ -26,11 +26,12 @@ JUDGE_SETTINGS = {
     "max_output_tokens": None,
     "instructions_version": 4,
 }
-REFERENCE_FIELDS = ("h3_context_ir", "best_of_4")
+REFERENCE_FIELDS = ("h3_context_ir", "best_of_4", "best_of_16")
 # Evaluation-row fields holding each reference's self-hosted H3 video path.
 REFERENCE_VIDEO_FIELDS = {
     "h3_context_ir": "h3_context_ir_h3_self_hosted_video",
     "best_of_4": "best_of_4_h3_self_hosted_video",
+    "best_of_16": "best_of_16_h3_self_hosted_video",
 }
 CANDIDATE = "video_agent"
 
