@@ -204,6 +204,28 @@ and deletes uploaded files after all comparisons settle. This is a per-subproces
 limit; 16 active groups can make up to 240 comparisons concurrently. Both orders,
 retry budgets, fallback rules, and the pass deadline remain in effect.
 
+Set `video_rl.judge_streaming=true` to upload each completed H3 video immediately
+and start each comparison when its two uploads are ready. Both presentation
+orders share the uploads and run concurrently; `judge_concurrency` then limits
+the total comparisons across both orders per group. For group size 8 and
+concurrency 28, 32 active groups can have up to 896 judgments in flight. Uploads
+use a separate pool so waiting judgments cannot block them. Evaluation also
+shares the candidate and reference uploads across both orders.
+
+Streaming preserves complete-group rewards, invalid-call penalties, the three
+request attempts, and neutral fallback coverage checks. No reward is published
+until every rollout and comparison settles. The `judge_pass` deadline bounds the
+remaining work after the final rollout arrives; waiting for an H3 sibling does
+not spend that deadline. Cancellation or a failed H3 sibling reaps the evaluator
+without publishing partial rewards. A killed evaluator can leave remote Gemini
+files for provider expiry, as with a timed-out nonstreaming pass.
+
+Streamed pairs keep their own immutable manifests and real/fallback ledgers under
+`judge/stream/pairs/`; `judge/stream-index.json` maps the final group to those
+manifests. Scoring verifies each pair against the complete group's identities.
+`gemini_stream_candidate`, `gemini_stream_pair`, and `gemini_stream_tail` timings
+show arrivals, overlap, and the remaining wait after the last video.
+
 Neutral decisions are identity-checked and persisted separately in
 `judge/fallbacks-<order>.json`, with the policy version and failure reason. They
 are reused when scoring resumes, preserving the actual Gemini ledgers. A pass

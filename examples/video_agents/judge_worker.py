@@ -149,7 +149,7 @@ def parallel_pairs(runner, *, keep_uploaded_files=False):
                         print("Warning: Gemini file cleanup failed after the comparisons settled.", flush=True)
 
 
-def main(argv=None):
+def parse_options(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--timings", type=Path, required=True)
@@ -159,6 +159,11 @@ def main(argv=None):
     args, forwarded = parser.parse_known_args(argv)
     if not math.isfinite(args.file_control_timeout) or args.file_control_timeout <= 0:
         parser.error("--file-control-timeout must be finite and positive")
+    return args, forwarded
+
+
+def main(argv=None):
+    args, forwarded = parse_options(argv)
     runner = load_external(args.runner)
     instrument_client(runner, args.timings, args.file_control_timeout)
     record_event(args.timings, "gemini_network", "configured", address_family=args.address_family)

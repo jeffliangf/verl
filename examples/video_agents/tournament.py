@@ -75,6 +75,9 @@ def runtime_protocol(protocol: dict, settings) -> dict:
     policy = settings.get("judge_failure_policy", "drop")
     if policy not in {"drop", "neutral"}:
         raise ValueError("video_rl.judge_failure_policy must be drop or neutral")
+    streaming = settings.get("judge_streaming", False)
+    if not isinstance(streaming, bool):
+        raise ValueError("video_rl.judge_streaming must be boolean")
     fraction = settings.get("max_judge_fallback_fraction", 0.75)
     if (
         isinstance(fraction, bool)
@@ -90,6 +93,7 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         "judge_max_attempts": attempts,
         "judge_concurrency": concurrency,
         "judge_failure_policy": policy,
+        "judge_streaming": streaming,
         "max_judge_fallback_fraction": fraction,
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
     }
@@ -332,7 +336,9 @@ def tournament_rewards(candidates: list[dict], manifests: dict, judgments: dict)
     ]
 
 
-def score_group(directory: Path, protocol: dict, sample: dict, candidates: list[dict], *, validate: bool) -> list[dict]:
+def score_group(
+    directory: Path, protocol: dict, sample: dict, candidates: list[dict], *, validate: bool, streamed: bool = False
+) -> list[dict]:
     """Score a training tournament or a held-out candidate against the frozen references."""
     check_dependencies(protocol)
     if any(c["status"] not in {"succeeded", "invalid_call"} for c in candidates):
@@ -342,6 +348,14 @@ def score_group(directory: Path, protocol: dict, sample: dict, candidates: list[
             raise ValueError("Candidate video changed before judging")
     with run_lock(directory):
         freeze_json(directory / "inputs.json", {"sample": sample, "candidates": candidates, "validate": validate})
+        if streamed:
+            from .streaming_judge import read_streamed_judgments
+
+        def judgments_for(manifests, *, allow_fallback=False):
+            if streamed:
+                return read_streamed_judgments(directory, protocol, manifests, allow_fallback=allow_fallback)
+            return run_judgments(directory, protocol, manifests, allow_fallback=allow_fallback)
+
         if validate:
             if len(candidates) != 1:
                 raise ValueError("Held-out evaluation requires one candidate per prompt")
@@ -349,7 +363,7 @@ def score_group(directory: Path, protocol: dict, sample: dict, candidates: list[
             valid = candidates[0]["status"] == "succeeded"
             eval_protocol = {**protocol, "name": "h3-agent", "samples": [sample]}
             manifests = judge.build_manifests(eval_protocol, {sample["id"]: candidates[0]} if valid else {})
-            judgments = run_judgments(directory, protocol, manifests)
+            judgments = judgments_for(manifests)
             pairs = manifests["original"]["pairs"]
             by_reference = {pair["reference"]: key for key, pair in pairs.items()}
             result = {"valid_call": float(valid), "judge_comparisons": 2 * len(pairs)}
@@ -369,9 +383,7 @@ def score_group(directory: Path, protocol: dict, sample: dict, candidates: list[
             rewards = tournament_rewards(
                 candidates,
                 manifests,
-                run_judgments(
-                    directory, protocol, manifests, allow_fallback=protocol.get("judge_failure_policy") == "neutral"
-                ),
+                judgments_for(manifests, allow_fallback=protocol.get("judge_failure_policy") == "neutral"),
             )
         write_json(directory / "rewards.json", rewards)
         return rewards

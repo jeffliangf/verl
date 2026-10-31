@@ -31,6 +31,7 @@ from .config import REFERENCE_FIELDS
 from .h3 import generation_slot
 from .observability import ProviderError, failure_record, record_event, timed_stage
 from .storage import item_key, write_json
+from .streaming_judge import StreamingJudge
 from .tournament import generate_video, load_protocol, runtime_protocol, score_group
 
 # Decoded tokens kept with an invalid call, so the policy's actual output can be read.
@@ -274,21 +275,26 @@ class TournamentWorker(AgentLoopWorkerTQBase):
             )
         sample = self.samples[partition][prompt["extra_info"]["id"]]
         await tq.async_kv_put(key=uid, partition_id=partition, tag={"status": "running"})
+        stream = None
         try:
-            results = await asyncio.gather(
-                *[
-                    self._run_agent_loop(
-                        sampling_params,
-                        trajectory=trajectory,
-                        trace=trace,
-                        session_id=i,
-                        _video_timings=str(directory / "timings.jsonl"),
-                        **prompt,
-                    )
-                    for i in range(n)
-                ],
-                return_exceptions=True,
-            )
+            if self.protocol.get("judge_streaming", False):
+                stream = StreamingJudge(directory, self.protocol, sample, validate=validate)
+                await stream.start()
+
+            async def rollout(i):
+                output = await self._run_agent_loop(
+                    sampling_params,
+                    trajectory=trajectory,
+                    trace=trace,
+                    session_id=i,
+                    _video_timings=str(directory / "timings.jsonl"),
+                    **prompt,
+                )
+                if stream is not None:
+                    stream.offer(i, output.extra_fields["h3_result"])
+                return output
+
+            results = await asyncio.gather(*(rollout(i) for i in range(n)), return_exceptions=True)
             # Settle every sibling, and never let a provider error hide a code,
             # artifact, or cancellation error from another sibling.
             errors = [result for result in results if isinstance(result, BaseException)]
@@ -297,6 +303,8 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                     raise error
             if errors:
                 raise errors[0]
+            if stream is not None:
+                await stream.finish()
             write_json(
                 directory / "trajectories.json",
                 {
@@ -322,6 +330,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 sample,
                 [output.extra_fields["h3_result"] for output in results],
                 validate=validate,
+                **({"streamed": True} if stream is not None else {}),
             )
             for i, (output, reward) in enumerate(zip(results, rewards, strict=True)):
                 output.reward_score = reward["score"]
@@ -357,6 +366,9 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 # the validation sampler skips a failed group without refill.
                 return failure
             raise
+        finally:
+            if stream is not None:
+                await stream.close()
 
 
 class TournamentManager(AgentLoopManagerTQ):

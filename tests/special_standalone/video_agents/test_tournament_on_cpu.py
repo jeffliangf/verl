@@ -14,6 +14,8 @@ import asyncio
 import copy
 import json
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1381,9 +1383,10 @@ def native_worker(prepared_rl, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("group_size", [4, 6])
+@pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("failure", [None, "rollout", "judge", "h3_provider", "judge_provider", "mixed"])
 async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(
-    native_worker, monkeypatch, failure, group_size
+    native_worker, monkeypatch, failure, group_size, streaming
 ):
     import numpy as np
 
@@ -1393,9 +1396,31 @@ async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(
 
     worker, events, published = native_worker
     worker.protocol["group_size"] = group_size
+    worker.protocol["judge_streaming"] = streaming
     worker.config.actor_rollout_ref.rollout.n = group_size
     scores = [1 - i / (group_size - 1) for i in range(group_size - 1)] + [-1]
     settled = set()
+    offered, closed = set(), []
+
+    class Stream:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            pass
+
+        def offer(self, index, candidate):
+            assert not published
+            offered.add(index)
+
+        async def finish(self):
+            assert offered == settled == set(range(group_size))
+            assert not published
+
+        async def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(agent, "StreamingJudge", Stream)
 
     async def rollout(*args, session_id, **kwargs):
         await asyncio.sleep(session_id * 0.001)
@@ -1465,6 +1490,7 @@ async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(
             assert fields["loss_mask"][0].tolist() == [1, 1, 0]
             assert fields["rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2, 0])
             assert fields["extra_fields"][0]["reward_extra_info"]["valid_call"] == 1
+    assert bool(closed) == streaming
 
 
 @pytest.mark.asyncio
@@ -1918,3 +1944,125 @@ def test_fallback_fraction_limit_is_validated(prepared_rl, value):
     settings["max_judge_fallback_fraction"] = value
     with pytest.raises(ValueError, match="fallback_fraction"):
         tournament.runtime_protocol(prepared_rl[1], settings)
+
+
+@pytest.mark.parametrize("failure", [None, "network", "auth"])
+def test_streaming_uploads_and_both_orders_start_before_last_video(prepared_rl, tmp_path, monkeypatch, failure):
+    from examples.video_agents import judge_worker, streaming_judge
+    from examples.video_agents.config import DEFAULT_EVAL_REPO
+    from examples.video_agents.storage import load_external
+
+    runner_path = DEFAULT_EVAL_REPO / "scripts/run_gemini_pairwise_eval.py"
+    if not runner_path.exists():
+        pytest.skip("Optional frozen evaluator integration; no downloads or provider calls")
+    runner = load_external(runner_path)
+    directory, protocol, _ = prepared_rl
+    protocol.update(group_size=8, judge_concurrency=4, judge_failure_policy="neutral")
+    sample = protocol["samples"]["train"][0]
+    clips = candidates(tmp_path, group_size=8, invalid=(7,))
+    group = directory / "streamed"
+    session = streaming_judge.StreamingJudge(group, protocol, sample, validate=False)
+    write_json(session.root / "context.json", session.context)
+    uploaded, comparisons, deleted = [], [], []
+    first_uploaded, first_pair = threading.Event(), threading.Event()
+    both_orders = threading.Barrier(2)
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-no-network")
+
+    class Client(runner.GeminiRestClient):
+        def upload_video(self, path):
+            uploaded.append(path.name)
+            first_uploaded.set()
+            return {"name": path.name, "uri": path.name, "mime_type": "video/mp4"}
+
+        def evaluate(self, payload, **kwargs):
+            paths = [part["uri"] for part in payload["input"] if part["type"] == "video"]
+            comparisons.append(tuple(paths))
+            assert not deleted
+            if set(paths) == {"candidate-0.mp4", "candidate-1.mp4"}:
+                both_orders.wait(timeout=10)
+                first_pair.set()
+                if paths[0] == "candidate-0.mp4" and failure:
+                    if failure == "auth":
+                        raise runner.HttpFailure(401, "HTTP 401: unauthorized", {})
+                    raise runner.NetworkFailure("read timed out")
+            return {
+                "preferred_video": "A" if paths[0] < paths[1] else "B",
+                "reason": "Visible evidence",
+                "confidence": "high",
+            }, {}
+
+        def delete_file(self, name):
+            deleted.append(name)
+
+    monkeypatch.setattr(runner, "GeminiRestClient", Client)
+    session.offer(0, clips[0])
+    with judge_worker.parallel_pairs(runner), ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(streaming_judge.run_stream, group, runner)
+        try:
+            assert first_uploaded.wait(10), "First upload must start with only one clip"
+            assert not comparisons
+            session.offer(1, clips[1])
+            assert first_pair.wait(10), "Both orders must run before the remaining videos arrive"
+            assert not (group / "rewards.json").exists()
+        finally:
+            for i in range(2, 8):
+                session.offer(i, clips[i])
+            write_json(session.root / "finished.json", True)
+        if failure == "auth":
+            with pytest.raises(RuntimeError, match="Nonrecoverable"):
+                future.result(timeout=15)
+            assert (session.root / "fatal.json").exists()
+            return
+        future.result(timeout=15)
+        assert not deleted
+    assert sorted(uploaded) == sorted(deleted) == [f"candidate-{i}.mp4" for i in range(7)]
+    assert len(comparisons) == 42 and len(set(comparisons)) == 42
+    write_json(session.root / "outcome.json", {"timed_out": False})
+    manifests = tournament.tournament_manifests(sample, clips, protocol)
+    expected = votes(manifests)
+    if failure == "network":
+        expected["original"]["0_vs_1"] = {"status": "fallback", "fallback_policy": "neutral-v1", "fallback_score": 0.5}
+    rewards = tournament.score_group(group, protocol, sample, clips, validate=False, streamed=True)
+    assert rewards == tournament.tournament_rewards(clips, manifests, expected)
+    assert tournament.score_group(group, protocol, sample, clips, validate=False, streamed=True) == rewards
+    # Changing the complete group's pair identity cannot reuse an early vote.
+    changed = copy.deepcopy(manifests)
+    changed["original"]["pairs"]["0_vs_1"]["prompt"] = "Different prompt"
+    with pytest.raises(ValueError, match="Frozen input changed"):
+        streaming_judge.read_streamed_judgments(group, protocol, changed, allow_fallback=True)
+
+
+def test_stream_timeout_only_neutralizes_missing_votes_and_keeps_auth_fatal(prepared_rl, tmp_path):
+    from examples.video_agents import streaming_judge
+
+    directory, protocol, _ = prepared_rl
+    clips = candidates(tmp_path)
+    manifests = tournament.tournament_manifests(protocol["samples"]["train"][0], clips, protocol)
+    group = directory / "timeout"
+    write_json(group / "judge/stream/outcome.json", {"timed_out": True})
+    results = streaming_judge.read_streamed_judgments(group, protocol, manifests, allow_fallback=True)
+    assert all(row["fallback_reason"] == "pass_timeout" for rows in results.values() for row in rows.values())
+    assert [row["score"] for row in tournament.tournament_rewards(clips, manifests, results)] == [0.5] * 4
+    with pytest.raises(ValueError, match="disallowed"):
+        streaming_judge.read_streamed_judgments(group, protocol, manifests, allow_fallback=False)
+
+
+@pytest.mark.asyncio
+async def test_stream_cancel_reaps_child_without_publishing_rewards(prepared_rl, monkeypatch):
+    from examples.video_agents import streaming_judge
+
+    directory, protocol, _ = prepared_rl
+    session = streaming_judge.StreamingJudge(
+        directory / "cancel", protocol, protocol["samples"]["train"][0], validate=False
+    )
+    create_process = asyncio.create_subprocess_exec
+
+    async def sleeping_child(*args, **kwargs):
+        return await create_process(args[0], "-c", "import time; time.sleep(60)", **kwargs)
+
+    monkeypatch.setattr(streaming_judge.asyncio, "create_subprocess_exec", sleeping_child)
+    await session.start()
+    assert session.process.returncode is None
+    await session.close()
+    assert session.process.returncode is not None
+    assert not (session.directory / "rewards.json").exists()
