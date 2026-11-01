@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for a safe checkpoint to deploy inspection RL H3 timeout fix
+
+[Timer]
+OnActiveSec=60
+OnUnitActiveSec=60
+AccuracySec=5
+Unit=video-agents-inspection-v1-1-queue-timeouts.service
+
+[Install]
+WantedBy=timers.target

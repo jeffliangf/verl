@@ -1,0 +1,18 @@
+[Unit]
+Description=Watch the 72-hour GRPO experiment with eight candidates
+ConditionHost=utopai-m1
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101
+ExecStart=/home/jeff/.venvs/video-agents-h100-f169e786/bin/python /home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/watchdog.py --run-dir /home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo
+Environment=PATH=/home/jeff/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TZ=UTC
+UMask=0077
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/watchdog.log
+StandardError=append:/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/watchdog.log
+
+[Install]
+WantedBy=default.target

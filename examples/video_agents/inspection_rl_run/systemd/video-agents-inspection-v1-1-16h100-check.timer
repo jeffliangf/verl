@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the 72-hour GRPO experiment every 30 minutes until completion
+ConditionHost=utopai-m1
+
+[Timer]
+OnActiveSec=30m
+OnUnitActiveSec=30m
+AccuracySec=1s
+Unit=video-agents-inspection-v1-1-16h100-check.service
+
+[Install]
+WantedBy=timers.target

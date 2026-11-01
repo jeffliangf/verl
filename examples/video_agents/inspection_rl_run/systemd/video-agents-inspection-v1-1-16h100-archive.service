@@ -1,0 +1,17 @@
+[Unit]
+Description=Copy the latest verified inspection RL checkpoint to the controller
+ConditionHost=utopai-m1
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101
+ExecStart=/home/jeff/.venvs/video-agents-h100-f169e786/bin/python /home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/archive_checkpoint.py --run-dir /home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo --backup-dir /home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/checkpoint-backup
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UMask=0077
+Restart=on-failure
+RestartSec=60
+StandardOutput=append:/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/checkpoint-backup.log
+StandardError=append:/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/checkpoint-backup.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,208 @@
+{
+  "variant": "inspection-v1-1",
+  "norm_adv_by_std_in_grpo": true,
+  "group_size": 8,
+  "judge_concurrency": 8,
+  "h3_max_inflight": 20,
+  "h3_timeout_seconds": 150,
+  "max_judge_fallback_fraction": 0.75,
+  "train_batch_size": 32,
+  "ppo_mini_batch_size": 32,
+  "ppo_micro_batch_size_per_gpu": 1,
+  "rollout_tensor_parallel_size": 4,
+  "rollout_replicas": 4,
+  "rollout_agent_workers": 8,
+  "save_freq": 5,
+  "test_freq": 25,
+  "evaluate_initial": true,
+  "evaluate_final": true,
+  "max_new_actor_checkpoints_to_keep": 2,
+  "initial_checkpoint_step": 0,
+  "source_checkpoint": null,
+  "model": "Qwen/Qwen3.8-27B",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "initialization": "Baseline Qwen weights with fresh optimizer and scheduler; reference initialized from the same base weights",
+  "evaluation_references": [
+    "h3_context_ir",
+    "best_of_4",
+    "best_of_16"
+  ],
+  "best_of_16_selection": "Four groups of four candidates, followed by a tournament among the four winners",
+  "judge": {
+    "judge_model": "gemini-3.8-flash",
+    "thinking_level": "high",
+    "video_processing": "standard",
+    "seed": 0,
+    "max_output_tokens": null,
+    "instructions_version": 4
+  },
+  "data_dir": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/data",
+  "run_dir": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo",
+  "evaluator_snapshot": "/home/jeff/rl-benchmarks/grpo-group8-16h100-20261031/evaluator",
+  "evaluator_note": "Prior frozen v4 rubric and runner; current fragmented-MP4 parser frozen and tested (12 passed)",
+  "code_checkout": "/home/jeff/verl-inspection-v1-1-20261101",
+  "code_commit": "366e2af024d2bec661a86653fc87a701de77382a",
+  "total_training_steps": 10000,
+  "target_step": 10000,
+  "requested_duration_hours": 72,
+  "slurm_time_limit_hours": 72,
+  "slurm_time_limit_minutes": 4313,
+  "stop_policy": "72-hour budget from this new experiment first allocation, including any recovery downtime; step 10000 is a safety ceiling",
+  "finish_reserve_seconds": 7200,
+  "nodes": 2,
+  "gpus_per_node": 8,
+  "requested_nodes": [
+    "gmicloud-loki-gpu-004",
+    "gmicloud-loki-gpu-005"
+  ],
+  "job_name": "rl-inspection-v1-1-16h100",
+  "controller_host": "utopai-m1",
+  "request_scope": "Base Qwen3.8-27B with optional native V1 inspection, at most two generations and one inspection, quality-only reward, full 200-prompt step-zero evaluation, and a three-day allocation",
+  "watchdog_service": "video-agents-inspection-v1-1-16h100-watchdog.service",
+  "watchdog_interval_seconds": 60,
+  "check_service": "video-agents-inspection-v1-1-16h100-check.service",
+  "check_timer": "video-agents-inspection-v1-1-16h100-check.timer",
+  "check_interval_seconds": 1800,
+  "watchdog_policy": {
+    "startup_minutes": 45,
+    "training_minutes": 90,
+    "checkpoint_minutes": 60,
+    "evaluation_minutes": 240,
+    "no_progress_minutes": 40,
+    "minimum_disk_free_gib": 450,
+    "automatic_blind_restart": false,
+    "automatic_recovery": true,
+    "recovery_interval_minutes": 30,
+    "maximum_automatic_recoveries": 6,
+    "maximum_recoveries_without_new_checkpoint": 2,
+    "bulk_storage_reserves": "350 GiB checkpoints; 40 GiB episodes; missing mounts are fatal"
+  },
+  "checkpoint_retention": "Keep newest two complete checkpoints in this run only, with verification before deletion",
+  "created_at": "2026-11-01T21:26:09.310675+00:00",
+  "validation": {
+    "video_agent_tests": "260 inherited tournament/judge tests plus 19 inspection RL tests passed",
+    "monitoring_tests": "55 watchdog/recovery tests passed",
+    "prepared_train_prompts": 2046,
+    "prepared_eval_prompts": 200,
+    "prepared_reference_videos": 600,
+    "max_initial_prompt_tokens": {
+      "train": 1478,
+      "val": 1317
+    },
+    "live_inspector": "Valid V1 report returned; inspection-owned upload deletion verified",
+    "storage": "Concurrent writes, fsync, atomic rename and 16 cross-client SHA256 checks passed on both nodes and controller",
+    "pre_commit": "New code lint/format, mypy, config checks and remaining hooks passed. Frozen V1 source retained byte-for-byte; its existing formatting/license violations are excluded from the snapshot commit hooks.",
+    "checkpoint_backup_tests": "2 passed: verification/retention and interrupted-copy preservation",
+    "actual_qwen_tokenizer": "Passed three-turn native history test: all generated reasoning retained; exact policy tokens have mask 1, all observation/framing tokens have mask 0; QwenContinuousTokenBuilder",
+    "gemini_metadata_preflight": "HTTP 200 from controller; uses the reference experiment frozen evaluator snapshot"
+  },
+  "launcher_sha256": {
+    "canary_ops.py": "7d42a3a9675e9a022ac71eb333f745d315181a5a34ce8360fcd4518ed0bd909b",
+    "run_budget.py": "f9f0696a93985d10d782ba56057b0d95659c9d453102115508675d442b8d11f8",
+    "initialize.py": "6af1f43844706884e5167eb13c07ab5dcfd4e9c9e0a2aea092e2a713fd0e2d39",
+    "run_callback.py": "5b3ba9d5ece406649d9caf803bd6902ef20a066a7e4b96f00b5bbfb618c56f89",
+    "cluster-env.sh": "df1436f4217a937b0ed79111921b1d7596f08b86dc448b6e1a6d33b90b859568",
+    "train.sh": "fa0dbfb2a1c411e7b1ce0d0f02d05ac874a9b7ec93b62484f68b5806202339c4",
+    "train.sbatch": "fcefca8b0a4368d3d0af33712b53bd95cabcd1f0fd45b84cb77209eb5e1a4e2b",
+    "ray-node.sh": "1692e1274a768a10bb21ace218ce78685ba7224f6f8ff816286361cd112a99cf",
+    "stage-model.py": "5f3ce12739cbf87a20aef3754568fdec19583e57b4efe9d0e551827c4a49c505",
+    "nccl-preflight.py": "4adf6388171d222d9c653ee6b96f913d48edd4bcffb9b4fdc113e92e4e8cbcf8",
+    "gemini-preflight.py": "f4955313194d391844a008183ea98a9a5e8d8b26a71fcda8045c6b4b932e4701",
+    "gpu_metrics.py": "1ba2121aed588ec12704d56ae02fa36e87296f3508072f9a15d14a866fe620f0",
+    "shutdown-sync.sh": "ff65c0ae0c73052d94f93d1e7e66866fb402a26ce231e18193cc7b8c91a9e7d8",
+    "protocol.json": "214e4573519bdace875a2270570aa4046d9ebdb0b931d13cb601e52820b8594a",
+    "protocol-sha256.json": "4814361e657976a716889a88450ee8982dc602f170b756b1d02ce894fb852499",
+    "tools.json": "46ffdfcca5709104a677d5525a193c2d949e551af698a1e44c114f51e2ab412a",
+    "storage.py": "4d6bde218ec2ad977f5fb5272e27e96dd1aa9ad50f41789327663f95874d9c78",
+    "../storage-tools/package/usr/bin/sshfs": "ab2d7025aa485272bbc9cce65b624cdad952ab011aa83f6c6aa195766fdb3918"
+  },
+  "monitor_sha256": {
+    "canary_ops.py": "7d42a3a9675e9a022ac71eb333f745d315181a5a34ce8360fcd4518ed0bd909b",
+    "run_budget.py": "f9f0696a93985d10d782ba56057b0d95659c9d453102115508675d442b8d11f8",
+    "watchdog.py": "c62e537cac983c6acaebe3a2b2d40f25d6b47a2669b8cef3fd03d2e3628d5f57",
+    "check30.py": "b81d3a3ebfe133879194d80b22f5d50aafab1110b2d34adbeb7ad9b9a440a6a1",
+    "test_watchdog.py": "21b797a2eb6f9dd38d8e3907b6dad51b1e3634ed2656f6bb8de4997f10e5f381",
+    "recover.py": "e877488e3cc341b03dfaacdf1278db99747d04183004b30068866612df6a0511",
+    "test_recover.py": "8334977492d9ff79e9f890ce26bcc2c6b179aea140d173ad695243b8b2da407f",
+    "archive_checkpoint.py": "8449185dd3a665110603e13376c5bfeb75d1a4604a97fae88561529509d3499d"
+  },
+  "judge_streaming": true,
+  "reference_run": "/home/jeff/rl-benchmarks/grpo-group8-16h100-20261031/grpo",
+  "context": {
+    "initial_prompt_tokens": 4096,
+    "continuation_including_tools": 28672,
+    "model_tokens": 32768,
+    "per_policy_turn": 8192
+  },
+  "tool_limits": {
+    "generations": 2,
+    "inspections": 1,
+    "second_generation_requires_inspection": true,
+    "second_generation_terminates": true
+  },
+  "reward": "Unchanged final-video tournament quality; tool costs logged without penalties",
+  "inspector": {
+    "model": "gemini-3.8-flash",
+    "fps": 4,
+    "resolution": "high",
+    "thinking_level": "medium",
+    "seed": 0,
+    "max_output_tokens": 12288,
+    "policy": "unchanged V1 feedback-only",
+    "temporary_upload_cleanup": true
+  },
+  "generator": {
+    "schema": "identical to source rows",
+    "duration_options": [
+      5,
+      10
+    ],
+    "default_duration": 10,
+    "default_seed": 42,
+    "configurable_seed": true
+  },
+  "bulk_storage": {
+    "episodes": {
+      "host": "gmicloud-loki-gpu-004",
+      "address": "176.56.202.237",
+      "path": "/tmp/jeff-inspection-v1-1-20261101/episodes",
+      "reserve_bytes": 42949672960
+    },
+    "checkpoints": {
+      "host": "gmicloud-loki-gpu-005",
+      "address": "176.56.202.238",
+      "path": "/tmp/jeff-inspection-v1-1-20261101/checkpoints",
+      "reserve_bytes": 375809638400
+    }
+  },
+  "job_id": 3573,
+  "submitted_at": "2026-11-01T21:33:02.252829+00:00",
+  "checkpoint_backup": {
+    "service": "video-agents-inspection-v1-1-16h100-archive.service",
+    "host": "utopai-m1",
+    "directory": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/checkpoint-backup",
+    "retention": "One complete verified checkpoint; prior copy retained until replacement verifies",
+    "mode": "asynchronous, independent of training",
+    "storage": "Shared /home filesystem, after user freed capacity"
+  },
+  "startup_fixes": [
+    {
+      "job_id": 3572,
+      "failure": "Copied preflight expected an absent evaluator directory under the new experiment",
+      "resolution": "Point the preflight at the same frozen evaluator snapshot already used by the protocol",
+      "samples_evaluated": 0
+    }
+  ],
+  "replaces_job_id": 3572,
+  "recovery_reason": "Fix the Gemini preflight path to the frozen reference evaluator; restart before any evaluation within the original 72-hour budget",
+  "recovery_checkpoint_step": 0,
+  "tensorboard": {
+    "service": "video-agents-tensorboard.service",
+    "url_on_controller": "http://127.0.0.1:8792/#scalars",
+    "bind": "127.0.0.1",
+    "port": 8792,
+    "run_name": "inspection-v1-1-group8-16h100-20261101",
+    "log_dir": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/tensorboard",
+    "gpu_sampling_seconds": 15
+  }
+}

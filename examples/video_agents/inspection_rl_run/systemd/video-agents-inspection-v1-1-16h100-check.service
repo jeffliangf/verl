@@ -1,0 +1,14 @@
+[Unit]
+Description=Check GRPO every 30 minutes and recover transient failures from verified checkpoints
+ConditionHost=utopai-m1
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101
+ExecStart=/home/jeff/.venvs/video-agents-h100-f169e786/bin/python /home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/check30.py --run-dir /home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo
+Environment=PATH=/home/jeff/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TZ=UTC
+UMask=0077
+TimeoutStartSec=240
+StandardOutput=append:/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/checks-30min.log
+StandardError=append:/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/checks-30min.log

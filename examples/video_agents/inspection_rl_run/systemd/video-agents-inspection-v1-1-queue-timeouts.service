@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply inspection RL H3 timeout fix after a verified checkpoint
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101
+ExecStart=/home/jeff/.local/bin/uv run --no-project --python /home/jeff/.venvs/video-agents-h100-f169e786/bin/python python /home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/deploy_queue_timeouts.py --run-dir /home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=600
+StandardOutput=append:/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/queue-timeout-deployment.log
+StandardError=append:/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/queue-timeout-deployment.log

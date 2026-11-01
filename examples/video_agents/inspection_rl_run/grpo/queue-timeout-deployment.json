@@ -1,0 +1,17 @@
+{
+  "status": "error",
+  "source_job": 3573,
+  "source_commit": "366e2af024d2bec661a86653fc87a701de77382a",
+  "target_commit": "4098862d5f727ff4e223cc52fecc7757c9829ddf",
+  "code_checkout": "/home/jeff/verl-inspection-v1-1-20261101",
+  "staged_checkout": "/home/jeff/verl-inspection-v1-1-queuefix",
+  "minimum_checkpoint_step": 5,
+  "budgets": {
+    "queue": 600,
+    "generation": 150,
+    "download": 120
+  },
+  "validation": "294 H3/tournament/native-inspection CPU tests passed; Ruff lint and format passed; live smoke pending a local H3 slot",
+  "error": "StoppedByUser: experiment and goal stopped before deployment",
+  "stopped_at_epoch": 1793574742.0489283
+}

@@ -1,0 +1,174 @@
+{
+  "status": "stopped by user; no automatic services enabled",
+  "experiment": "inspection-v1-1-group8-16h100-20261101",
+  "files": {
+    "EXPERIMENT.rst": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/EXPERIMENT.rst",
+      "sha256": "8faaff74ad4614cd1f31b6b1840d8b5711773dbab2bd32f9d66a473a1b5571d5"
+    },
+    "archive_checkpoint.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/archive_checkpoint.py",
+      "sha256": "8449185dd3a665110603e13376c5bfeb75d1a4604a97fae88561529509d3499d"
+    },
+    "canary_ops.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/canary_ops.py",
+      "sha256": "7d42a3a9675e9a022ac71eb333f745d315181a5a34ce8360fcd4518ed0bd909b"
+    },
+    "check30.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/check30.py",
+      "sha256": "b81d3a3ebfe133879194d80b22f5d50aafab1110b2d34adbeb7ad9b9a440a6a1"
+    },
+    "deploy_queue_timeouts.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/deploy_queue_timeouts.py",
+      "sha256": "439531931e3d43a23ef1c3a37b4ffa2afc376588291cd49b71630997e61cf806"
+    },
+    "grpo/canary_ops.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/canary_ops.py",
+      "sha256": "7d42a3a9675e9a022ac71eb333f745d315181a5a34ce8360fcd4518ed0bd909b"
+    },
+    "grpo/cluster-env.sh": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/cluster-env.sh",
+      "sha256": "df1436f4217a937b0ed79111921b1d7596f08b86dc448b6e1a6d33b90b859568"
+    },
+    "grpo/gemini-preflight.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/gemini-preflight.py",
+      "sha256": "f4955313194d391844a008183ea98a9a5e8d8b26a71fcda8045c6b4b932e4701"
+    },
+    "grpo/gpu_metrics.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/gpu_metrics.py",
+      "sha256": "1ba2121aed588ec12704d56ae02fa36e87296f3508072f9a15d14a866fe620f0"
+    },
+    "grpo/initialize.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/initialize.py",
+      "sha256": "6af1f43844706884e5167eb13c07ab5dcfd4e9c9e0a2aea092e2a713fd0e2d39"
+    },
+    "grpo/native-tokenizer-smoke.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/native-tokenizer-smoke.py",
+      "sha256": "9c5100af415d4b9d3924df2ed955fd44f8f4b5f51e7cb5835a264188e374f261"
+    },
+    "grpo/nccl-preflight.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/nccl-preflight.py",
+      "sha256": "4adf6388171d222d9c653ee6b96f913d48edd4bcffb9b4fdc113e92e4e8cbcf8"
+    },
+    "grpo/ray-node.sh": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/ray-node.sh",
+      "sha256": "1692e1274a768a10bb21ace218ce78685ba7224f6f8ff816286361cd112a99cf"
+    },
+    "grpo/run_budget.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/run_budget.py",
+      "sha256": "f9f0696a93985d10d782ba56057b0d95659c9d453102115508675d442b8d11f8"
+    },
+    "grpo/run_callback.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/run_callback.py",
+      "sha256": "5b3ba9d5ece406649d9caf803bd6902ef20a066a7e4b96f00b5bbfb618c56f89"
+    },
+    "grpo/shutdown-sync.sh": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/shutdown-sync.sh",
+      "sha256": "ff65c0ae0c73052d94f93d1e7e66866fb402a26ce231e18193cc7b8c91a9e7d8"
+    },
+    "grpo/stage-model.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/stage-model.py",
+      "sha256": "5f3ce12739cbf87a20aef3754568fdec19583e57b4efe9d0e551827c4a49c505"
+    },
+    "grpo/storage-smoke.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/storage-smoke.py",
+      "sha256": "3a630fb088d979e3f8c767948971485004721a73042e1d3c5987e94f7da99b4c"
+    },
+    "grpo/storage.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/storage.py",
+      "sha256": "4d6bde218ec2ad977f5fb5272e27e96dd1aa9ad50f41789327663f95874d9c78"
+    },
+    "grpo/train.sbatch": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/train.sbatch",
+      "sha256": "fcefca8b0a4368d3d0af33712b53bd95cabcd1f0fd45b84cb77209eb5e1a4e2b"
+    },
+    "grpo/train.sh": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/train.sh",
+      "sha256": "fa0dbfb2a1c411e7b1ce0d0f02d05ac874a9b7ec93b62484f68b5806202339c4"
+    },
+    "probe_storage_latency.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/probe_storage_latency.py",
+      "sha256": "cca9762a573ce7d87f7283f295f90ada1ec7328d1edf16c0dd9da69e482ac3a6"
+    },
+    "queue_timeout_smoke.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/queue_timeout_smoke.py",
+      "sha256": "2fc00728e7857f4074f73d8fe8b28c41ea595be0a7b3b7a84d2941fe53b67d8c"
+    },
+    "recover.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/recover.py",
+      "sha256": "e877488e3cc341b03dfaacdf1278db99747d04183004b30068866612df6a0511"
+    },
+    "run_budget.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/run_budget.py",
+      "sha256": "f9f0696a93985d10d782ba56057b0d95659c9d453102115508675d442b8d11f8"
+    },
+    "test_archive_checkpoint.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/test_archive_checkpoint.py",
+      "sha256": "2d96b1dfa66935b18efae280e02629cfa00c2a9a3556c6078c33deab6bcbaec1"
+    },
+    "test_deploy_queue_timeouts.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/test_deploy_queue_timeouts.py",
+      "sha256": "d4782ebc5ada38b3e7c98f4cd58bf0a6b868c5c3cc83b2f8f4c8088e74fa5b80"
+    },
+    "test_recover.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/test_recover.py",
+      "sha256": "8334977492d9ff79e9f890ce26bcc2c6b179aea140d173ad695243b8b2da407f"
+    },
+    "test_watchdog.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/test_watchdog.py",
+      "sha256": "21b797a2eb6f9dd38d8e3907b6dad51b1e3634ed2656f6bb8de4997f10e5f381"
+    },
+    "watchdog.py": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/watchdog.py",
+      "sha256": "c62e537cac983c6acaebe3a2b2d40f25d6b47a2669b8cef3fd03d2e3628d5f57"
+    },
+    "grpo/launch.json": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/launch.json",
+      "sha256": "276539b76300cc8fd3d6c07743da818e0885ac99620670976d61e01d86defb60"
+    },
+    "grpo/training-config.json": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/training-config.json",
+      "sha256": "28cf5d88c4452301897bef549fd78e49213c3dc553f22bbaeb12dd009e60df10"
+    },
+    "grpo/run-budget.json": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/run-budget.json",
+      "sha256": "01799d560ccd94059928f3a066f55e15caeedef9802d480413d956942e6471de"
+    },
+    "grpo/user-stop-request.json": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/user-stop-request.json",
+      "sha256": "635c12466d04f55b9ee34cc5c03be341652aff364c3dfe9bd48b11fa11a8d465"
+    },
+    "grpo/recovery-disabled.json": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/recovery-disabled.json",
+      "sha256": "635c12466d04f55b9ee34cc5c03be341652aff364c3dfe9bd48b11fa11a8d465"
+    },
+    "grpo/queue-timeout-deployment.json": {
+      "source": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/queue-timeout-deployment.json",
+      "sha256": "7efd5608ec9a2976d3bb82cbdb02789850942f0fb3ac324eb5941345d82c984f"
+    },
+    "systemd/video-agents-inspection-v1-1-16h100-archive.service": {
+      "source": "/home/jeff/.config/systemd/user/video-agents-inspection-v1-1-16h100-archive.service",
+      "sha256": "b285cb96c50f6e30b3d25825493d1f37bea6f7d616a27207f98189f9a6b26543"
+    },
+    "systemd/video-agents-inspection-v1-1-16h100-check.service": {
+      "source": "/home/jeff/.config/systemd/user/video-agents-inspection-v1-1-16h100-check.service",
+      "sha256": "b987d7be8310063b288194b785b1fea17c242e323bb779b3ce66888177dd4a19"
+    },
+    "systemd/video-agents-inspection-v1-1-16h100-check.timer": {
+      "source": "/home/jeff/.config/systemd/user/video-agents-inspection-v1-1-16h100-check.timer",
+      "sha256": "0072aa5ef55974c5d311fd8f7e80e6fcc460b5952ba09e8c2ff012fe4fbe8aa3"
+    },
+    "systemd/video-agents-inspection-v1-1-16h100-watchdog.service": {
+      "source": "/home/jeff/.config/systemd/user/video-agents-inspection-v1-1-16h100-watchdog.service",
+      "sha256": "930fa757ce2f72265eff6b77a42b79b070e974cc281ecf6e4c1d1a3bc67dae6c"
+    },
+    "systemd/video-agents-inspection-v1-1-queue-timeouts.service": {
+      "source": "/home/jeff/.config/systemd/user/video-agents-inspection-v1-1-queue-timeouts.service",
+      "sha256": "fdf5add8d308e4cf144910f44da9016996ab8bf2c386c4d48a2fbb4d2f4a9b7a"
+    },
+    "systemd/video-agents-inspection-v1-1-queue-timeouts.timer": {
+      "source": "/home/jeff/.config/systemd/user/video-agents-inspection-v1-1-queue-timeouts.timer",
+      "sha256": "ddcb9f33da84b6ca35943068e4187214a6862243247634a39d4c4554fbaecf3e"
+    }
+  }
+}
