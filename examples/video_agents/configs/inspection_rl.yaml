@@ -3,8 +3,6 @@ overrides:
   - +inspection_rl.turn_max_tokens=8192
   - +inspection_rl.timeout_seconds=900
   - +inspection_rl.max_inflight=500
-  - +inspection_rl.h3_queue_timeout_seconds=600
-  - +inspection_rl.h3_download_timeout_seconds=120
   - data.train_batch_size=32
   - data.max_prompt_length=4096
   - data.max_response_length=28672

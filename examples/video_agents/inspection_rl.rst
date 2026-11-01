@@ -23,9 +23,11 @@ applies to rendering, measured from the gateway's worker-start timestamp to its
 finish timestamp. Queue and render time are accumulated across backend retries;
 neither budget is reset by resuming a saved job. Artifact download and validation
 have a separate 120-second deadline. A final subprocess guard is the sum of these
-budgets plus 60 seconds for control operations. The inspection configuration
-exposes queue and download limits; ``video_rl.timeouts.h3`` controls rendering.
-These settings do not change the video-only experiment's legacy total deadline.
+budgets plus 60 seconds for control operations. Both entry points inherit these
+defaults from ``video_rl.h3_phase_timeouts`` in ``configs/rl.yaml``; its generation
+value references ``video_rl.timeouts.h3``. The inspection preset has no separate
+H3 limits. Set ``video_rl.h3_phase_timeouts=null`` to reproduce the legacy total
+deadline. Both launch previews print the resolved budgets and process limit.
 
 The generator keeps its configurable seed (default 42, valid range 0 through
 9223372036854775807) and 5/10-second duration (default 10). ``inspect_video`` accepts
@@ -69,19 +71,28 @@ Compatibility with video-only RL
 --------------------------------
 
 The inspection implementation builds on commit ``74262494`` used by
-``grpo-group8-16h100-20261031``. The inspection changes leave ``rl.py``,
-``configs/rl.yaml``, the generator schema, datasets, system prompt and judge
-implementation unchanged relative to that baseline. Inspection uses its own
-entry point, configuration overrides and loop class.
+``grpo-group8-16h100-20261031``. The generator schema, datasets, original system
+prompt and judge implementation retain that baseline. Inspection uses its own
+entry point, configuration overrides and loop class. H3 provider limits are
+shared by both entry points; new launches now use separate phase budgets by
+default, while explicit null selects the old total deadline.
 
 Three shared files provide integration points. In ``agent.py``, the default
 worker class is still ``TournamentWorker`` and the default reward metadata hook
 returns an empty mapping. Episode metadata is written only for inspection
 trajectories. In ``h3.py`` and ``tournament.py``, phase accounting is enabled only
-when the protocol supplies ``h3_phase_timeouts``. The video-only path retains its
-existing total H3 deadline and worker protocol. Regression tests exercise native
-group-eight dispatch, reward publication, token masks, legacy artifacts and both
-timeout modes.
+when the runtime protocol supplies ``h3_phase_timeouts``. The launch settings
+always override any frozen phase settings, including when disabling them.
+Regression tests exercise both native loops, shared overrides, explicit legacy
+mode, group-eight dispatch, reward publication and token masks. No inspection
+action is registered by the video-only entry point.
+
+For a pair of experiments, use clean checkouts pinned to the same commit and
+record that commit in both launch manifests. Use each entry point's own run/data
+directories and policy settings. Old launch scripts in ``inspection_rl_run/``
+are historical snapshots, not the shared source of current timeout defaults.
+Existing runs require a recorded resolved-config revision when adopting the new
+provider limits; their frozen datasets and evaluation protocols stay unchanged.
 
 The original running experiment uses a separate checkout at
 ``/home/jeff/verl-grpo-streaming-20261031`` pinned to ``74262494``. Updating this

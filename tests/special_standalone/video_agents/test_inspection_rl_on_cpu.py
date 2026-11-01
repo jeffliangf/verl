@@ -17,10 +17,12 @@ from types import SimpleNamespace
 import pytest
 from test_tournament_on_cpu import TemplateTokenizer, prepared_rl  # noqa: F401
 
-from examples.video_agents import inspection_rl
+from examples.video_agents import inspection_rl, rl
+from examples.video_agents.h3_deadlines import phase_budgets, worker_timeout
 from examples.video_agents.inspection_episode import InvalidAction
 from examples.video_agents.observability import ProviderError
 from examples.video_agents.storage import read_json, read_jsonl, write_json
+from examples.video_agents.tournament import load_protocol, runtime_protocol
 
 
 def call(name, **parameters):
@@ -87,6 +89,66 @@ def test_prepare_preserves_user_goals_order_generator_and_template(prepared_insp
     assert config.inspection_rl.turn_max_tokens == 8192
 
 
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ([], {"queue": 600, "generation": 150, "download": 120}),
+        (
+            [
+                "video_rl.h3_phase_timeouts.queue=300",
+                "video_rl.timeouts.h3=75",
+                "video_rl.h3_phase_timeouts.download=60",
+            ],
+            {"queue": 300, "generation": 75, "download": 60},
+        ),
+        (["video_rl.h3_phase_timeouts=null"], None),
+    ],
+)
+def test_both_entry_points_share_one_h3_configuration(prepared_inspection, overrides, expected):
+    inspection, source = prepared_inspection
+    for entry, prepared in ((rl, source), (inspection_rl, inspection)):
+        args = entry.parse_args(
+            [
+                "train",
+                "--run-dir",
+                str(prepared.run_dir),
+                "--data-dir",
+                str(prepared.data_dir),
+                "--",
+                "actor_rollout_ref.rollout.n=4",
+                *overrides,
+            ]
+        )
+        config, _ = entry.training_config(args)
+        runtime = runtime_protocol(load_protocol(prepared.run_dir / "protocol.json"), config.video_rl)
+        assert runtime["h3_phase_timeouts"] == expected
+        assert worker_timeout(runtime, config.video_rl.timeouts.h3) == (
+            sum(expected.values()) + 60 if expected else config.video_rl.timeouts.h3
+        )
+        if entry is inspection_rl:
+            assert not {"h3_queue_timeout_seconds", "h3_download_timeout_seconds"} & set(config.inspection_rl)
+
+
+@pytest.mark.parametrize("invalid", ["queue=0", "download=-1", "generation=true"])
+def test_both_launchers_reject_invalid_phase_budgets(prepared_inspection, invalid):
+    inspection, source = prepared_inspection
+    for entry, prepared in ((rl, source), (inspection_rl, inspection)):
+        args = entry.parse_args(
+            [
+                "train",
+                "--run-dir",
+                str(prepared.run_dir),
+                "--data-dir",
+                str(prepared.data_dir),
+                "--",
+                "actor_rollout_ref.rollout.n=4",
+                f"video_rl.h3_phase_timeouts.{invalid}",
+            ]
+        )
+        with pytest.raises(ValueError, match="H3 phase budgets"):
+            entry.training_config(args)
+
+
 @pytest.fixture
 def native_factory(prepared_inspection, monkeypatch):
     from examples.video_agents import inspection_loop
@@ -114,7 +176,7 @@ def native_factory(prepared_inspection, monkeypatch):
     report = {"status": "ok", "evidence": "full observation " * 100, "sentinel": "END_OF_REPORT"}
 
     def generate(directory, protocol, request):
-        assert protocol["h3_phase_timeouts"] == {"queue": 600, "generation": 150, "download": 120}
+        assert protocol["h3_phase_timeouts"] == phase_budgets(config.video_rl)
         generated.append(deepcopy(request))
         return {
             "status": "succeeded",
@@ -153,6 +215,17 @@ def native_factory(prepared_inspection, monkeypatch):
         return loop
 
     return make, row, generated, inspected, requests, report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phases", [None, {"queue": 300, "generation": 75, "download": 60}])
+async def test_inspection_loop_uses_shared_h3_budgets(native_factory, phases):
+    make, row, generated, _, _, _ = native_factory
+    loop = make([G, F])
+    loop.config.video_rl.h3_phase_timeouts = phases
+    await loop.run({}, **row)
+    assert len(generated) == 1
+    assert loop.protocol["h3_phase_timeouts"] == phases
 
 
 @pytest.mark.asyncio

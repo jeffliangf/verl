@@ -32,6 +32,7 @@ from .config import (
     ROOT,
 )
 from .dataset import load_samples, reference_inventory
+from .h3_deadlines import phase_budgets, worker_timeout
 from .judge import EXTERNAL_FILES
 from .observability import summarize_timings
 from .storage import (
@@ -45,7 +46,7 @@ from .storage import (
     run_lock,
     write_json,
 )
-from .tournament import GROUP_SIZE, load_protocol, validate_group_size
+from .tournament import GROUP_SIZE, load_protocol, runtime_protocol, validate_group_size
 
 CONFIG_DIR = Path(__file__).with_name("configs")
 DEFAULT_DATA_DIR = ROOT / "data/prompt_rewrite_rl"
@@ -228,7 +229,9 @@ def training_config(args):
         or config.actor_rollout_ref.model.path != args.model
     ):
         raise ValueError("Evaluation loads --model and requires val_only, val_before_train, and resume_mode=disable")
-    group_size = load_protocol(directory / "protocol.json")["group_size"]
+    protocol = load_protocol(directory / "protocol.json")
+    runtime_protocol(protocol, config.video_rl)
+    group_size = protocol["group_size"]
     if (
         not config.trainer.use_v1
         or config.trainer.v1.trainer_mode != "sync"
@@ -342,6 +345,8 @@ def train(args) -> dict:
         "model": config.actor_rollout_ref.model.path,
         "h3_model": protocol["h3"]["model"],
         "h3_endpoints": protocol["h3_endpoints"],
+        "h3_phase_timeouts": phase_budgets(config.video_rl),
+        "h3_worker_timeout_seconds": worker_timeout(config.video_rl, config.video_rl.timeouts.h3),
         "reference_h3": protocol["reference_h3"],
         "train_prompts": len(protocol["samples"]["train"]),
         "eval_prompts": len(protocol["samples"]["val"]),

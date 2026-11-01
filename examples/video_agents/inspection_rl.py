@@ -22,9 +22,10 @@ from pathlib import Path
 
 from . import rl
 from .config import ROOT
+from .h3_deadlines import phase_budgets, worker_timeout
 from .inspection_agent import feedback
 from .storage import atomic_text, file_sha256, fingerprint, freeze_json, read_json, read_jsonl, run_lock
-from .tournament import load_protocol
+from .tournament import load_protocol, runtime_protocol
 
 SYSTEM_EXTENSION = (
     "Balance expected improvements in final video quality against the resource cost of additional tool calls. "
@@ -113,8 +114,6 @@ def training_config(args):
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
-    from .h3_deadlines import phase_budgets
-
     directory, data_dir = map(rl.local_path, (args.run_dir, args.data_dir))
     overrides = [
         *list(OmegaConf.load(CONFIG_DIR / "inspection_rl.yaml")["overrides"]),
@@ -133,15 +132,7 @@ def training_config(args):
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
         config = compose(config_name="rl", overrides=overrides)
     protocol = load_protocol(directory / "protocol.json")
-    phase_budgets(
-        {
-            "h3_phase_timeouts": {
-                "queue": config.inspection_rl.h3_queue_timeout_seconds,
-                "generation": config.video_rl.timeouts.h3,
-                "download": config.inspection_rl.h3_download_timeout_seconds,
-            }
-        }
-    )
+    runtime_protocol(protocol, config.video_rl)
     rollout = config.actor_rollout_ref.rollout
     if (
         not config.trainer.use_v1
@@ -218,6 +209,8 @@ def train(args):
         "training_episodes_per_update": episodes,
         "generation_calls_per_update": [episodes, 2 * episodes],
         "max_inspections_per_update": episodes,
+        "h3_phase_timeouts": phase_budgets(config.video_rl),
+        "h3_worker_timeout_seconds": worker_timeout(config.video_rl, config.video_rl.timeouts.h3),
         "reward": frozen["reward"],
         "context": {
             "prompt": config.data.max_prompt_length,

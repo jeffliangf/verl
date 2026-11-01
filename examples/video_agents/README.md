@@ -134,15 +134,16 @@ An all-neutral group of four valid videos has zero GRPO advantages, although the
 actor's KL loss can still contribute a gradient. Evaluation always requires real
 judgments and never uses training fallback ledgers.
 
-`video_rl.timeouts` in `configs/rl.yaml` is the only source of provider limits.
-They apply at launch without changing the frozen protocol, so a resumed run adopts
-them; limits frozen by older runs are ignored. Service limits are about twice the
-healthy P99 measured in canary job 2391, dropping the slowest ~1% of work instead
-of waiting for it:
+Provider limits live under `video_rl` in `configs/rl.yaml`, shared by `rl.py` and
+`inspection_rl.py`. Launch settings replace limits frozen by older protocols.
+The request/judge limits below retain their canary settings; H3 uses separate
+queue, rendering and transfer budgets:
 
 | Stage | Healthy P99 | Limit |
 | --- | ---: | ---: |
-| H3 worker: admission, generation, download, media checks (`h3`) | 80 s | 150 s |
+| H3 server queue (`h3_phase_timeouts.queue`) | — | 600 s |
+| H3 rendering (`timeouts.h3`) | — | 150 s |
+| H3 download and media checks (`h3_phase_timeouts.download`) | — | 120 s |
 | One H3 HTTP request (`h3_request`) | 4 s | 30 s |
 | One Gemini judgment (`judge_request`) | 20-22 s | 45 s |
 | Gemini upload and file processing (`judge_file`) | 10-12 s | 60 s |
@@ -150,10 +151,17 @@ of waiting for it:
 | One presentation-order pass (`judge_pass`) | 65-132 s | 300 s |
 | LLM turn (`llm`) | 130-187 s | 900 s |
 
-H3 recovery keeps the **150-second in-flight limit**, including admission,
-polling, retries, regeneration, download, and media checks. On a gateway whose
-health response advertises `idempotency_key: true`, the client persists a caller
-UUID before submitting it as `Idempotency-Key`. An uncertain response is retried
+H3 rendering is measured from the gateway's worker-start and finish timestamps;
+server queueing and downloading do not consume its 150 seconds. Queue and render
+usage accumulate across backend retries. Download retries share one transfer
+deadline. A final subprocess guard is the sum of these budgets plus 60 seconds
+for control operations: **930 seconds** with the defaults. Both launcher previews
+print the resolved phase budgets and process limit. Set
+`video_rl.h3_phase_timeouts=null` to reproduce the old combined `timeouts.h3`
+deadline. The inspection preset has no separate H3 timeout settings.
+
+On a gateway whose health response advertises `idempotency_key: true`, the client
+persists a caller UUID before submitting it as `Idempotency-Key`. An uncertain response is retried
 with the same key, exact inputs, and gateway. A 502 carrying an accepted job ID
 switches directly to polling. Saved attempts bypass new-admission readiness
 checks; a full queue does not prevent recovering an existing job.
@@ -172,15 +180,18 @@ It preserves the policy response and successful sibling videos. The original
 deadline and generation history survive client restarts; retries never renew the
 budget. A timeout or unknown failure code does not authorize regeneration. Older
 keyless ambiguous submissions remain unresolved rather than receiving a new key.
-The gateway's 600-second worker-loss detection can outlast this client budget;
-such a candidate still fails at 150 seconds and leaves its job identity available.
+Timed-out candidates leave their job identities available; expired budgets are
+not automatically renewed.
 
 `video_rl.h3_max_inflight` defaults to 2 across all agent workers in a run, using
 advisory locks in the shared output directory. With both training jobs running,
 this permits four client operations in total. Set it to 4 for a single job using
 the four-worker H3 pool. Slot waiting occurs before the generation subprocess
 starts, outside its in-flight deadline. Recovery budgets are launch-time settings
-and do not rewrite frozen experiment or candidate inputs.
+and do not rewrite frozen experiment or candidate inputs. When resuming an
+existing experiment with new limits, record a configuration revision and archive
+its previous resolved training config; the launcher rejects silently overwriting
+`training-config.json`.
 
 The LLM limit is a stall guard, not a tail cut. An LLM turn takes about its
 response tokens divided by ~15 tokens/s (r = 0.997 in job 2391), so

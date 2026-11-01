@@ -523,8 +523,8 @@ def test_gemini_refusals_and_errors_fail_the_example_with_their_reason(
     assert not (group / "rewards.json").exists()
 
 
-@pytest.mark.parametrize("stage", ["h3", "judge"])
-def test_hard_timeouts_raise_without_neutral_fallbacks(prepared_rl, tmp_path, monkeypatch, stage):
+@pytest.mark.parametrize("stage,limit", [("h3", 930), ("judge", 300)])
+def test_hard_timeouts_raise_without_neutral_fallbacks(prepared_rl, tmp_path, monkeypatch, stage, limit):
     directory, protocol, _ = prepared_rl
     protocol = {**protocol, "judge_failure_policy": "drop"}
     calls = []
@@ -543,7 +543,7 @@ def test_hard_timeouts_raise_without_neutral_fallbacks(prepared_rl, tmp_path, mo
             tournament.score_group(
                 directory / "group", protocol, protocol["samples"]["train"][0], candidates(tmp_path), validate=False
             )
-    assert [call["timeout"] for call in calls] == [protocol["timeouts"]["h3" if stage == "h3" else "judge_pass"]]
+    assert [call["timeout"] for call in calls] == [limit]
     assert calls[0]["check"] is True and calls[0]["stderr"] == subprocess.STDOUT
     log = "candidate/h3-worker.log" if stage == "h3" else "group/judge/runner-original.log"
     assert (directory / log).exists()
@@ -669,7 +669,7 @@ def test_h3_adapter_reuses_existing_worker_and_validates_artifacts(prepared_rl, 
         get_json=lambda url, **kw: (
             {"status": "ready", "queued": 0, "queue_capacity": 8}
             if url.endswith("/healthz")
-            else {"id": job_id, "status": "succeeded"}
+            else {"id": job_id, "status": "succeeded", "created_at": 100, "started_at": 110, "finished_at": 140}
         ),
         download=lambda origin, job_id, path, **kw: path.write_bytes(b"video"),
     )
@@ -997,6 +997,8 @@ def test_launcher_preview_uses_base_model_and_never_executes(prepared_rl, monkey
     assert summary["videos_per_training_batch"] == 64
     assert summary["judgments_per_training_batch"] == 192
     assert summary["execute"] is False
+    assert summary["h3_phase_timeouts"] == {"queue": 600, "generation": 150, "download": 120}
+    assert summary["h3_worker_timeout_seconds"] == 930
     config, _ = rl.training_config(args)
     assert config.data.train_files == str(prepared_args.data_dir / "train.jsonl")
     assert config.data.val_files == str(prepared_args.data_dir / "val.jsonl")
@@ -1188,6 +1190,25 @@ async def test_checkpoint_evaluation_keeps_videos_in_its_output_directory(loop_f
     output = await loop.run({}, **model_request)
     assert Path(output.extra_fields["h3_result"]["path"]).is_relative_to(output_dir)
     assert not Path(output.extra_fields["h3_result"]["path"]).is_relative_to(original_dir)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phases", [None, {"queue": 300, "generation": 75, "download": 60}])
+async def test_terminal_loop_forwards_shared_h3_budgets(loop_factory, model_request, monkeypatch, phases):
+    from examples.video_agents import agent
+
+    make, generated = loop_factory
+    loop = make()
+    loop.config.video_rl.h3_phase_timeouts = phases
+    generate = agent.generate_video
+
+    def check(directory, protocol, request):
+        assert protocol["h3_phase_timeouts"] == phases
+        return generate(directory, protocol, request)
+
+    monkeypatch.setattr(agent, "generate_video", check)
+    await loop.run({}, **model_request)
+    assert len(generated) == 1
 
 
 @pytest.mark.asyncio
@@ -1699,11 +1720,21 @@ def test_launch_config_supplies_every_limit_and_keeps_the_frozen_identity(prepar
     assert {key: runtime[key] for key in h3.RECOVERY_DEFAULTS} == dict(h3.RECOVERY_DEFAULTS)
     assert all(VIDEO_RL[key] == default for key, default in h3.RECOVERY_DEFAULTS.items())
     assert runtime["max_judge_fallback_fraction"] == VIDEO_RL.max_judge_fallback_fraction == 0.75
+    assert runtime["h3_phase_timeouts"] == {"queue": 600, "generation": 150, "download": 120}
     assert runtime["protocol_sha256"] == fingerprint(frozen) == read_json(directory / "protocol-sha256.json")
     assert tournament.runtime_protocol(runtime, VIDEO_RL)["protocol_sha256"] == fingerprint(frozen)
     # Limits frozen by older runs are replaced, not merged.
-    legacy = {**frozen, "timeouts": {"llm": 1, "unmeasured": 2}}
+    legacy = {
+        **frozen,
+        "timeouts": {"llm": 1, "unmeasured": 2},
+        "h3_phase_timeouts": {"queue": 1, "generation": 2, "download": 3},
+    }
     assert tournament.runtime_protocol(legacy, VIDEO_RL)["timeouts"] == dict(VIDEO_RL.timeouts)
+    assert tournament.runtime_protocol(legacy, VIDEO_RL)["h3_phase_timeouts"] == runtime["h3_phase_timeouts"]
+    disabled_settings = OmegaConf.merge(VIDEO_RL, {"h3_phase_timeouts": None})
+    disabled = tournament.runtime_protocol(legacy, disabled_settings)
+    assert disabled["h3_phase_timeouts"] is None
+    assert legacy["h3_phase_timeouts"] == {"queue": 1, "generation": 2, "download": 3}
 
 
 @pytest.mark.parametrize(
@@ -1759,8 +1790,7 @@ def test_rl_config_timeouts_reach_the_judge_runner(prepared_rl, tmp_path, monkey
 def test_h3_worker_receives_runtime_limit_and_frozen_protocol_identity(prepared_rl, monkeypatch, phases):
     directory, protocol, _ = prepared_rl
     protocol = {**protocol, "h3_max_request_attempts": 5, "h3_max_generation_attempts": 3}
-    if phases:
-        protocol["h3_phase_timeouts"] = phases
+    protocol["h3_phase_timeouts"] = phases
     expected_timeout = 930 if phases else 150
     calls = []
 

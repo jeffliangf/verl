@@ -121,11 +121,6 @@ class InspectionLoop(ToolAgentLoop):
 
     async def run(self, sampling_params, **kwargs):
         self.protocol = runtime_protocol(load_protocol(Path(self.config.video_rl.protocol)), self.config.video_rl)
-        self.protocol["h3_phase_timeouts"] = {
-            "queue": self.config.inspection_rl.h3_queue_timeout_seconds,
-            "generation": self.protocol["timeouts"]["h3"],
-            "download": self.config.inspection_rl.h3_download_timeout_seconds,
-        }
         schemas = kwargs["tools"]
         if [s["function"]["name"] for s in schemas] != ["sol_h3", "inspect_video", "finish_video"]:
             raise ValueError("Prepared inspection rows must supply the three native actions in order")

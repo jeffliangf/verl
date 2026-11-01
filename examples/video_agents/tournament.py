@@ -60,6 +60,8 @@ def validate_group_size(value) -> int:
 
 def runtime_protocol(protocol: dict, settings) -> dict:
     """Attach the launch-time provider limits from video_rl; the frozen identity is kept."""
+    from .h3_deadlines import phase_budgets
+
     timeouts = dict(settings.get("timeouts") or {})
     if set(timeouts) != set(TIMEOUT_STAGES):
         raise ValueError(f"video_rl.timeouts must set exactly: {', '.join(TIMEOUT_STAGES)}")
@@ -90,6 +92,7 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         **protocol,
         **h3.recovery_settings(settings),
         "timeouts": timeouts,
+        "h3_phase_timeouts": phase_budgets(settings),
         "judge_max_attempts": attempts,
         "judge_concurrency": concurrency,
         "judge_failure_policy": policy,

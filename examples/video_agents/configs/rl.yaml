@@ -15,14 +15,14 @@ video_rl:
   # Stop a persistent outage after replacing at most one training batch of groups.
   max_dropped_groups_per_step: ${data.train_batch_size}
 
-  # The only provider limits, in seconds; a frozen protocol's own limits are
-  # ignored. Service limits are about 2x the healthy P99 of canary job 2391, so
-  # the slowest ~1% is dropped instead of awaited.
+  # Shared provider limits for rl.py and inspection_rl.py, in seconds.
+  # Launch settings replace any limits recorded in a frozen protocol.
   timeouts:
     # A stall guard, not a tail cut: an LLM turn takes ~response tokens / 15 tok/s,
     # so data.max_response_length (8192) bounds it near 540 s. A lower limit would
     # drop the policy's own long outputs instead of scoring them; cap tokens instead.
     llm: 900
+    # Rendering budget when phase timeouts are enabled; total worker budget otherwise.
     h3: 150
     h3_request: 30
     judge_request: 45
@@ -30,8 +30,15 @@ video_rl:
     judge_control: 15
     judge_pass: 300
 
-  # H3 retries share the 150-second in-flight deadline. A new generation is
-  # allowed only after a confirmed terminal failure, keeping the original inputs.
+  # Queueing and artifact transfer do not consume the rendering budget.
+  # Set this mapping to null to reproduce the legacy combined H3 deadline.
+  h3_phase_timeouts:
+    queue: 600
+    generation: ${video_rl.timeouts.h3}
+    download: 120
+
+  # Retries share the phase budgets (or the legacy total deadline when disabled).
+  # A new generation requires a confirmed terminal failure and keeps the same inputs.
   h3_max_request_attempts: 3
   h3_max_generation_attempts: 2
 
