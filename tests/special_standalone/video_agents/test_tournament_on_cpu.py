@@ -1382,7 +1382,7 @@ def native_worker(prepared_rl, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("group_size", [4, 6])
+@pytest.mark.parametrize("group_size", [4, 6, 8])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("failure", [None, "rollout", "judge", "h3_provider", "judge_provider", "mixed"])
 async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(
@@ -1483,13 +1483,15 @@ async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(
         assert events == ["running", "score", *(["publish"] * group_size), "finished"]
         end = [row for row in read_jsonl(worker.output_dir / "timings.jsonl") if row["event"] == "end"][-1]
         assert end["status"] == "succeeded" and end["scores"] == pytest.approx(scores)
+        saved = read_json(next(worker.output_dir.rglob("trajectories.json")))
+        assert all("episode" not in row for row in saved["rollouts"])
         for i, row in enumerate(published):
             assert row["keys"] == [f"uid0_{i}_0"]
             fields = row["fields"]
             assert fields["rm_scores"][0].sum().item() == pytest.approx(scores[i])
             assert fields["loss_mask"][0].tolist() == [1, 1, 0]
             assert fields["rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2, 0])
-            assert fields["extra_fields"][0]["reward_extra_info"]["valid_call"] == 1
+            assert fields["extra_fields"][0]["reward_extra_info"] == {"score": scores[i], "valid_call": 1.0}
     assert bool(closed) == streaming
 
 
@@ -1753,27 +1755,35 @@ def test_rl_config_timeouts_reach_the_judge_runner(prepared_rl, tmp_path, monkey
     assert float(command[command.index("--file-control-timeout") + 1]) == 15
 
 
-def test_h3_worker_receives_runtime_limit_and_frozen_protocol_identity(prepared_rl, monkeypatch):
+@pytest.mark.parametrize("phases", [None, {"queue": 600, "generation": 150, "download": 120}])
+def test_h3_worker_receives_runtime_limit_and_frozen_protocol_identity(prepared_rl, monkeypatch, phases):
     directory, protocol, _ = prepared_rl
     protocol = {**protocol, "h3_max_request_attempts": 5, "h3_max_generation_attempts": 3}
+    if phases:
+        protocol["h3_phase_timeouts"] = phases
+    expected_timeout = 930 if phases else 150
     calls = []
 
     def run(command, **kwargs):
         calls.append(kwargs["timeout"])
         assert command[command.index("--max-request-attempts") + 1] == "5"
         assert command[command.index("--max-generation-attempts") + 1] == "3"
+        assert float(command[command.index("--timeout") + 1]) == expected_timeout
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 
     monkeypatch.setattr(tournament.subprocess, "run", run)
-    with pytest.raises(ProviderError, match="150"):
+    with pytest.raises(ProviderError, match=str(expected_timeout)):
         tournament.generate_video(
             directory / "candidate", protocol, {"prompt": "A valid video prompt", "duration": 10, "seed": 42}
         )
-    assert calls == [150]
+    assert calls == [expected_timeout]
     worker_protocol = read_json(directory / "candidate/protocol.json")
     assert worker_protocol["rl_protocol_sha256"] == read_json(directory / "protocol-sha256.json")
     assert worker_protocol["timeouts"] == {"h3_request": 30}
     expected = {"h3", "h3_endpoints", "media_profile", "eval_repo", "timeouts", "rl_protocol_sha256"}
+    if phases:
+        expected.add("h3_phase_timeouts")
+        assert worker_protocol["h3_phase_timeouts"] == phases
     assert set(worker_protocol) == expected
 
 

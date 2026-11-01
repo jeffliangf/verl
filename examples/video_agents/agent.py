@@ -225,6 +225,10 @@ class TournamentWorker(AgentLoopWorkerTQBase):
         # Delay the native TQ publication until the complete tournament is scored.
         return output
 
+    def reward_metadata(self, output):
+        """Optional episode accounting; never changes the video-quality reward."""
+        return {}
+
     async def generate_sequences(self, batch):
         """Return one record per prompt group: its rewards, or why it was dropped."""
         await super().generate_sequences(batch)
@@ -318,6 +322,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                             "response_logprobs": output.response_logprobs,
                             "response_mask": output.response_mask,
                             "h3_result": output.extra_fields["h3_result"],
+                            **({"episode": output.extra_fields["episode"]} if "episode" in output.extra_fields else {}),
                         }
                         for output in results
                     ],
@@ -333,6 +338,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 **({"streamed": True} if stream is not None else {}),
             )
             for i, (output, reward) in enumerate(zip(results, rewards, strict=True)):
+                reward.update(self.reward_metadata(output))
                 output.reward_score = reward["score"]
                 output.extra_fields["reward_extra_info"] = reward
                 await super()._agent_loop_postprocess(output, validate, session_id=i, **prompt)
@@ -374,6 +380,8 @@ class TournamentWorker(AgentLoopWorkerTQBase):
 class TournamentManager(AgentLoopManagerTQ):
     """Keep native worker dispatch and enforce synchronous, complete-group rewards."""
 
+    worker_class = TournamentWorker
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if not self.config.trainer.use_v1 or self.config.trainer.v1.trainer_mode != "sync":
@@ -384,7 +392,7 @@ class TournamentManager(AgentLoopManagerTQ):
         if self.config.video_rl.max_dropped_groups_per_step < 1:
             raise ValueError("video_rl.max_dropped_groups_per_step must be positive")
         self.reward_loop_worker_handles = None
-        self.agent_loop_workers_class = ray.remote(TournamentWorker)
+        self.agent_loop_workers_class = ray.remote(self.worker_class)
         self._drop_step, self._dropped_groups = None, 0
         self._eval_step, self._eval_records = None, []
 

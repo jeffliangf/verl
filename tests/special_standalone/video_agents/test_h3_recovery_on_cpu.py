@@ -468,3 +468,144 @@ def test_real_http_recovery_keeps_one_generation(candidate):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.fixture
+def phased(candidate, monkeypatch):
+    from examples.video_agents.h3_deadlines import worker_timeout
+
+    c = candidate
+    c.protocol["h3_phase_timeouts"] = {"queue": 600, "generation": 150, "download": 120}
+    c.run = lambda: h3.generate_one(
+        c.task, c.protocol, c.client, lambda path: MEDIA, timeout=worker_timeout(c.protocol, 150)
+    )
+    original = c.client.get_json
+    c.snapshots = []
+    c.epoch = c.clock.time()
+
+    def status(url, **kwargs):
+        response = original(url, **kwargs)
+        if not url.endswith("/healthz"):
+            elapsed, values = c.snapshots[0]
+            if len(c.snapshots) > 1:
+                c.snapshots.pop(0)
+            c.clock.elapsed = max(c.clock.elapsed, elapsed)
+            response.update(values)
+        return response
+
+    monkeypatch.setattr(c.client, "get_json", status)
+    return c
+
+
+def test_long_queue_does_not_consume_render_budget(phased):
+    c = phased
+    c.snapshots = [
+        (300, {"status": "queued", "created_at": c.epoch}),
+        (320, {"status": "running", "created_at": c.epoch, "started_at": c.epoch + 300}),
+        (
+            340,
+            {
+                "status": "succeeded",
+                "created_at": c.epoch,
+                "started_at": c.epoch + 300,
+                "finished_at": c.epoch + 340,
+            },
+        ),
+    ]
+    assert c.run()
+    assert c.clock.elapsed == 340 and len(c.client.posts) == 1
+    assert (
+        c.client.posts[0][1] == c.task["request"] == {"prompt": "Preserve this exact prompt", "duration": 10, "seed": 7}
+    )
+    assert list(c.state()["phase_usage_by_job"].values()) == [{"queue": 300, "generation": 40}]
+
+
+def test_late_poll_uses_completed_server_interval(phased):
+    c = phased
+    c.snapshots = [(700, {"created_at": c.epoch, "started_at": c.epoch + 300, "finished_at": c.epoch + 340})]
+    assert c.run() and c.clock.elapsed == 700
+    assert list(c.state()["phase_usage_by_job"].values()) == [{"queue": 300, "generation": 40}]
+
+
+@pytest.mark.parametrize(
+    "phase,elapsed,started",
+    [("queue", 601, None), ("generation", 451, 300)],
+)
+def test_each_phase_expires_without_creating_another_job(phased, phase, elapsed, started):
+    c = phased
+    values = {"status": "queued" if started is None else "running", "created_at": c.epoch}
+    if started is not None:
+        values["started_at"] = c.epoch + started
+    c.snapshots = [(elapsed, values)]
+    assert not c.run()
+    assert c.state()["timeout_phase"] == phase and c.state()["error_stage"] == "provider"
+    assert len(c.client.posts) == 1 and not c.client.downloads
+
+
+def test_download_deadline_is_separate_and_survives_resume(phased, monkeypatch):
+    c = phased
+    c.snapshots = [(340, {"created_at": c.epoch, "started_at": c.epoch + 300, "finished_at": c.epoch + 340})]
+    download = c.client.download
+
+    def slow_download(*args, **kwargs):
+        c.clock.elapsed += 121
+        return download(*args, **kwargs)
+
+    monkeypatch.setattr(c.client, "download", slow_download)
+    assert not c.run()
+    before = c.state()
+    assert before["timeout_phase"] == "download"
+    assert before["download_deadline_at"] == c.epoch + 460
+    assert not c.run()
+    assert c.state()["download_deadline_at"] == before["download_deadline_at"]
+    assert len(c.client.downloads) == len(c.client.posts) == 1
+
+
+def test_regeneration_accumulates_server_execution_intervals(phased):
+    c = phased
+    c.client.generation_results = ["worker_restarted", "succeeded"]
+    c.snapshots = [
+        (400, {"created_at": c.epoch, "started_at": c.epoch + 300, "finished_at": c.epoch + 400}),
+        (560, {"created_at": c.epoch + 400, "started_at": c.epoch + 500, "finished_at": c.epoch + 560}),
+    ]
+    assert not c.run()
+    assert len(c.client.posts) == 2 and not c.client.downloads
+    assert c.state()["timeout_phase"] == "generation"
+    assert sum(row["generation"] for row in c.state()["phase_usage_by_job"].values()) == 160
+
+
+def test_interrupted_queue_keeps_original_budgets(phased, monkeypatch):
+    c = phased
+    c.snapshots = [(300, {"status": "queued", "created_at": c.epoch})]
+    sleep = c.clock.sleep
+    monkeypatch.setattr(c.clock, "sleep", lambda seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        c.run()
+    before = c.state()
+    monkeypatch.setattr(c.clock, "sleep", sleep)
+    c.snapshots = [(640, {"created_at": c.epoch, "started_at": c.epoch + 601, "finished_at": c.epoch + 640})]
+    assert not c.run()
+    assert c.state()["deadline_at"] == before["deadline_at"]
+    assert c.state()["timeout_phase"] == "queue"
+    assert len(c.client.posts) == 1
+    assert list(c.state()["phase_usage_by_job"].values()) == [{"queue": 601, "generation": 39}]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [{}, {"created_at": True}, {"created_at": 10, "started_at": 9, "finished_at": 11}],
+)
+def test_phase_accounting_requires_valid_gateway_timestamps(phased, values):
+    c = phased
+    c.snapshots = [(0, values)]
+    assert not c.run()
+    assert c.state()["error_stage"] == "protocol"
+    assert len(c.client.posts) == 1 and not c.client.downloads
+
+
+@pytest.mark.parametrize("value", [0, -1, True, float("nan"), float("inf"), "1800"])
+def test_invalid_phase_budgets_are_rejected(value):
+    from examples.video_agents.h3_deadlines import phase_budgets
+
+    with pytest.raises(ValueError, match="positive finite"):
+        phase_budgets({"h3_phase_timeouts": {"queue": value, "generation": 150, "download": 120}})

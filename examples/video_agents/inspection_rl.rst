@@ -1,0 +1,91 @@
+Inspection RL V1-1
+==================
+
+``inspection_rl.py`` reuses a frozen video-only RL experiment. Preparation copies
+its ordered train/evaluation rows and generator schema, adds the V1 inspector and
+``finish_video``, and appends one paragraph to the original system prompt. It does
+not change the user's goal, references, Gemini comparison rubric, or GRPO reward.
+
+The environment permits three successful trajectories::
+
+    sol_h3 -> finish_video
+    sol_h3 -> inspect_video -> finish_video
+    sol_h3 -> inspect_video -> sol_h3  (automatic termination)
+
+Limits are checked before backend execution. Each trajectory has at most two
+generation calls and one inspection; a second generation requires inspection.
+Invalid policy actions retain the original tournament's invalid-call treatment.
+Provider failures trigger the existing complete-group replacement mechanism.
+Backend retries are distinct from policy calls and retain the original inputs.
+
+H3 queueing has a separate 600-second budget. The existing 150-second H3 limit
+applies to rendering, measured from the gateway's worker-start timestamp to its
+finish timestamp. Queue and render time are accumulated across backend retries;
+neither budget is reset by resuming a saved job. Artifact download and validation
+have a separate 120-second deadline. A final subprocess guard is the sum of these
+budgets plus 60 seconds for control operations. The inspection configuration
+exposes queue and download limits; ``video_rl.timeouts.h3`` controls rendering.
+These settings do not change the video-only experiment's legacy total deadline.
+
+The generator keeps its configurable seed (default 42, valid range 0 through
+9223372036854775807) and 5/10-second duration (default 10). ``inspect_video`` accepts
+only a registered ``video_id``. The server supplies the immutable original goal
+and the actual generation prompt to the unchanged V1 Gemini feedback backend.
+The policy receives the complete feedback JSON plus environment counters and
+available actions. Gemini receives no stopping budget and supplies no overall
+verdict or stopping decision. ``finish_video`` is a terminal control action,
+not a paid service.
+
+The continuation allowance is 28,672 tokens, including observations, after a
+4,096-token initial prompt allowance, with a 32,768-token model context. Each
+policy turn is capped at 8,192 tokens and the remaining episode budget. Native
+continuous token histories preserve generated reasoning and log probabilities.
+Only policy-generated tokens have loss mask 1; tool observations and inserted
+chat delimiters have loss mask 0. Oversized observations are never silently
+truncated, and exhausted trajectories do not silently select an earlier video.
+
+Rewards remain final-video quality only. Generation/inspection counts, elapsed
+tool time, policy and observation token counts, revision rate, and stopping paths
+are recorded separately. The cost instruction in the system prompt is therefore
+not an explicit training penalty; learning a calibrated cost tradeoff is deferred.
+
+Preparation and execution::
+
+    uv run python -m examples.video_agents.inspection_rl prepare \
+      --reference-run /path/to/original/grpo \
+      --run-dir /path/to/new/grpo --data-dir /path/to/new/data
+
+    uv run python -m examples.video_agents.inspection_rl train \
+      --run-dir /path/to/new/grpo --data-dir /path/to/new/data --check-tokens
+
+    # Add --execute to launch the reviewed configuration.
+
+The prepared protocol freezes the inspector prompt, schema, implementation,
+settings, source datasets, and evaluation references. Three-day allocation,
+checkpoint storage, retention, monitoring, and recovery belong to the experiment's
+launch files; they are not part of the policy's tool interface.
+
+Compatibility with video-only RL
+--------------------------------
+
+The inspection implementation builds on commit ``74262494`` used by
+``grpo-group8-16h100-20261031``. The inspection changes leave ``rl.py``,
+``configs/rl.yaml``, the generator schema, datasets, system prompt and judge
+implementation unchanged relative to that baseline. Inspection uses its own
+entry point, configuration overrides and loop class.
+
+Three shared files provide integration points. In ``agent.py``, the default
+worker class is still ``TournamentWorker`` and the default reward metadata hook
+returns an empty mapping. Episode metadata is written only for inspection
+trajectories. In ``h3.py`` and ``tournament.py``, phase accounting is enabled only
+when the protocol supplies ``h3_phase_timeouts``. The video-only path retains its
+existing total H3 deadline and worker protocol. Regression tests exercise native
+group-eight dispatch, reward publication, token masks, legacy artifacts and both
+timeout modes.
+
+The original running experiment uses a separate checkout at
+``/home/jeff/verl-grpo-streaming-20261031`` pinned to ``74262494``. Updating this
+branch does not update that checkout or its running processes. Historical launch
+and monitoring sources for the stopped inspection experiment are preserved in
+``inspection_rl_run/``; their embedded paths and allocation IDs describe that
+specific experiment.

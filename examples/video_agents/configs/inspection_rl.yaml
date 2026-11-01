@@ -1,0 +1,20 @@
+# Minimal overrides of the original video-agent RL preset.
+overrides:
+  - +inspection_rl.turn_max_tokens=8192
+  - +inspection_rl.timeout_seconds=900
+  - +inspection_rl.max_inflight=500
+  - +inspection_rl.h3_queue_timeout_seconds=600
+  - +inspection_rl.h3_download_timeout_seconds=120
+  - data.train_batch_size=32
+  - data.max_prompt_length=4096
+  - data.max_response_length=28672
+  - actor_rollout_ref.actor.ppo_mini_batch_size=32
+  - actor_rollout_ref.rollout.n=8
+  - actor_rollout_ref.rollout.max_model_len=32768
+  - actor_rollout_ref.rollout.agent.num_workers=8
+  - actor_rollout_ref.rollout.agent.default_agent_loop=h3_inspection
+  - actor_rollout_ref.rollout.agent.agent_loop_manager_class=examples.video_agents.inspection_loop.InspectionManager
+  - actor_rollout_ref.rollout.multi_turn.max_tool_response_length=1000000
+  - trainer.nnodes=2
+  - trainer.val_before_train=true
+  - trainer.experiment_name=qwen38-h3-inspection-v1-1

@@ -1,0 +1,33 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "inspect_video",
+      "description": "Inspect the video identified by video_id in the context of the original user request and generation prompt. Returns assessment coverage, the observed action sequence, successful elements, findings with supporting evidence, timestamps, severity and confidence, repair goals and priorities, and uncertain observations. The environment supplies the original request and actual generation prompt.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "video_id": {"type": "string", "description": "The ID of a video returned by sol_h3."}
+        },
+        "required": ["video_id"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "finish_video",
+      "description": "Finish the task with a generated video. Identify the final video and briefly summarize the decision.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "final_video_id": {"type": "string", "description": "The ID of the generated video to return."},
+          "decision_summary": {"type": "string", "minLength": 1, "description": "A brief summary of the decision to finish."}
+        },
+        "required": ["final_video_id", "decision_summary"],
+        "additionalProperties": false
+      }
+    }
+  }
+]

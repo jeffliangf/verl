@@ -730,7 +730,11 @@ class _Generation:
 
 
 def generate_one(task, protocol, client, probe, poll_interval=1, timeout=1800):
-    """Recover one video using durable attempt IDs and one total in-flight deadline."""
+    """Recover a durable attempt with a process deadline and optional phase budgets."""
+    if protocol.get("h3_phase_timeouts") is not None:
+        from .h3_deadlines import PhaseTimedGeneration
+
+        return PhaseTimedGeneration(task, protocol, client, probe, poll_interval, timeout).run()
     return _Generation(task, protocol, client, probe, poll_interval, timeout).run()
 
 

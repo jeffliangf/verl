@@ -101,6 +101,8 @@ def runtime_protocol(protocol: dict, settings) -> dict:
 
 def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
     """Execute the policy's complete Sol-H3 request using the existing durable worker."""
+    from .h3_deadlines import phase_budgets, worker_timeout
+
     task = {
         "id": "candidate",
         "request": request,
@@ -113,11 +115,14 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
         "timeouts": {"h3_request": protocol["timeouts"]["h3_request"]},
         "rl_protocol_sha256": protocol["protocol_sha256"],
     }
+    budgets = phase_budgets(protocol)
+    if budgets:
+        worker_protocol["h3_phase_timeouts"] = budgets
     log_path = directory / "h3-worker.log"
     with run_lock(directory):
         freeze_json(directory / "protocol.json", worker_protocol)
         freeze_json(directory / "generation.json", [task])
-        timeout = protocol["timeouts"]["h3"]
+        timeout = worker_timeout(protocol, protocol["timeouts"]["h3"])
         # Recovery settings are launch-time flags, not new frozen inputs. The
         # outer deadline includes every retry and regeneration in the subprocess.
         try:
