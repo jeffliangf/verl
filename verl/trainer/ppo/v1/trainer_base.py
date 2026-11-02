@@ -441,9 +441,7 @@ class PPOTrainer(ABC):
 
         # perform validation before training
         if self.config.trainer.get("val_before_train", True):
-            self.on_validate_begin()
-            val_metrics = self._validate()
-            self.on_validate_end()
+            val_metrics = self._run_validation()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             self.logger.log(data=val_metrics, step=self.global_steps)
@@ -483,7 +481,13 @@ class PPOTrainer(ABC):
 
                 # 2. save checkpoint
                 if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                    is_last_step
+                    or self.global_steps % self.config.trainer.save_freq == 0
+                    or (
+                        self.checkpoint_callback.save_on_validation
+                        and self.config.trainer.test_freq > 0
+                        and self.global_steps % self.config.trainer.test_freq == 0
+                    )
                 ):
                     with marked_timer("save_checkpoint", self.timing_raw, color="green"):
                         self._save_checkpoint()
@@ -496,9 +500,7 @@ class PPOTrainer(ABC):
                 is_last_step or self.global_steps % self.config.trainer.test_freq == 0
             ):
                 with marked_timer("testing", self.timing_raw, color="green"):
-                    self.on_validate_begin()
-                    val_metrics: dict = self._validate()
-                    self.on_validate_end()
+                    val_metrics: dict = self._run_validation()
                     if is_last_step:
                         last_val_metrics = val_metrics
                 metrics.update(val_metrics)
@@ -1031,6 +1033,14 @@ class PPOTrainer(ABC):
         self.checkpoint_callback.on_save(
             trainer=self, global_step=self.global_steps, checkpoint_dir=local_global_step_folder, async_save=False
         )
+
+    def _run_validation(self) -> dict[str, float]:
+        """Run validation and notify checkpoint selection using this step's metrics."""
+        self.on_validate_begin()
+        metrics = self._validate()
+        self.on_validate_end()
+        self.checkpoint_callback.on_validation(trainer=self, global_step=self.global_steps, metrics=metrics)
+        return metrics
 
     def _validate(self) -> dict[str, float]:
         # Lists to collect samples for the table

@@ -69,6 +69,9 @@ video_rl:
   # Held-out evaluation drops unscorable prompts; flag it degraded below this.
   min_valid_eval_fraction: 0.9
 
+  # Keep this many recent complete saves, plus the best overall evaluation score.
+  checkpoint_keep_latest: 2
+
 data:
   train_batch_size: 16
 
@@ -225,5 +228,12 @@ trainer:
   save_freq: 5
 
   test_freq: 10
+
+  checkpoint_callback_class: examples.video_agents.checkpoints.VideoCheckpointCallback
+
+  # The callback owns retention so worker-side rotation cannot delete the best.
+  max_actor_ckpt_to_keep: null
+
+  max_critic_ckpt_to_keep: null
 
   resume_mode: auto

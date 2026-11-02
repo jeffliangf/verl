@@ -300,6 +300,31 @@ per prompt group, not total API requests; `judge_comparisons` counts all planned
 orders, and completed counts exclude fallbacks. Order disagreement uses only pairs
 with two real judgments; neutral fallbacks are not measured judge disagreements.
 
+The default video-agent checkpoint callback also logs
+`val-core/overall/score/mean@1` to TensorBoard. This is exactly
+`(val-aux/aa_eval/score/mean@1 + val-aux/movie_gen_video_bench/score/mean@1) / 2`:
+the two datasets have equal weight, including when their valid counts differ.
+Both scores must be present and finite in the same evaluation pass. The combined
+scalar is logged for initial and evaluation-only passes as well as training.
+
+Both `rl.py` and `inspection_rl.py` retain the latest two complete checkpoints
+plus the checkpoint with the highest overall score. Ties keep the previous best.
+`checkpoints/best_checkpoint.json` records its `step`, relative `checkpoint` path,
+overall `score`, and both source metrics; selection survives trainer restarts.
+This protects the existing checkpoint directory without copying its model and
+optimizer state. An older best can therefore add one checkpoint beyond the two
+recent saves. Old saves are deleted only after the retained shards are verified.
+
+Regular saves remain every `trainer.save_freq` updates. When saving is enabled,
+evaluation steps also save the evaluated weights even if the two intervals differ.
+Initial base-model evaluation is logged without creating a training checkpoint;
+only saved, evaluated checkpoints can become best. `trainer.save_freq=-1` disables
+saving. Set `video_rl.checkpoint_keep_latest` to change the recent-save count.
+The callback requires synchronous FSDP saves with model, optimizer, and extra
+state, and `trainer.max_actor_ckpt_to_keep=null` / `max_critic_ckpt_to_keep=null`
+so worker cleanup cannot delete the best. Custom callbacks replace this policy;
+the archived inspection launchers retain their historical behavior.
+
 ## Local inputs and services
 
 These runtime assets are supplied separately:

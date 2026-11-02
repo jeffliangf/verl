@@ -16,8 +16,8 @@
 Users plug in a custom callback by setting ``trainer.checkpoint_callback_class``
 to the fully qualified class name of a :class:`CheckpointCallback` subclass.
 The trainer instantiates it on the driver process and calls :meth:`CheckpointCallback.on_save`
-after each checkpoint save, mirroring the ``on_save`` event of the HuggingFace
-``transformers`` ``TrainerCallback``. The hook runs only on the driver, after the
+after each checkpoint save and :meth:`CheckpointCallback.on_validation` after validation,
+similar to HuggingFace ``transformers`` ``TrainerCallback`` events. Hooks run only on the driver, after the
 worker-group RPCs; per-rank hooks inside the FSDP/Megatron checkpoint managers
 are out of scope.
 
@@ -33,10 +33,14 @@ from verl.utils.import_utils import load_class_from_fqn
 class CheckpointCallback:
     """No-op base class for trainer checkpoint callbacks.
 
-    Subclass and override :meth:`on_save`. The hook is invoked with keyword
-    arguments and must accept ``**kwargs`` so that additional context can be
+    Subclass and override :meth:`on_save` or :meth:`on_validation`. Hooks are invoked
+    with keyword arguments and must accept ``**kwargs`` so that additional context can be
     passed in future versions without breaking user subclasses.
     """
+
+    # Opt in to saving on evaluation steps as well as regular save steps, while
+    # trainer.save_freq > 0. This gives validation metrics matching saved weights.
+    save_on_validation = False
 
     def __init__(self, config=None):
         """Store the full trainer config for use by subclass hooks.
@@ -60,6 +64,14 @@ class CheckpointCallback:
             checkpoint_dir: The local ``global_step_{N}`` directory that was written.
             async_save: Whether the checkpoint was saved asynchronously.
             **kwargs: Reserved for future context.
+        """
+
+    def on_validation(self, trainer, global_step: int, metrics: dict[str, float], **kwargs) -> None:
+        """Called after a complete validation pass, with metrics for this policy step.
+
+        Also called for initial and validation-only passes, which need not have
+        a saved checkpoint. Failed validation passes do not invoke this hook.
+        Callbacks may add derived scalars to ``metrics`` before the trainer logs it.
         """
 
 

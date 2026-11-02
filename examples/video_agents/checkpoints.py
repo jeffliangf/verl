@@ -1,0 +1,169 @@
+# Copyright 2026 verl contributors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Keep recent video-agent checkpoints and the best balanced held-out score."""
+
+import logging
+import math
+import shutil
+import zipfile
+from pathlib import Path
+
+from verl.trainer.ppo.checkpoint_callback import CheckpointCallback
+
+from .storage import read_json, write_json
+
+logger = logging.getLogger(__name__)
+
+SCORE_METRICS = (
+    "val-aux/aa_eval/score/mean@1",
+    "val-aux/movie_gen_video_bench/score/mean@1",
+)
+OVERALL_SCORE = "val-core/overall/score/mean@1"
+COMPLETE_MARKER = "checkpoint_complete.json"
+
+
+def overall_score(metrics):
+    """Return the equal-weight mean of both datasets, never a partial mean."""
+    scores = [metrics.get(key) for key in SCORE_METRICS]
+    if any(value is None or not math.isfinite(value) for value in scores):
+        return None
+    return sum(float(value) for value in scores) / len(scores)
+
+
+class VideoCheckpointCallback(CheckpointCallback):
+    """Retain the latest N complete FSDP saves plus the highest evaluation score.
+
+    Worker-side rotation must be disabled so it cannot delete the best save.
+    Completion markers identify the directories owned by this callback; existing
+    checkpoints without these markers are left alone. Selection is persisted in
+    ``best_checkpoint.json`` and restored when the trainer restarts.
+    """
+
+    save_on_validation = True
+
+    def __init__(self, config=None):
+        super().__init__(config=config)
+        self.root = Path(config.trainer.default_local_dir).resolve()
+        self.keep_latest = config.video_rl.checkpoint_keep_latest
+        if type(self.keep_latest) is not int or self.keep_latest < 1:
+            raise ValueError("video_rl.checkpoint_keep_latest must be a positive integer")
+        actor = config.actor_rollout_ref.actor
+        if not config.trainer.use_v1 or config.trainer.v1.trainer_mode != "sync":
+            raise ValueError("Video checkpoint selection requires the synchronous V1 trainer")
+        if actor.strategy not in ("fsdp", "fsdp2") or actor.checkpoint.get("async_save", False):
+            raise ValueError("Video checkpoint retention requires synchronous FSDP saves")
+        if not {"model", "optimizer", "extra"}.issubset(actor.checkpoint.save_contents):
+            raise ValueError("Video checkpoint retention requires model, optimizer, and extra state")
+        if (
+            config.trainer.get("max_actor_ckpt_to_keep") is not None
+            or config.trainer.get("max_critic_ckpt_to_keep") is not None
+            or config.trainer.get("remove_previous_ckpt_in_save", False)
+            or config.trainer.del_local_ckpt_after_load
+        ):
+            raise ValueError("Disable worker checkpoint deletion; the video callback owns retention")
+        self.world_size = config.trainer.nnodes * config.trainer.n_gpus_per_node
+        self.best_path = self.root / "best_checkpoint.json"
+        self.best = read_json(self.best_path) if self.best_path.exists() else None
+        if self.best is not None:
+            score = overall_score(self.best["metrics"])
+            if score is None or score != self.best["score"]:
+                raise ValueError("Best checkpoint record has inconsistent scores")
+            if self.best["checkpoint"] != f"global_step_{self.best['step']}":
+                raise ValueError("Best checkpoint record has an inconsistent path")
+            self._verify(self.best["step"])
+
+    def _directory(self, step):
+        if type(step) is not int or step < 0:
+            raise ValueError("Checkpoint step must be a nonnegative integer")
+        directory = self.root / f"global_step_{step}"
+        if directory.is_symlink() or directory.resolve().parent != self.root:
+            raise ValueError(f"Unsafe checkpoint directory: {directory}")
+        return directory
+
+    def _verify(self, step):
+        """Verify all required shards before publishing or deleting checkpoints."""
+        directory = self._directory(step)
+        actor = directory / "actor"
+        if actor.is_symlink() or read_json(actor / "fsdp_config.json")["world_size"] != self.world_size:
+            raise ValueError("Checkpoint actor directory or world size is inconsistent")
+        paths = [directory / "data.pt"]
+        paths.extend(
+            actor / f"{kind}_world_size_{self.world_size}_rank_{rank}.pt"
+            for rank in range(self.world_size)
+            for kind in ("model", "optim", "extra_state")
+        )
+        for path in paths:
+            if path.is_symlink():
+                raise ValueError(f"Unsafe checkpoint file: {path}")
+            with zipfile.ZipFile(path) as archive:
+                if not any(name.endswith("/data.pkl") for name in archive.namelist()):
+                    raise ValueError(f"Invalid PyTorch checkpoint archive: {path}")
+
+    def _completed_steps(self):
+        """Read only checkpoints that this callback has successfully verified."""
+        steps = []
+        for marker in self.root.glob(f"global_step_*/{COMPLETE_MARKER}"):
+            step = read_json(marker)["step"]
+            if marker.is_symlink() or marker.parent != self._directory(step):
+                raise ValueError(f"Unsafe checkpoint completion marker: {marker}")
+            steps.append(step)
+        return sorted(steps, reverse=True)
+
+    def _prune(self):
+        steps = self._completed_steps()
+        retained = set(steps[: self.keep_latest])
+        if self.best is not None:
+            retained.add(self.best["step"])
+        for step in retained:
+            self._verify(step)
+        for step in steps:
+            if step not in retained:
+                shutil.rmtree(self._directory(step))
+
+    def on_save(self, trainer, global_step, checkpoint_dir, async_save=False, **kwargs):
+        directory = self._directory(global_step)
+        if async_save or Path(checkpoint_dir).resolve() != directory:
+            raise ValueError("Expected a synchronous checkpoint in this run's directory")
+        if int((self.root / "latest_checkpointed_iteration.txt").read_text()) != global_step:
+            raise ValueError("Latest checkpoint marker does not match the completed save")
+        if any(step > global_step for step in self._completed_steps()):
+            raise ValueError("Use a new run directory when restarting from an older checkpoint")
+        self._verify(global_step)
+        write_json(directory / COMPLETE_MARKER, {"step": global_step})
+        self._prune()
+
+    def on_validation(self, trainer, global_step, metrics, **kwargs):
+        score = overall_score(metrics)
+        if score is None:
+            logger.warning("Skipping overall score at step %s: both finite dataset scores are required", global_step)
+            return
+        # The trainer logs this same dict to TensorBoard, including initial and
+        # validation-only passes that do not have a training checkpoint.
+        metrics[OVERALL_SCORE] = score
+        if self.config.trainer.get("val_only", False):
+            return
+        directory = self._directory(global_step)
+        if not (directory / COMPLETE_MARKER).exists():
+            return  # Initial base-model evaluation has no saved training state.
+        if self.best is not None and score <= self.best["score"]:
+            return  # Ties keep the existing winner.
+        self._verify(global_step)
+        best = {
+            "step": global_step,
+            "checkpoint": directory.name,
+            "score": score,
+            "metrics": {key: float(metrics[key]) for key in SCORE_METRICS},
+        }
+        # Publish the new winner before releasing the previous best checkpoint.
+        write_json(self.best_path, best)
+        self.best = best
+        self._prune()
+        logger.info("Best checkpoint is step %s with overall score %s", global_step, score)
