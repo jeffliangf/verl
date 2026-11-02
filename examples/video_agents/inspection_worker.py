@@ -14,6 +14,7 @@ import argparse
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,6 +22,21 @@ from .h3 import generation_slot
 from .inspection_agent import feedback
 from .observability import ProviderError, timed_stage
 from .storage import load_external, read_json, write_json
+
+_CLEANUP = ThreadPoolExecutor(max_workers=2, thread_name_prefix="inspection-cleanup")
+
+
+def schedule_cleanup(directory, eval_repo):
+    """Keep owned-media cleanup outside the expired inspection deadline."""
+
+    def cleanup():
+        try:
+            cleanup_uploads(directory, eval_repo)
+        except Exception as exc:
+            # Cleanup must not replace the tool failure or invalidate a ready report.
+            write_json(Path(directory) / "cleanup-error.json", {"error_type": type(exc).__name__})
+
+    _CLEANUP.submit(cleanup)
 
 
 def inspect_video(video, original_request, directory, protocol, settings, output_dir):
@@ -49,8 +65,16 @@ def inspect_video(video, original_request, directory, protocol, settings, output
                         check=False,
                     )
             except subprocess.TimeoutExpired as exc:
-                cleanup_uploads(directory, protocol["eval_repo"])
-                raise ProviderError("inspection", "Gemini inspection exceeded its service deadline") from exc
+                schedule_cleanup(directory, protocol["eval_repo"])
+                path = directory / "worker-result.json"
+                if path.exists():
+                    result = read_json(path)
+                    if result["status"] == "succeeded":
+                        # The report can be ready while the child is deleting its upload.
+                        return result["report"]
+                raise ProviderError(
+                    "inspection", f"Gemini inspection exceeded its {settings['timeout_seconds']}s service deadline"
+                ) from exc
             path = directory / "worker-result.json"
             if not path.exists():
                 raise RuntimeError(f"Inspection worker exited {process.returncode} without a result: {directory}")

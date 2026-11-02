@@ -106,7 +106,7 @@ class InspectionLoop(ToolAgentLoop):
             self.episode.invalid(str(exc))
             return AgentState.TERMINATED
         # Keep the native token merger and zero masks for observations. Override
-        # only dispatch below so service errors propagate and JSON is not cut.
+        # only dispatch below so unhandled service errors propagate and JSON is not cut.
         state = await super()._handle_processing_tools_state(agent_data)
         if self.episode.final_result is not None:
             return AgentState.TERMINATED

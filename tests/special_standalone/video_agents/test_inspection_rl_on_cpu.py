@@ -87,6 +87,7 @@ def test_prepare_preserves_user_goals_order_generator_and_template(prepared_insp
     )
     assert config.data.max_prompt_length + config.data.max_response_length == 32768
     assert config.inspection_rl.turn_max_tokens == 8192
+    assert config.inspection_rl.timeout_seconds == 120
 
 
 @pytest.mark.parametrize(
@@ -286,17 +287,109 @@ async def test_length_truncation_is_scored_not_executed_or_dropped(native_factor
 
 
 @pytest.mark.asyncio
-async def test_inspection_service_failure_propagates_for_group_refill(native_factory, monkeypatch):
+async def test_inspection_service_failure_finishes_with_previous_video(native_factory, monkeypatch):
     from examples.video_agents import inspection_loop
 
-    make, row, _, _, _, _ = native_factory
+    make, row, generated, _, requests, _ = native_factory
 
     def failed(*args):
         raise ProviderError("inspection", "outage")
 
     monkeypatch.setattr(inspection_loop, "inspect_video", failed)
-    with pytest.raises(ProviderError, match="outage"):
+    loop = make([G, INSPECT])
+    output = await loop.run({}, **row)
+    assert len(generated) == 1 and len(requests) == 2
+    assert output.extra_fields["h3_result"] == loop.episode.videos["video_1"]
+    assert output.extra_fields["h3_result"]["status"] == "succeeded"
+    episode = output.extra_fields["episode"]
+    assert episode["terminal_reason"] == "inspection_failed"
+    assert episode["fallback"] == 1 and episode["revised"] == 0
+    assert episode["inspection_calls"] == 1
+    saved = read_json(loop.episode.directory / "episode.json")
+    event = saved["events"][-1]
+    assert event["status"] == "failed" and event["error"] == "outage"
+    assert event["seconds"] >= 0
+    response = event["response"]
+    assert response["status"] == "failed"
+    assert response["error"] == "Inspection tool failed. The previous video is final."
+    assert response["final_video_id"] == "video_1"
+    assert response["environment"]["available_actions"] == []
+    assert "report" not in response
+    policy = [token for token, mask in zip(output.response_ids, output.response_mask, strict=True) if mask]
+    observation = [token for token, mask in zip(output.response_ids, output.response_mask, strict=True) if not mask]
+    assert bytes(policy).decode() == G + INSPECT
+    assert json.dumps(response) in bytes(observation).decode()
+    assert all(
+        logprob == (-0.25 if mask else 0.0)
+        for mask, logprob in zip(output.response_mask, output.response_logprobs, strict=True)
+    )
+    with pytest.raises(InvalidAction):
+        await loop.episode.execute("sol_h3", {"prompt": "Must not revise after inspection failure"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("bad local artifact"), ProviderError("h3", "unrelated failure")])
+async def test_inspection_fallback_does_not_hide_unrelated_errors(native_factory, monkeypatch, error):
+    from examples.video_agents import inspection_loop
+
+    make, row, _, _, _, _ = native_factory
+
+    def failed(*args):
+        raise error
+
+    monkeypatch.setattr(inspection_loop, "inspect_video", failed)
+    with pytest.raises(type(error), match=str(error)):
         await make([G, INSPECT]).run({}, **row)
+
+
+@pytest.mark.asyncio
+async def test_inspection_worker_deadline_ends_episode_without_waiting_for_cleanup(native_factory, monkeypatch):
+    import subprocess
+
+    from examples.video_agents import inspection_loop, inspection_worker
+
+    make, row, generated, _, requests, _ = native_factory
+    cleanup = []
+
+    def timeout(command, **kwargs):
+        assert kwargs["timeout"] == 120
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(inspection_loop, "inspect_video", inspection_worker.inspect_video)
+    monkeypatch.setattr(inspection_worker.subprocess, "run", timeout)
+    monkeypatch.setattr(inspection_worker, "schedule_cleanup", lambda *args: cleanup.append(args))
+    loop = make([G, INSPECT])
+    output = await loop.run({}, **row)
+    assert output.extra_fields["h3_result"] == loop.episode.videos["video_1"]
+    assert output.extra_fields["episode"]["fallback"] == 1
+    assert len(generated) == 1 and len(requests) == 2 and len(cleanup) == 1
+    assert "120s" in loop.episode.events[-1]["error"]
+
+
+def test_report_saved_before_cleanup_timeout_is_kept(tmp_path, monkeypatch):
+    import subprocess
+
+    from examples.video_agents import inspection_worker
+
+    report = {"valid": "inspection feedback"}
+    directory = tmp_path / "inspection"
+    cleanup = []
+
+    def timeout(command, **kwargs):
+        write_json(directory / "worker-result.json", {"status": "succeeded", "report": report})
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(inspection_worker.subprocess, "run", timeout)
+    monkeypatch.setattr(inspection_worker, "schedule_cleanup", lambda *args: cleanup.append(args))
+    result = inspection_worker.inspect_video(
+        {},
+        "original request",
+        directory,
+        {"eval_repo": str(tmp_path)},
+        {"timeout_seconds": 120, "max_inflight": 2},
+        tmp_path,
+    )
+    assert result == report and len(cleanup) == 1
 
 
 @pytest.mark.asyncio

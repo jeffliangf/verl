@@ -15,6 +15,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
+from .observability import ProviderError
 from .storage import write_json
 
 
@@ -23,7 +24,7 @@ class InvalidAction(ValueError):
 
 
 class InspectionEpisode:
-    """Only G→finish, G→I→finish and G→I→G are successful trajectories."""
+    """Bound tool calls and finish with the existing video if inspection fails."""
 
     def __init__(self, original_request, schemas, directory, generate, inspect):
         self.original_request = original_request
@@ -94,16 +95,33 @@ class InspectionEpisode:
             response = {"status": "succeeded", "video_id": video_id, "generation_request": parameters}
         elif name == "inspect_video":
             self.inspection_calls += 1
-            report = await self.inspect(
-                self.videos[parameters["video_id"]], self.original_request, self.directory / "inspection"
-            )
-            response = {"video_id": parameters["video_id"], "report": report}
+            video_id = parameters["video_id"]
+            try:
+                report = await self.inspect(self.videos[video_id], self.original_request, self.directory / "inspection")
+            except ProviderError as exc:
+                if exc.stage != "inspection":
+                    raise
+                self.final_result = self.videos[video_id]
+                self.terminal_reason = "inspection_failed"
+                event.update(error_type=type(exc).__name__, error=str(exc)[:500])
+                response = {
+                    "status": "failed",
+                    "error": "Inspection tool failed. The previous video is final.",
+                    "video_id": video_id,
+                    "final_video_id": video_id,
+                }
+            else:
+                response = {"video_id": video_id, "report": report}
         else:
             self.final_result = self.videos[parameters["final_video_id"]]
             self.terminal_reason = "finish_after_inspection" if self.inspection_calls else "finish_after_generation"
             response = {"status": "finished", **parameters}
         response["environment"] = self.environment()
-        event.update(status="completed", seconds=time.monotonic() - start, response=response)
+        event.update(
+            status="failed" if self.terminal_reason == "inspection_failed" else "completed",
+            seconds=time.monotonic() - start,
+            response=response,
+        )
         self.save()
         return response
 
@@ -116,6 +134,7 @@ class InspectionEpisode:
         return {
             "generation_calls": self.generation_calls,
             "inspection_calls": self.inspection_calls,
+            "fallback": int(self.terminal_reason == "inspection_failed"),
             "revised": int(self.generation_calls == 2),
             "terminal_reason": self.terminal_reason,
             "tool_seconds": sum(e.get("seconds", 0) for e in self.events),

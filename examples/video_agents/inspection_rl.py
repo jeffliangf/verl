@@ -211,6 +211,8 @@ def train(args):
         "max_inspections_per_update": episodes,
         "h3_phase_timeouts": phase_budgets(config.video_rl),
         "h3_worker_timeout_seconds": worker_timeout(config.video_rl, config.video_rl.timeouts.h3),
+        "inspection_timeout_seconds": config.inspection_rl.timeout_seconds,
+        "inspection_failure_policy": "finish with the inspected video",
         "reward": frozen["reward"],
         "context": {
             "prompt": config.data.max_prompt_length,

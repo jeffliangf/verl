@@ -24,7 +24,7 @@ from uuid import uuid4
 
 
 class ProviderError(RuntimeError):
-    """A service failure whose prompt group must not contribute a training reward."""
+    """A service failure requiring an explicit tool fallback or complete-group replacement."""
 
     def __init__(self, stage: str, message: str):
         super().__init__(message)

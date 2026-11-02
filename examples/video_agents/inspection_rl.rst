@@ -15,8 +15,24 @@ The environment permits three successful trajectories::
 Limits are checked before backend execution. Each trajectory has at most two
 generation calls and one inspection; a second generation requires inspection.
 Invalid policy actions retain the original tournament's invalid-call treatment.
-Provider failures trigger the existing complete-group replacement mechanism.
+Inspection provider failures finish the episode with the inspected video. The
+tool returns ``status: failed`` and ``Inspection tool failed. The previous video
+is final.`` with no available actions; no further policy turn or generation is
+allowed. The existing video receives its normal final-video quality reward, so
+the other seven trajectories are retained. Generation and policy-server failures
+still use the existing complete-group replacement mechanism. Invalid actions,
+corrupt local artifacts and programming errors retain their existing handling.
 Backend retries are distinct from policy calls and retain the original inputs.
+
+The inspection subprocess deadline is 120 seconds, configurable with
+``inspection_rl.timeout_seconds``. This replaces the former 900-second default:
+across 540 observed calls from the original and resumed first steps, the resumed
+p95 was 37.6 seconds and maximum 49.7 seconds; only one original call exceeded
+120 seconds (124.8 seconds). Timeout cleanup runs in a bounded background pool,
+and a report already saved before a cleanup timeout remains usable. The separate
+inspection quota wait precedes the subprocess deadline. Each fallback is saved
+in the episode trace and reported as
+``training/reward_extra/inspection/fallback/mean`` in TensorBoard.
 
 H3 queueing has a separate 600-second budget. The existing 150-second H3 limit
 applies to rendering, measured from the gateway's worker-start timestamp to its
