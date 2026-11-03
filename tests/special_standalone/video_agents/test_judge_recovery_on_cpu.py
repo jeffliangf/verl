@@ -10,8 +10,10 @@
 # limitations under the License.
 """Check neutral scoring and real evaluator retry behavior without provider calls."""
 
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -158,7 +160,8 @@ def test_file_processing_deadline_is_a_provider_failure_but_invalid_local_files_
 
 @pytest.fixture
 def external_runner():
-    path = DEFAULT_EVAL_REPO / "scripts/run_gemini_pairwise_eval.py"
+    repo = Path(os.environ.get("VIDEO_AGENTS_TEST_EVAL_REPO", DEFAULT_EVAL_REPO))
+    path = repo / "scripts/run_gemini_pairwise_eval.py"
     if not path.exists():
         pytest.skip("Optional local evaluator integration; no downloads or live calls")
     return load_external(path)

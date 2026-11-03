@@ -11,6 +11,7 @@
 """Bounded subprocess adapter around the unchanged V1 Gemini inspector."""
 
 import argparse
+import http.client
 import os
 import subprocess
 import sys
@@ -94,6 +95,12 @@ def provider_failure(exc, directory):
         error = error.__cause__ or error.__context__
     provider_types = {"EvalError", "HttpFailure", "NetworkFailure", "FileProcessingFailure"}
     if any(type(error).__name__ in provider_types for error in chain):
+        return True
+    # The frozen inspector wraps exceptions in RuntimeError, retaining their
+    # context. Truncated/malformed HTTP responses can escape its client's
+    # network-error wrapper before any response JSON is saved.
+    response_errors = (http.client.IncompleteRead, http.client.BadStatusLine, http.client.LineTooLong)
+    if any(isinstance(error, response_errors) for error in chain):
         return True
     # V1 validates an external response after persisting it. Bad JSON/schema or
     # an incomplete/wrong-model response is a failed service observation.

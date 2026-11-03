@@ -10,18 +10,22 @@
 # limitations under the License.
 """Native multi-turn credit masks, hard budgets, and unchanged source data."""
 
+import http.client
 import json
 from copy import deepcopy
+from pathlib import Path
+from textwrap import dedent
 from types import SimpleNamespace
 
 import pytest
+from test_gemini_transport_on_cpu import interrupted_gemini  # noqa: F401
 from test_tournament_on_cpu import TemplateTokenizer, prepared_rl  # noqa: F401
 
 from examples.video_agents import inspection_rl, rl
 from examples.video_agents.h3_deadlines import phase_budgets, worker_timeout
 from examples.video_agents.inspection_episode import InvalidAction
 from examples.video_agents.observability import ProviderError
-from examples.video_agents.storage import read_json, read_jsonl, write_json
+from examples.video_agents.storage import file_sha256, read_json, read_jsonl, write_json
 from examples.video_agents.tournament import load_protocol, runtime_protocol
 
 
@@ -325,6 +329,100 @@ async def test_inspection_service_failure_finishes_with_previous_video(native_fa
     )
     with pytest.raises(InvalidAction):
         await loop.episode.execute("sol_h3", {"prompt": "Must not revise after inspection failure"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["upload", "interaction"])
+async def test_interrupted_inspection_worker_finishes_with_previous_video(
+    native_factory,
+    interrupted_gemini,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    from examples.video_agents import inspection_loop, inspection_worker
+
+    make, row, generated, _, requests, _ = native_factory
+    interrupted_gemini.operation = operation
+    repo = tmp_path / "fault-evaluator"
+    script = repo / "scripts/run_gemini_pairwise_eval.py"
+    script.parent.mkdir(parents=True)
+    script.write_text(
+        dedent(f"""\
+        import json
+        import urllib.request
+
+        API_BASE = {interrupted_gemini.url!r}
+        def read_env_file(path):
+            return {{}}
+        def safe_error_text(error, key):
+            return str(error)
+        class GeminiRestClient:
+            def __init__(self, *args, **kwargs):
+                pass
+            def upload_video(self, path):
+                if {operation!r} == "upload":
+                    return self.request_json("POST", API_BASE + "/content/1")[0]
+                return {{"name": "files/1", "uri": API_BASE + "/files/1"}}
+            def request_json(self, method, url, **kwargs):
+                request = urllib.request.Request(url, data=b"{{}}", method=method)
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    return json.loads(response.read()), response.headers
+            def delete_file(self, name):
+                pass
+        """)
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-no-provider-calls")
+    generate = inspection_loop.generate_video
+
+    def generated_video(*args):
+        video = generate(*args)
+        path = Path(video["path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"local test video")
+        return {**video, "sha256": file_sha256(path)}
+
+    def inspect(video, original, directory, protocol, settings, output_dir):
+        return inspection_worker.inspect_video(
+            video, original, directory, {**protocol, "eval_repo": str(repo)}, settings, output_dir
+        )
+
+    monkeypatch.setattr(inspection_loop, "generate_video", generated_video)
+    monkeypatch.setattr(inspection_loop, "inspect_video", inspect)
+    loop = make([G, INSPECT])
+    output = await loop.run({}, **row)
+    assert len(generated) == 1 and len(requests) == 2
+    assert output.extra_fields["h3_result"] == loop.episode.videos["video_1"]
+    assert output.extra_fields["episode"]["fallback"] == 1
+    assert loop.episode.terminal_reason == "inspection_failed"
+    result = read_json(loop.episode.directory / "inspection/worker-result.json")
+    assert result["status"] == "provider_error"
+    assert result["error_type"] == "RuntimeError"  # The unchanged inspector wraps the HTTP exception.
+    assert "IncompleteRead" in result["error"]
+    assert len(interrupted_gemini.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "error,provider",
+    [
+        (http.client.IncompleteRead(b""), True),
+        (http.client.BadStatusLine("invalid status"), True),
+        (http.client.LineTooLong("header"), True),
+        (http.client.CannotSendRequest("bug"), False),
+        (FileNotFoundError("local video"), False),
+        (RuntimeError("local bug"), False),
+    ],
+)
+def test_inspection_classifies_wrapped_response_errors_without_hiding_local_errors(tmp_path, error, provider):
+    from examples.video_agents.inspection_worker import provider_failure
+
+    try:
+        try:
+            raise error
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from None
+    except RuntimeError as wrapped:
+        assert provider_failure(wrapped, tmp_path) is provider
 
 
 @pytest.mark.asyncio

@@ -11,9 +11,11 @@
 """Instrument the frozen evaluator and retry transient judgment transport failures."""
 
 import argparse
+import http.client
 import math
 import socket
 import threading
+import urllib.error
 from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -75,7 +77,22 @@ def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0)
                 operation="interaction" if url.endswith("/interactions") else "file",
                 timeout_seconds=kwargs.get("timeout") or self.request_timeout,
             ):
-                return super()._request_once(method, url, **kwargs)
+                try:
+                    return super()._request_once(method, url, **kwargs)
+                except (http.client.IncompleteRead, http.client.BadStatusLine, http.client.LineTooLong) as exc:
+                    # The frozen client misses these response-read failures.
+                    # Preserve an HTTP status even if reading its error body
+                    # failed: an interrupted 401/403 must still remain fatal.
+                    error, seen = exc, set()
+                    while error is not None and id(error) not in seen:
+                        seen.add(id(error))
+                        if isinstance(error, urllib.error.HTTPError):
+                            raise runner.HttpFailure(
+                                error.code, "Interrupted HTTP error response", error.headers
+                            ) from exc
+                        error = error.__cause__ or error.__context__
+                    # Use the existing retry budget and per-pair error ledger.
+                    raise runner.NetworkFailure(f"Network response failed: {exc}") from exc
 
         def upload_video(self, path):
             with timed_stage(timings, "gemini_upload", video_path=str(path), timeout_seconds=self.file_timeout):

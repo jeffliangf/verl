@@ -34,6 +34,24 @@ inspection quota wait precedes the subprocess deadline. Each fallback is saved
 in the episode trace and reported as
 ``training/reward_extra/inspection/fallback/mean`` in TensorBoard.
 
+Incomplete HTTP bodies, invalid status lines, and oversized response headers are
+inspection service failures even when the frozen inspector wraps them in a
+``RuntimeError``. The shared judge adapter also recognizes these failures for
+uploads, file polling, comparisons, and cleanup, in both streamed and batch
+judging. It reuses the evaluator's existing retry budget and error ledgers;
+known HTTP statuses are preserved if reading the error body fails. Local file
+and programming errors retain their existing handling.
+
+Group reward comparisons allow three attempts by default. Exhausted service
+failures contribute explicitly recorded neutral half-votes; completed votes and
+videos are retained. More than 75% fallback comparisons in a completed training
+batch stops the run before an optimizer update. Held-out evaluation excludes
+unscorable prompts, reports their failures and coverage, and marks coverage below
+90% as degraded. An entirely failed evaluation batch still stops the run. File
+control requests and judge subprocesses/tails retain their 15-second and
+300-second default limits. Remote cleanup failures cannot invalidate completed
+judgments. These protections are bounded fallbacks, not automatic job restarts.
+
 H3 queueing has a separate 600-second budget. The existing 150-second H3 limit
 applies to rendering, measured from the gateway's worker-start timestamp to its
 finish timestamp. Queue and render time are accumulated across backend retries;
