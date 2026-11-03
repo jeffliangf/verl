@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+rl_launcher_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source /home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/grpo/cluster-env.sh
 source "$RL_RUN_DIR/shutdown-sync.sh"
 rl_phase=training
@@ -52,20 +53,25 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
-ssh -p 44222 -i /home/jeff/.ssh/gmi -o IdentitiesOnly=yes -o BatchMode=yes \
+# Both the process guard and worker wait loop watch this stable supervisor PID.
+# Its SSH child may reconnect without terminating Ray or the node launcher.
+rl_tunnel_ready="$rl_control/h3-$rl_node.ready"
+rm -f "$rl_tunnel_ready"
+uv run --no-sync python "$rl_launcher_dir/h3_tunnel.py" \
+  --health-url http://127.0.0.1:28080/healthz --ready-file "$rl_tunnel_ready" -- \
+  ssh -p 44222 -i /home/jeff/.ssh/gmi -o IdentitiesOnly=yes -o BatchMode=yes \
   -o ConnectTimeout=15 -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
   -o ServerAliveCountMax=3 -N -L 127.0.0.1:28080:10.2.201.187:18080 \
   jeff@157.66.255.187 > "$RL_RUN_DIR/h3-tunnel-$SLURM_JOB_ID-$rl_node.log" 2>&1 &
 rl_ssh_pid=$!
-uv run --no-sync python - <<'PY'
-import socket, time
-deadline=time.monotonic()+30
-while time.monotonic()<deadline:
-    try:
-        with socket.create_connection(('127.0.0.1',28080),timeout=2): break
-    except OSError: time.sleep(1)
-else: raise RuntimeError('H3 tunnel did not start')
-PY
+until [[ -f "$rl_tunnel_ready" ]]; do
+  if ! kill -0 "$rl_ssh_pid" 2>/dev/null; then
+    wait "$rl_ssh_pid" || true
+    rl_lifecycle_log 'ERROR: H3 tunnel did not become ready'
+    exit 1
+  fi
+  sleep 1
+done
 uv run --no-sync python -m examples.video_agents.rl status --run-dir "$RL_RUN_DIR" \
   > "$RL_RUN_DIR/h3-status-$SLURM_JOB_ID-$rl_node.json"
 uv run --no-sync python "$RL_RUN_DIR/gpu_metrics.py" --run-dir "$RL_RUN_DIR" --job-id "$SLURM_JOB_ID" \

@@ -5,7 +5,9 @@ This directory preserves the launch, checkpoint, monitoring, recovery and
 diagnostic sources used for ``inspection-v1-1-group8-16h100-20261101``. It is a
 historical snapshot with machine-specific paths, not a new active allocation.
 ``snapshot.json`` records each original path and SHA256. The sources and frozen
-configuration are copied byte-for-byte, including their original formatting.
+configuration were originally copied byte-for-byte. The launcher maintenance
+change below is a subsequent repository change; the manifest retains the
+original run's hashes.
 
 The user stopped Slurm job 3573 on 2026-11-01 and paused its goal. Automatic
 recovery, checkpoint archiving and timeout deployment services were disabled.
@@ -51,3 +53,23 @@ The isolated operational tests can be run without starting jobs::
       examples/video_agents/inspection_rl_run/test_recover.py \
       examples/video_agents/inspection_rl_run/test_archive_checkpoint.py \
       examples/video_agents/inspection_rl_run/test_deploy_queue_timeouts.py -q
+
+H3 tunnel recovery
+------------------
+
+``grpo/ray-node.sh`` now runs SSH through the small, launcher-owned
+``grpo/h3_tunnel.py`` process. Both existing process checks watch this stable
+PID while its SSH child reconnects. Recovery uses a two-minute deadline with
+2/4/8/10-second backoff and requires a successful H3 ``/healthz`` response.
+Failed attempts do not extend the deadline. An unrecovered outage still exits
+through the existing launcher cleanup; normal shutdown also stops the SSH child.
+
+This addresses the tunnel timeout that terminated baseline job 4081. It does not
+install a service or resubmit jobs. The operational launchers outside this
+repository remain frozen; applying this change to a future allocation requires
+the updated launcher and its adjacent ``h3_tunnel.py``. Existing historical
+paths, launch hashes, and stop records are not a ready-to-submit configuration.
+
+The local fault tests use a fake SSH child serving a real HTTP health endpoint::
+
+    uv run python -m pytest tests/special_standalone/video_agents/test_h3_tunnel_on_cpu.py -q
