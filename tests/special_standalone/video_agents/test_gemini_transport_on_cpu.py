@@ -74,7 +74,10 @@ def interrupted_gemini():
 
         do_POST = do_GET = do_DELETE = respond
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class Server(ThreadingHTTPServer):
+        request_queue_size = 128  # Accommodate the shared default of 100 concurrent comparisons.
+
+    server = Server(("127.0.0.1", 0), Handler)
     state.url = f"http://127.0.0.1:{server.server_port}"
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
     thread.start()

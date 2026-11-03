@@ -42,10 +42,9 @@ video_rl:
   h3_max_request_attempts: 3
   h3_max_generation_attempts: 2
 
-  # Shared across all agent workers in this run. Two concurrent training jobs
-  # therefore occupy at most four client slots. Use 4 when running only one job.
+  # Shared across all agent workers in each rl.py or inspection_rl.py run.
   # Waiting for this slot does not consume the H3 in-flight deadline.
-  h3_max_inflight: 2
+  h3_max_inflight: 32
 
   # Initial request plus two retries, sharing one budget for transient HTTP and
   # network failures, including judgments. Each pass still has a hard deadline.
@@ -53,7 +52,7 @@ video_rl:
 
   # Comparisons run concurrently within each presentation order of a group.
   # This limit is per judge subprocess, not shared across rollout groups.
-  judge_concurrency: 1
+  judge_concurrency: 100
   # Upload completed clips and judge ready pairs while sibling H3 jobs run.
   # The concurrency limit covers both presentation orders together.
   judge_streaming: false

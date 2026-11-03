@@ -183,10 +183,9 @@ keyless ambiguous submissions remain unresolved rather than receiving a new key.
 Timed-out candidates leave their job identities available; expired budgets are
 not automatically renewed.
 
-`video_rl.h3_max_inflight` defaults to 2 across all agent workers in a run, using
-advisory locks in the shared output directory. With both training jobs running,
-this permits four client operations in total. Set it to 4 for a single job using
-the four-worker H3 pool. Slot waiting occurs before the generation subprocess
+`video_rl.h3_max_inflight` defaults to 32 across all agent workers in each
+`rl` or `inspection_rl` run, using advisory locks in the shared output directory.
+Slot waiting occurs before the generation subprocess
 starts, outside its in-flight deadline. Recovery budgets are launch-time settings
 and do not rewrite frozen experiment or candidate inputs. When resuming an
 existing experiment with new limits, record a configuration revision and archive
@@ -208,11 +207,11 @@ bounds the subprocess and is not reset by retries. A timed-out interaction may
 already have completed remotely, so its retry can incur a duplicate Gemini charge.
 Retrying a judgment does not regenerate or re-upload its H3 videos.
 
-`video_rl.judge_concurrency` defaults to 1. Set it to 15 to run the matchups of a
-six-candidate group concurrently within each presentation order. The adapter splits
+`video_rl.judge_concurrency` defaults to 100 for both `rl` and `inspection_rl`.
+Available pairs further limit concurrency within each presentation order. The adapter splits
 the evaluator's prompt batches into individual comparisons, shares each video upload,
 and deletes uploaded files after all comparisons settle. This is a per-subprocess
-limit; 16 active groups can make up to 240 comparisons concurrently. Both orders,
+limit, so separate groups have independent comparison slots. Both orders,
 retry budgets, fallback rules, and the pass deadline remain in effect.
 
 Set `video_rl.judge_streaming=true` to upload each completed H3 video immediately
@@ -398,7 +397,7 @@ uv run --frozen --extra fsdp --extra vllm python -m examples.video_agents.rl tra
 
 The preset uses Qwen3.8-27B, FSDP2, TP=4 vLLM rollout, eight GPUs, sixteen prompts
 per batch, and four samples per prompt. Four agent workers each allow five H3
-tasks locally, while the run-wide `video_rl.h3_max_inflight` limit defaults to two
+tasks locally, while the run-wide `video_rl.h3_max_inflight` limit defaults to 32
 active H3 operations. The ten-step pilot saves every
 five steps and validates at step ten. An initial batch costs at most 64 videos
 and 192 judgments, with additional work for failed-group replacements;

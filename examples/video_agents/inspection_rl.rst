@@ -24,6 +24,10 @@ still use the existing complete-group replacement mechanism. Invalid actions,
 corrupt local artifacts and programming errors retain their existing handling.
 Backend retries are distinct from policy calls and retain the original inputs.
 
+Both ``rl.py`` and ``inspection_rl.py`` use the shared defaults
+``video_rl.h3_max_inflight=32`` per run and ``video_rl.judge_concurrency=100``
+per judge subprocess. Explicit launch overrides take precedence.
+
 The inspection subprocess deadline is 120 seconds, configurable with
 ``inspection_rl.timeout_seconds``. This replaces the former 900-second default:
 across 540 observed calls from the original and resumed first steps, the resumed

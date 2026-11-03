@@ -1717,8 +1717,7 @@ def test_launch_config_supplies_every_limit_and_keeps_the_frozen_identity(prepar
     runtime = tournament.runtime_protocol(frozen, VIDEO_RL)
     assert runtime["timeouts"] == dict(VIDEO_RL.timeouts) and set(runtime["timeouts"]) == set(tournament.TIMEOUT_STAGES)
     assert runtime["judge_max_attempts"] == VIDEO_RL.judge_max_attempts
-    assert {key: runtime[key] for key in h3.RECOVERY_DEFAULTS} == dict(h3.RECOVERY_DEFAULTS)
-    assert all(VIDEO_RL[key] == default for key, default in h3.RECOVERY_DEFAULTS.items())
+    assert {key: runtime[key] for key in h3.RECOVERY_DEFAULTS} == {key: VIDEO_RL[key] for key in h3.RECOVERY_DEFAULTS}
     assert runtime["max_judge_fallback_fraction"] == VIDEO_RL.max_judge_fallback_fraction == 0.75
     assert runtime["h3_phase_timeouts"] == {"queue": 600, "generation": 150, "download": 120}
     assert runtime["protocol_sha256"] == fingerprint(frozen) == read_json(directory / "protocol-sha256.json")
