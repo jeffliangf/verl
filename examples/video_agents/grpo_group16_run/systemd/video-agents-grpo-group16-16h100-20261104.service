@@ -1,0 +1,15 @@
+[Unit]
+Description=Monitor fresh Qwen group-16 GRPO run
+ConditionHost=utopai-m1
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jeff/verl-rl-shared-20261103-4af40b37
+Environment=PYTHONPATH=/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/common:/home/jeff/verl-rl-shared-20261103-4af40b37
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/jeff/.local/bin/uv run --no-project --python /home/jeff/verl/.venv-sft-check/bin/python /home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/common/watchdog.py --run-dir /home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo
+StandardOutput=append:/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/watchdog.log
+StandardError=append:/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/watchdog.log
+Restart=on-failure
+RestartSec=15
+UMask=0077

@@ -1,0 +1,11 @@
+{
+  "step": 5,
+  "path": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/checkpoints/global_step_5",
+  "archives_checked": 49,
+  "bytes": 328311998280,
+  "verified_at": 1793822726.6572907,
+  "scope": "Required shards and archive directories; not a tensor CRC or GPU restore test",
+  "retained_checkpoints": [
+    "global_step_5"
+  ]
+}

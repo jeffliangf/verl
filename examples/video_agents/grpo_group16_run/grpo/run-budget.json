@@ -1,0 +1,8 @@
+{
+  "first_job_id": "4138",
+  "started_at_epoch": 1793815737.0,
+  "deadline_epoch": 1794074937.0,
+  "budget_seconds": 259200,
+  "finish_reserve_seconds": 7200,
+  "scope": "Elapsed from first allocation, including recovery downtime; never reset on relaunch"
+}

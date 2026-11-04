@@ -1,0 +1,17 @@
+{
+  "job_id": 4138,
+  "command": [
+    "sbatch",
+    "--parsable",
+    "--job-name=grpo-group16-16h100-20261104",
+    "--nodelist=gmicloud-loki-gpu-001,gmicloud-loki-gpu-006",
+    "--time=3-00:00:00",
+    "--output=/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/slurm-%j.log",
+    "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/common/train.sbatch",
+    "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo"
+  ],
+  "submitted_at": "2026-11-04T18:08:55.114549+00:00",
+  "initial_checkpoint_step": 0,
+  "source_checkpoint": null,
+  "evaluate_initial": true
+}

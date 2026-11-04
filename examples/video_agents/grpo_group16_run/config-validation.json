@@ -1,0 +1,90 @@
+{
+  "passed": true,
+  "executed_training": false,
+  "source_job_id": 4135,
+  "trainer_changes": {
+    "video_rl.output_dir": {
+      "before": "/home/jeff/rl-benchmarks/shared-resume-20261102/baseline",
+      "after": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo"
+    },
+    "critic.rollout_n": {
+      "before": 8,
+      "after": 16
+    },
+    "trainer.validation_data_dir": {
+      "before": "/home/jeff/rl-benchmarks/shared-resume-20261102/baseline/validation",
+      "after": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/validation"
+    },
+    "trainer.rollout_data_dir": {
+      "before": "/home/jeff/rl-benchmarks/shared-resume-20261102/baseline/rollouts",
+      "after": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/rollouts"
+    },
+    "actor_rollout_ref.rollout.n": {
+      "before": 8,
+      "after": 16
+    },
+    "trainer.resume_from_path": {
+      "before": "/home/jeff/rl-benchmarks/shared-resume-20261102/baseline/checkpoints/global_step_250",
+      "after": null
+    },
+    "trainer.default_local_dir": {
+      "before": "/home/jeff/rl-benchmarks/shared-resume-20261102/baseline/checkpoints",
+      "after": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/checkpoints"
+    },
+    "actor_rollout_ref.actor.rollout_n": {
+      "before": 8,
+      "after": 16
+    },
+    "trainer.experiment_name": {
+      "before": "grpo-group8-16h100-20261031-resume-20261102",
+      "after": "grpo-group16-16h100-20261104"
+    },
+    "video_rl.judge_concurrency": {
+      "before": 100,
+      "after": 500
+    },
+    "actor_rollout_ref.rollout.trace.experiment_name": {
+      "before": "grpo-group8-16h100-20261031-resume-20261102",
+      "after": "grpo-group16-16h100-20261104"
+    },
+    "trainer.resume_mode": {
+      "before": "resume_path",
+      "after": "disable"
+    },
+    "actor_rollout_ref.rollout.multi_turn.tool_config_path": {
+      "before": "/home/jeff/rl-benchmarks/shared-resume-20261102/baseline/tools.json",
+      "after": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/tools.json"
+    },
+    "video_rl.h3_max_inflight": {
+      "before": 32,
+      "after": 128
+    },
+    "data.tool_config_path": {
+      "before": "/home/jeff/rl-benchmarks/shared-resume-20261102/baseline/tools.json",
+      "after": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/tools.json"
+    },
+    "actor_rollout_ref.ref.rollout_n": {
+      "before": 8,
+      "after": 16
+    },
+    "video_rl.protocol": {
+      "before": "/home/jeff/rl-benchmarks/shared-resume-20261102/baseline/protocol.json",
+      "after": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/protocol.json"
+    }
+  },
+  "protocol_changes": {
+    "group_size": {
+      "before": 8,
+      "after": 16
+    },
+    "h3_concurrency_per_worker": {
+      "before": 4,
+      "after": 16
+    }
+  },
+  "videos_per_training_batch": 512,
+  "judgments_per_training_batch": 7680,
+  "source_model_shards_present": 18,
+  "runtime_model": "/tmp/jeff-video-agents-model-1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "new_budget_hours": 72
+}

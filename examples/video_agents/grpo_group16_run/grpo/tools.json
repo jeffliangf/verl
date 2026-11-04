@@ -1,0 +1,12 @@
+{
+  "tools": [
+    {
+      "class_name": "examples.video_agents.agent.SolH3Tool",
+      "config": {
+        "type": "native",
+        "protocol": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/protocol.json",
+        "dataset": "/home/jeff/rl-benchmarks/grpo-group8-16h100-20261031/data/train.jsonl"
+      }
+    }
+  ]
+}

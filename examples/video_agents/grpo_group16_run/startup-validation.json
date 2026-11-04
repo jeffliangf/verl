@@ -1,0 +1,38 @@
+{
+  "checked_at": "2026-11-04T18:16:43.613949+00:00",
+  "job_id": 4138,
+  "slurm_state": "RUNNING",
+  "runtime_config_matches_validated_preview": true,
+  "runtime_config_sha256": "9332f364ec3fe8dd91168d708b99e0de1023cfcd6250d7ec73353b82cf5a8c4a",
+  "resume_disabled": true,
+  "base_model": "Qwen/Qwen3.8-27B",
+  "base_model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "group_size": 16,
+  "train_batch_size": 32,
+  "h3_max_inflight": 128,
+  "judge_concurrency": 500,
+  "h3_slots_per_worker": 16,
+  "agent_workers": 8,
+  "nccl_world_size": 16,
+  "node_preflights": {
+    "gmicloud-loki-gpu-001": {
+      "gemini_http_status": 200,
+      "h3_ready": true,
+      "h3_workers": [
+        32
+      ]
+    },
+    "gmicloud-loki-gpu-006": {
+      "gemini_http_status": 200,
+      "h3_ready": true,
+      "h3_workers": [
+        32
+      ]
+    }
+  },
+  "budget_hours": 72,
+  "deadline_utc": "2026-11-07T18:08:57+00:00",
+  "watchdog_active": true,
+  "replaced_job_accounting": "4135|CANCELLED by 10016|0:0|2026-11-04T18:08:33",
+  "scope": "Launch and startup validation; no completed group-16 optimizer update verified yet"
+}

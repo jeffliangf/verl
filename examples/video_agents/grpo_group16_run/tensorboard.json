@@ -1,0 +1,11 @@
+{
+  "label": "grpo-group16-16h100-20261104",
+  "logdir": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104/grpo/tensorboard",
+  "service": "/home/jeff/.config/systemd/user/video-agents-tensorboard.service",
+  "port": 8792,
+  "runs": [
+    "grpo-group16-16h100-20261104/system/gmicloud-loki-gpu-001",
+    "grpo-group16-16h100-20261104/system/gmicloud-loki-gpu-006",
+    "grpo-group16-16h100-20261104/."
+  ]
+}

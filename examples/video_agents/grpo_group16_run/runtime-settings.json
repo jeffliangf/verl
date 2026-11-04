@@ -1,0 +1,76 @@
+{
+  "slurm_directives": [
+    "--partition=all",
+    "--constraint=h100",
+    "--nodes=2",
+    "--ntasks-per-node=1",
+    "--gpus-per-node=8",
+    "--cpus-per-task=64",
+    "--mem=1024G",
+    "--time=3-00:00:00",
+    "--no-requeue"
+  ],
+  "requested_nodes": [
+    "gmicloud-loki-gpu-001",
+    "gmicloud-loki-gpu-006"
+  ],
+  "time_limit_minutes": 4320,
+  "shell_exports_unexpanded": {
+    "RL_SHARED": "/home/jeff/rl-benchmarks/grpo-group16-16h100-20261104",
+    "RL_CHECKOUT": "/home/jeff/verl-rl-shared-20261103-4af40b37",
+    "UV_PROJECT_ENVIRONMENT": "/home/jeff/.venvs/video-agents-h100-f169e786",
+    "PATH": "$UV_PROJECT_ENVIRONMENT/bin:/home/jeff/.local/bin:$PATH",
+    "PYTHONPATH": "$RL_SHARED/common:$RL_CHECKOUT",
+    "RAY_ENABLE_UV_RUN_RUNTIME_ENV": "0",
+    "RAY_USAGE_STATS_ENABLED": "0",
+    "RAY_DEDUP_LOGS": "1",
+    "PYTHONUNBUFFERED": "1",
+    "HYDRA_FULL_ERROR": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+    "OMP_NUM_THREADS": "4",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "VLLM_ALLREDUCE_USE_FLASHINFER": "0",
+    "HF_HUB_OFFLINE": "1",
+    "HF_HOME": "/home/jeff/.cache/huggingface",
+    "RL_MODEL_REVISION": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "RL_MODEL_SOURCE": "$HF_HOME/hub/models--Qwen--Qwen3.8-27B/snapshots/$RL_MODEL_REVISION",
+    "RL_LOCAL_MODEL": "/tmp/jeff-video-agents-model-$RL_MODEL_REVISION",
+    "TENSORBOARD_DIR": "$RL_RUN_DIR/tensorboard",
+    "VERL_FILE_LOGGER_PATH": "$RL_RUN_DIR/metrics-${SLURM_JOB_ID:-preview}.jsonl",
+    "TZ": "UTC",
+    "NCCL_SOCKET_IFNAME": "ens10f0np0",
+    "GLOO_SOCKET_IFNAME": "ens10f0np0",
+    "NCCL_IB_HCA": "=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1",
+    "NCCL_DEBUG": "WARN",
+    "TRITON_CACHE_DIR": "/tmp/jeff-video-agents-cache/triton",
+    "TORCHINDUCTOR_CACHE_DIR": "/tmp/jeff-video-agents-cache/inductor",
+    "CUDA_CACHE_PATH": "/tmp/jeff-video-agents-cache/cuda",
+    "VLLM_CACHE_ROOT": "/tmp/jeff-video-agents-cache/vllm"
+  },
+  "inherited_exports": [
+    "RL_RUN_DIR"
+  ],
+  "unset_variables": [
+    "VIRTUAL_ENV"
+  ],
+  "ray_per_node": {
+    "num_cpus": 64,
+    "num_gpus": 8,
+    "object_store_memory_bytes": 17179869184
+  },
+  "watchdog": {
+    "phase_limits_seconds": {
+      "startup": 2700,
+      "training": 5400,
+      "checkpoint": 3600,
+      "evaluation": 14400,
+      "finishing": 900
+    },
+    "minimum_free_disk_gib": 450,
+    "automatic_recovery": false
+  },
+  "budget": {
+    "budget_seconds": 259200,
+    "finish_reserve_seconds": 7200
+  }
+}
