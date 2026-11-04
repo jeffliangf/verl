@@ -1,6 +1,10 @@
 Inspection RL experiment snapshot
 ================================
 
+The configuration for the 2026-11-04 continuation (job 4142, checkpoint 75,
+fused Torch kernels) is recorded in ``resume_20261104/``. Its README describes
+the exact overrides, resolved configuration and external runtime dependencies.
+
 This directory preserves the launch, checkpoint, monitoring, recovery and
 diagnostic sources used for ``inspection-v1-1-group8-16h100-20261101``. It is a
 historical snapshot with machine-specific paths, not a new active allocation.

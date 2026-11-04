@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-11-04T22:09:55.322108+00:00",
+  "description": "Configuration snapshot of inspection continuation job 4142 with fused Torch output-head kernels",
+  "job_id": 4142,
+  "experiment_name": "inspection-v1-1-group8-16h100-20261101-resume-20261102",
+  "submitted_at": "2026-11-04T19:38:52.748363+00:00",
+  "code_commit": "4af40b373592161f169d75d6d32704651d6abdfe",
+  "code_checkout": "/home/jeff/verl-rl-shared-20261103-4af40b37",
+  "deployment_id": "inspection-fused-20261104-r4",
+  "run_dir": "/home/jeff/rl-benchmarks/shared-resume-20261102/inspection",
+  "data_dir": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/data",
+  "source_checkpoint": "/home/jeff/rl-benchmarks/shared-resume-20261102/inspection/checkpoints/global_step_75",
+  "initial_checkpoint_step": 75,
+  "initialization": "Full model/optimizer/scheduler/RNG/dataloader resume from step 75",
+  "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "nodes": 2,
+  "gpus_per_node": 8,
+  "requested_nodes": [
+    "gmicloud-loki-gpu-004",
+    "gmicloud-loki-gpu-005"
+  ],
+  "evaluate_initial": false,
+  "evaluate_final": true,
+  "save_freq": 5,
+  "test_freq": 25,
+  "checkpoint_retention": "Shared VideoCheckpointCallback: latest two complete saves plus best overall evaluated checkpoint",
+  "finish_reserve_seconds": 7200,
+  "budget_policy": "Preserve existing November 5 deadline and two-hour finish reserve",
+  "slurm_time_limit_minutes": 1390,
+  "model_name": "Qwen/Qwen3.8-27B",
+  "invocation": {
+    "module": "examples.video_agents.inspection_rl",
+    "subcommand": "train",
+    "overrides_file": "overrides.json"
+  },
+  "snapshots": {
+    "training-config.json": {
+      "source": "/home/jeff/rl-benchmarks/shared-resume-20261102/inspection/training-config.json",
+      "sha256": "de66dd359f81d632dd0baf532b7ac3148f830b2139e287b924c2baf2bbf96b73"
+    },
+    "run-budget.json": {
+      "source": "/home/jeff/rl-benchmarks/shared-resume-20261102/inspection/run-budget.json",
+      "sha256": "fb99168385927420124edc67533b7c16541bb08bc2016190fb15230120f064f4"
+    },
+    "common-overrides.json": {
+      "source": "/home/jeff/rl-benchmarks/shared-resume-20261102/deployments/inspection-fused-20261104-r4/common-overrides.json",
+      "sha256": "2804ccf0aa76e49bf4a2e64936720a7fb21cb7c41b5584a2e7c17a7e5feb1bb9"
+    }
+  },
+  "override_derivation": {
+    "launcher": "/home/jeff/rl-benchmarks/shared-resume-20261102/deployments/inspection-fused-20261104-r4/common/train.py",
+    "launcher_sha256": "f3f687b24cf852f7701335b2f4c243d75da559f104d6422b9a47f7ef42bab744",
+    "source": "arguments(run_dir, manifest=launch.json).overrides",
+    "sha256": "322ea1c1d9b04079652c046e1511d2e2a9ec5da02c7d49e1c9ecaa159852de48"
+  },
+  "external_inputs": {
+    "protocol": {
+      "path": "/home/jeff/rl-benchmarks/shared-resume-20261102/inspection/protocol.json",
+      "sha256": "214e4573519bdace875a2270570aa4046d9ebdb0b931d13cb601e52820b8594a"
+    },
+    "tools": {
+      "path": "/home/jeff/rl-benchmarks/shared-resume-20261102/inspection/tools.json",
+      "sha256": "46ffdfcca5709104a677d5525a193c2d949e551af698a1e44c114f51e2ab412a"
+    },
+    "datasets": {
+      "train": {
+        "path": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/data/train.jsonl",
+        "sha256": "fd78a701f34539c4bbd01e7974c2dee6e65488dcb5cf94a5e4640996ea3f12dc"
+      },
+      "val": {
+        "path": "/home/jeff/rl-benchmarks/inspection-v1-1-group8-16h100-20261101/data/val.jsonl",
+        "sha256": "047c345f8e6d2f111b80eb7b7e24e1f8c7ed2623ef21aec4eebb3e05808124c2"
+      }
+    }
+  },
+  "runtime_callback": {
+    "class": "resume_callback.ResumeCheckpoint",
+    "source": "/home/jeff/rl-benchmarks/shared-resume-20261102/deployments/inspection-fused-20261104-r4/common/resume_callback.py",
+    "sha256": "d02de6fff2110ead10b69a281d91362962f370a568be5be642e89b3f7fd0710f",
+    "budget_source": "/home/jeff/rl-benchmarks/shared-resume-20261102/deployments/inspection-fused-20261104-r4/common/run_budget.py",
+    "budget_sha256": "f9f0696a93985d10d782ba56057b0d95659c9d453102115508675d442b8d11f8"
+  },
+  "validation": {
+    "recomposed_config_matches_live": true,
+    "normalization": "Only replace this checkout root with the deployed checkout root",
+    "gpu_preflight": "/home/jeff/rl-benchmarks/shared-resume-20261102/inspection/fused-preflight-4142.json",
+    "gpu_preflight_passed": true
+  }
+}
