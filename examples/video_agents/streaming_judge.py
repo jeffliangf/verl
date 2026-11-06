@@ -26,8 +26,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import judge
+from .config import judging_protocol
 from .dataset import verify_references
-from .judge_worker import gemini_address_family, instrument_client, parallel_pairs, parse_options
+from .image_assets import image_bytes
+from .judge_worker import gemini_address_family, instrument_client, parallel_pairs, parse_options, reference_images
 from .observability import ProviderError, record_event, timed_stage
 from .storage import file_sha256, freeze_json, load_external, read_json, write_json
 from .tournament import check_dependencies, tournament_manifests
@@ -38,6 +40,7 @@ def pair_manifest(manifest, key):
 
 
 def ready_manifests(protocol, sample, candidates, validate):
+    protocol = judging_protocol(protocol, validate=validate)
     if validate:
         valid = candidates[0]["status"] == "succeeded"
         return judge.build_manifests(
@@ -126,6 +129,7 @@ class StreamingJudge:
     """Async parent: publish arrivals, bound the final pass, and reap on cancellation."""
 
     def __init__(self, directory, protocol, sample, *, validate):
+        protocol = judging_protocol(protocol, validate=validate)
         self.directory, self.protocol = directory, protocol
         self.root = directory / "judge/stream"
         self.context = {
@@ -201,7 +205,10 @@ def run_stream(directory, runner):
     root = directory / "judge/stream"
     context = read_json(root / "context.json")
     protocol, sample, validate = context["protocol"], context["sample"], context["validate"]
+    protocol = judging_protocol(protocol, validate=validate)
     check_dependencies(protocol)
+    if isinstance(sample.get("image"), dict):
+        image_bytes(sample["image"])
     if validate:
         verify_references([sample])
     count = 1 if validate else protocol["group_size"]
@@ -297,7 +304,7 @@ def main():
     protocol = read_json(root / "context.json")["protocol"]
     runner = load_external(Path(protocol["eval_repo"]) / "scripts/run_gemini_pairwise_eval.py")
     instrument_client(runner, args.directory / "judge/timings-stream.jsonl", protocol["timeouts"]["judge_control"])
-    with record_fatal(root), gemini_address_family("ipv4"), parallel_pairs(runner):
+    with record_fatal(root), gemini_address_family("ipv4"), reference_images(runner), parallel_pairs(runner):
         run_stream(args.directory, runner)
 
 

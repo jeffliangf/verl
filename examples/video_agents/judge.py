@@ -17,7 +17,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from .config import CANDIDATE, REFERENCE_FIELDS
+from .config import CANDIDATE, reference_fields
+from .image_assets import reference_image_fields
 from .storage import file_sha256, freeze_json, item_key, read_json
 
 ORDERS = ("original", "swapped")
@@ -41,7 +42,7 @@ def build_manifests(protocol: dict, candidate_videos: dict[str, dict]) -> dict[s
     for sample in protocol["samples"]:
         if sample["id"] not in candidate_videos:
             continue
-        for reference in REFERENCE_FIELDS:
+        for reference in reference_fields(protocol):
             pair_id = item_key(sample["id"]) + "__vs_" + reference
             pair = {
                 "prompt_id": sample["id"],
@@ -52,7 +53,12 @@ def build_manifests(protocol: dict, candidate_videos: dict[str, dict]) -> dict[s
                 "model_B": reference,
                 "video_path_A": candidate_videos[sample["id"]]["path"],
                 "video_path_B": sample["references"][reference]["path"],
+                **reference_image_fields(sample),
             }
+            if sample.get("target"):
+                from .mixed_data import original_request
+
+                pair["prompt"] = original_request(sample)
             if hashlib.sha256(pair_id.encode()).digest()[0] % 2:
                 pair = swap_pair(pair)
             pairs[pair_id] = pair

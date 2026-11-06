@@ -12,6 +12,7 @@
 
 import argparse
 import http.client
+import inspect
 import math
 import socket
 import threading
@@ -21,8 +22,80 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
+from .image_assets import image_bytes
 from .observability import record_event, timed_stage
 from .storage import load_external
+
+
+def supports_reference_images(runner):
+    """Old frozen T2V runners remain usable; mixed preparation requires the image API."""
+    builder = getattr(runner, "build_interaction_request", None)
+    return (
+        callable(builder)
+        and "reference_image" in inspect.signature(builder).parameters
+        and hasattr(getattr(runner, "GeminiRestClient", None), "upload_image")
+        and callable(getattr(runner, "image_mime_type", None))
+    )
+
+
+@contextmanager
+def reference_images(runner):
+    """Connect the upstream image helper to its batch runner without changing its rubric.
+
+    A private marker carries builder arguments only inside this process. Before
+    evaluate(), replace it with the upstream request built with an uploaded image.
+    T2V requests pass through unchanged. SharedUploads owns cleanup when enabled.
+    """
+    if not supports_reference_images(runner):
+        yield
+        return
+    original_client = runner.GeminiRestClient
+    original_build = runner.build_interaction_request
+    original_mime = runner.image_mime_type
+    marker = "_verl_reference_image_request"
+
+    def build(**kwargs):
+        payload = original_build(**kwargs)
+        if kwargs["pair"].get("reference_image") is not None:
+            payload[marker] = kwargs
+        return payload
+
+    def image_mime(path):
+        from .h3_request import MAX_IMAGE_BYTES, image_info
+
+        with Path(path).open("rb") as handle:
+            data = handle.read(MAX_IMAGE_BYTES + 1)
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ValueError("Reference image exceeds the frozen H3 image limit")
+        return image_info(data)[0]
+
+    class ReferenceImageClient(original_client):
+        def evaluate(self, request_payload, *, require_agentic_steps):
+            arguments = request_payload.get(marker)
+            if arguments is None:
+                return super().evaluate(request_payload, require_agentic_steps=require_agentic_steps)
+            asset = arguments["pair"]["reference_image"]
+            image_bytes(asset)
+            uploaded = self.upload_image(Path(asset["path"]))
+            try:
+                payload = original_build(**arguments, reference_image=uploaded)
+                return super().evaluate(payload, require_agentic_steps=require_agentic_steps)
+            finally:
+                if uploaded.get("name"):
+                    try:
+                        self.delete_file(uploaded["name"])
+                    except runner.EvalError:
+                        print("Warning: Gemini reference image cleanup failed.", flush=True)
+
+    runner.GeminiRestClient = ReferenceImageClient
+    runner.build_interaction_request = build
+    runner.image_mime_type = image_mime
+    try:
+        yield
+    finally:
+        runner.GeminiRestClient = original_client
+        runner.build_interaction_request = original_build
+        runner.image_mime_type = original_mime
 
 
 @contextmanager
@@ -98,6 +171,10 @@ def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0)
             with timed_stage(timings, "gemini_upload", video_path=str(path), timeout_seconds=self.file_timeout):
                 return super().upload_video(path)
 
+        def upload_image(self, path):
+            with timed_stage(timings, "gemini_image_upload", image_path=str(path), timeout_seconds=self.file_timeout):
+                return super().upload_image(path)
+
         def wait_for_file(self, file_object):
             with timed_stage(timings, "gemini_file_processing", timeout_seconds=self.file_timeout):
                 return super().wait_for_file(file_object)
@@ -130,7 +207,13 @@ def parallel_pairs(runner, *, keep_uploaded_files=False):
 
     class SharedUploads(original_client):
         def upload_video(self, path):
-            key = str(Path(path).resolve())
+            return self.shared_upload("video", path, super().upload_video)
+
+        def upload_image(self, path):
+            return self.shared_upload("image", path, super().upload_image)
+
+        def shared_upload(self, kind, path, upload):
+            key = (kind, str(Path(path).resolve()))
             with lock:
                 owner = key not in uploads
                 if owner:
@@ -138,7 +221,7 @@ def parallel_pairs(runner, *, keep_uploaded_files=False):
                 future = uploads[key]
             if owner:
                 try:
-                    future.set_result((self, super().upload_video(path)))
+                    future.set_result((self, upload(path)))
                 except BaseException as exc:
                     future.set_exception(exc)
             return future.result()[1]
@@ -184,7 +267,7 @@ def main(argv=None):
     runner = load_external(args.runner)
     instrument_client(runner, args.timings, args.file_control_timeout)
     record_event(args.timings, "gemini_network", "configured", address_family=args.address_family)
-    with gemini_address_family(args.address_family):
+    with gemini_address_family(args.address_family), reference_images(runner):
         if args.parallel_pairs:
             with parallel_pairs(runner, keep_uploaded_files="--keep-uploaded-files" in forwarded):
                 return runner.main(forwarded)

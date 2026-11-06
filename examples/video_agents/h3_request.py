@@ -182,7 +182,7 @@ def request_summary(request):
     return summary
 
 
-def tool_request(parameters, schema):
+def tool_request(parameters, schema, *, sample=None):
     """Apply row-specific tool defaults, preserving the contract of frozen legacy rows."""
     from jsonschema import Draft202012Validator
 
@@ -192,6 +192,37 @@ def tool_request(parameters, schema):
     request = {key: deepcopy(value["default"]) for key, value in spec["properties"].items() if "default" in value}
     request.update(parameters)
     validator.validate(request)
+    if spec.get("$id") == "urn:verl:sol-h3:3":
+        from .image_assets import image_bytes
+
+        if sample is None or sample.get("task") not in {"t2v", "i2v"}:
+            raise RuntimeError("The unified H3 tool requires a bound dataset sample")
+        expected = "fl2va" if sample["task"] == "i2v" else "t2va"
+        if request["task"] != expected:
+            raise ValueError(f"This sample requires task {expected}")
+        conditions = request["conditions"]
+        if (expected == "fl2va" and len(conditions) != 1) or (expected == "t2va" and conditions):
+            raise ValueError("I2V requires its supplied first frame; T2V requires empty conditions")
+        image = None
+        if expected == "fl2va":
+            asset = sample["image"]
+            image = f"data:{asset['mime_type']};base64," + base64.b64encode(image_bytes(asset)).decode("ascii")
+        target_spec = spec["properties"]["target"]["properties"]
+        target = {key: deepcopy(value["default"]) for key, value in target_spec.items() if "default" in value}
+        target.update(sample.get("target", {}))
+        target.update(request["target"])
+        # Explicit sample constraints take precedence over policy choices.
+        if any(target.get(key) != value for key, value in sample.get("target", {}).items()):
+            raise ValueError("Tool target contradicts the sample's requested output settings")
+        if target.get("short_edge", 768) != 768:
+            raise ValueError("Sol-H3 only supports short_edge 768")
+        return video_request(
+            request["prompt"],
+            duration=target["duration_seconds"],
+            aspect_ratio=target.get("aspect_ratio"),
+            image=image,
+            seed=42 if request["seed"] is None else request["seed"],
+        )
     if "aspect_ratio" in spec["properties"]:
         return video_request(**request)
     # Old prepared datasets remain byte-compatible with their persisted jobs.

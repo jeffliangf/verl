@@ -28,8 +28,8 @@ from .config import (
     DEFAULT_REFERENCES,
     DEFAULT_SYSTEM_PROMPT,
     JUDGE_SETTINGS,
-    REFERENCE_FIELDS,
     ROOT,
+    reference_fields,
 )
 from .dataset import load_samples, reference_inventory
 from .h3_deadlines import phase_budgets, worker_timeout
@@ -79,21 +79,34 @@ def prompt_rows(path: Path) -> list[dict]:
 
 def dataset_records(samples: list[dict], split: str, tools: list[dict]) -> list[dict]:
     """Materialize complete model inputs; rollout consumes these saved fields verbatim."""
-    return [
-        {
+    from .mixed_data import OBSERVATION_MAX_PIXELS, observation
+
+    records = []
+    for index, sample in enumerate(samples):
+        mixed = "task" in sample
+        record = {
             "data_source": sample["source"],
             "agent_name": "h3_terminal",
             "prompt": [
                 {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
-                {"role": "user", "content": GENERATION_INSTRUCTION.format(prompt=sample["prompt"])},
+                {
+                    "role": "user",
+                    "content": observation(sample) if mixed else GENERATION_INSTRUCTION.format(prompt=sample["prompt"]),
+                },
             ],
             "tools": deepcopy(tools),
             "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "xhigh"},
             "reward_model": {"style": "rule", "ground_truth": ""},
             "extra_info": {"id": sample["id"], "index": index, "split": split},
         }
-        for index, sample in enumerate(samples)
-    ]
+        if mixed:
+            record["data_source"] = sample["task"] + "/" + sample["source"]
+            record["extra_info"]["task"] = sample["task"]
+            record["images"] = (
+                [{"image": sample["image"]["path"], "max_pixels": OBSERVATION_MAX_PIXELS}] if sample["image"] else []
+            )
+        records.append(record)
+    return records
 
 
 def tool_config(directory: Path, train_file: Path) -> dict:
@@ -115,8 +128,6 @@ def tool_config(directory: Path, train_file: Path) -> dict:
 def prepare(args) -> dict:
     """Freeze data, tool schema, evaluation references, and provider settings offline."""
     group_size = validate_group_size(args.group_size)
-    directory = local_path(args.run_dir)
-    data_dir = local_path(args.data_dir)
     train_file, val_file = local_path(args.train_file), local_path(args.eval_dataset)
     references, repo = local_path(args.references), local_path(args.eval_repo)
     train, validation = prompt_rows(train_file), load_samples(val_file)
@@ -157,6 +168,12 @@ def prepare(args) -> dict:
     for key in ("duration", "seed"):
         protocol["h3"].pop(key)
     schema = read_json(CONFIG_DIR / "sol_h3_tool.json")
+    return save_prepared(args, protocol, schema)
+
+
+def save_prepared(args, protocol, schema):
+    """Persist immutable native datasets and tools for either protocol version."""
+    directory, data_dir = local_path(args.run_dir), local_path(args.data_dir)
     records = {split: dataset_records(protocol["samples"][split], split, [schema]) for split in ("train", "val")}
     contents = {
         split: "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows) for split, rows in records.items()
@@ -180,8 +197,8 @@ def prepare(args) -> dict:
     return {
         "run_dir": str(directory),
         "data_dir": str(data_dir),
-        "train_prompts": len(train),
-        "eval_prompts": len(val),
+        "train_prompts": len(protocol["samples"]["train"]),
+        "eval_prompts": len(protocol["samples"]["val"]),
         "network_requests": 0,
     }
 
@@ -273,44 +290,76 @@ def training_config(args):
 
 
 def check_tokens(config):
-    """Render saved rows with the actual tokenizer, check lengths, and save previews."""
-    from verl.utils import hf_tokenizer
+    """Count the same tools and image tokens seen by the native rollout processor."""
+    from verl.utils import hf_processor, hf_tokenizer
 
     tokenizer = hf_tokenizer(
         config.actor_rollout_ref.model.path, trust_remote_code=config.actor_rollout_ref.model.trust_remote_code
     )
+    datasets = {split: read_jsonl(local_path(config.data[f"{split}_files"])) for split in ("train", "val")}
+    multimodal = any(row.get("images") for rows in datasets.values() for row in rows)
+    processor = None
+    if multimodal:
+        processor = hf_processor(
+            config.actor_rollout_ref.model.path, trust_remote_code=config.actor_rollout_ref.model.trust_remote_code
+        )
+        if processor is None or getattr(processor, "image_processor", None) is None:
+            raise ValueError("Mixed I2V RL requires a vision-capable policy checkpoint and image processor")
     lengths = {}
     for split in ("train", "val"):
         path = local_path(config.data[f"{split}_files"])
-        rows = read_jsonl(path)
-        sizes = [
-            len(
-                tokenizer.apply_chat_template(
-                    row["prompt"],
-                    tools=row["tools"],
-                    **row["chat_template_kwargs"],
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=False,
-                )
-            )
-            for row in rows
-        ]
+        rows = datasets[split]
+        sizes, preview = [], None
+        for row in rows:
+            size, rendered = prompt_tokens(row, tokenizer, processor, config.data)
+            sizes.append(size)
+            if preview is None:
+                preview = rendered
         if max(sizes) > config.data.max_prompt_length:
             raise ValueError(f"{split} tool prompt exceeds data.max_prompt_length: {max(sizes)}")
         lengths[split] = max(sizes)
         write_json(path.with_suffix(".preview.json"), rows[0])
         atomic_text(
             path.with_suffix(".preview.txt"),
-            tokenizer.apply_chat_template(
-                rows[0]["prompt"],
-                tools=rows[0]["tools"],
-                **rows[0]["chat_template_kwargs"],
-                add_generation_prompt=True,
-                tokenize=False,
-            ),
+            preview,
         )
     return lengths
+
+
+def prompt_tokens(row, tokenizer, processor, data_config):
+    """Use verl's own placeholder expansion and vision extraction for length checks."""
+    options = {**row["chat_template_kwargs"], "tools": row["tools"], "add_generation_prompt": True}
+    if processor is None:
+        return (
+            len(tokenizer.apply_chat_template(row["prompt"], **options, tokenize=True, return_dict=False)),
+            tokenizer.apply_chat_template(row["prompt"], **options, tokenize=False),
+        )
+    from types import SimpleNamespace
+
+    from verl.utils.dataset.rl_dataset import RLHFDataset
+    from verl.utils.tokenizer import build_multimodal_processor_inputs
+
+    from .image_assets import upright_observation
+
+    context = SimpleNamespace(processor=processor, image_key="images", video_key="videos", audio_key="audios")
+    messages = RLHFDataset._build_messages(context, deepcopy(row), key="prompt")
+    messages = upright_observation(messages)
+    rendered = processor.apply_chat_template(messages, **options, tokenize=False)
+    # AgentLoop derives this from the processor, independently of dataset filtering overrides.
+    patch_size = getattr(processor.image_processor, "patch_size", 14)
+    images, videos, audios = RLHFDataset._process_multi_modal_info(messages, patch_size, data_config)
+    if images is None and videos is None and audios is None:
+        ids = tokenizer(rendered, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+    else:
+        ids = build_multimodal_processor_inputs(
+            processor,
+            text=[rendered],
+            images=images,
+            videos=videos,
+            audio=audios,
+            mm_processor_kwargs=data_config.get("mm_processor_kwargs", {}),
+        )["input_ids"][0]
+    return len(ids), rendered
 
 
 def train(args) -> dict:
@@ -355,7 +404,10 @@ def train(args) -> dict:
         if evaluation
         else protocol["group_size"] * (protocol["group_size"] - 1) * batch,
         "videos_per_evaluation": len(protocol["samples"]["val"]),
-        "judgments_per_evaluation": 2 * len(REFERENCE_FIELDS) * len(protocol["samples"]["val"]),
+        "judgments_per_evaluation": 2 * len(reference_fields(protocol)) * len(protocol["samples"]["val"]),
+        "training_judge": protocol["judge"]["judge_model"],
+        "evaluation_judge": protocol.get("eval_judge", protocol["judge"])["judge_model"],
+        "reference_fields": list(reference_fields(protocol)),
         "execute": args.execute,
         "command": shlex.join(command),
     }
@@ -363,6 +415,10 @@ def train(args) -> dict:
         summary["max_prompt_tokens"] = check_tokens(config)
     print(json.dumps(summary, indent=2), flush=True)
     if args.execute:
+        if protocol.get("h3_api_version") == 2:
+            readiness = h3.server_status(protocol)
+            if not readiness["all_ready"]:
+                raise RuntimeError(f"Mixed RL needs a ready v2 H3 gateway; run the status command: {readiness}")
         with run_lock(output):
             name = "evaluation-config.json" if evaluation else "training-config.json"
             freeze_json(output / name, OmegaConf.to_container(config, resolve=True))
@@ -375,6 +431,9 @@ def parse_args(argv=None):
     """Keep preparation offline and make paid training an explicit command flag."""
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    from .mixed_data import add_parser
+
+    add_parser(commands)
     prep = commands.add_parser("prepare")
     prep.add_argument("--run-dir", type=Path, required=True)
     prep.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
@@ -413,6 +472,10 @@ def main(argv=None):
     args = parse_args(argv)
     if args.command == "prepare":
         print(json.dumps(prepare(args), indent=2))
+    elif args.command == "prepare-mixed":
+        from .mixed_data import prepare as prepare_mixed
+
+        print(json.dumps(prepare_mixed(args), indent=2))
     elif args.command == "status":
         protocol = load_protocol(local_path(args.run_dir) / "protocol.json")
         result = h3.server_status(protocol, timeout=args.timeout)

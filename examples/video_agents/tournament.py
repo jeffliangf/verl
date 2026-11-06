@@ -16,8 +16,10 @@ from math import isfinite
 from pathlib import Path
 
 from . import h3, judge, scoring
-from .config import CANDIDATE, REFERENCE_FIELDS
+from .config import CANDIDATE, judging_protocol, reference_fields
 from .dataset import verify_references
+from .h3_request import request_summary
+from .image_assets import image_bytes, reference_image_fields
 from .observability import ProviderError, record_event, timed_stage
 from .storage import file_sha256, fingerprint, freeze_json, read_json, run_lock, write_json
 
@@ -43,10 +45,11 @@ def load_protocol(path: Path) -> dict:
     validate_group_size(protocol.get("group_size"))
     if protocol.get("h3_backend") != h3.BACKEND:
         raise ValueError("Expected a self-hosted Sol-H3 protocol; the H3 Max API is disabled")
-    if any(set(sample.get("references", {})) != set(REFERENCE_FIELDS) for sample in protocol["samples"]["val"]):
-        raise ValueError(
-            "Evaluation references changed; prepare a new run directory with Context-IR, best-of-4 and best-of-16"
-        )
+    fields = reference_fields(protocol)
+    if not fields or len(set(fields)) != len(fields):
+        raise ValueError("Expected a nonempty, unique evaluation reference list")
+    if any(set(sample.get("references", {})) != set(fields) for sample in protocol["samples"]["val"]):
+        raise ValueError(f"Evaluation references changed; prepare a new run directory with: {', '.join(fields)}")
     check_dependencies(protocol)
     return protocol
 
@@ -117,6 +120,7 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
         **({"h3_token_file": protocol["h3_token_file"]} if "h3_token_file" in protocol else {}),
         "timeouts": {"h3_request": protocol["timeouts"]["h3_request"]},
         "rl_protocol_sha256": protocol["protocol_sha256"],
+        **({"h3_api_version": protocol["h3_api_version"]} if "h3_api_version" in protocol else {}),
     }
     budgets = phase_budgets(protocol)
     if budgets:
@@ -171,7 +175,9 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
         return {
             "status": "succeeded",
             "prompt": request["prompt"],
-            "request": request,
+            # Keep image payloads in the durable generation artifact, not in every
+            # trajectory, reward input, streaming context, and transfer-queue row.
+            "request": request_summary(request) if protocol.get("tool_contract") == "urn:verl:sol-h3:3" else request,
             "path": str(path),
             "sha256": state["sha256"],
             "task_id": state["task_id"],
@@ -197,7 +203,12 @@ def tournament_manifests(sample: dict, candidates: list[dict], protocol: dict) -
             "model_B": f"candidate_{j}",
             "video_path_A": candidates[i]["path"],
             "video_path_B": candidates[j]["path"],
+            **reference_image_fields(sample),
         }
+        if sample.get("target"):
+            from .mixed_data import original_request
+
+            pairs[f"{i}_vs_{j}"]["prompt"] = original_request(sample)
     base = {
         "schema_version": 1,
         "instructions_version": protocol["judge"]["instructions_version"],
@@ -348,7 +359,10 @@ def score_group(
     directory: Path, protocol: dict, sample: dict, candidates: list[dict], *, validate: bool, streamed: bool = False
 ) -> list[dict]:
     """Score a training tournament or a held-out candidate against the frozen references."""
+    protocol = judging_protocol(protocol, validate=validate)
     check_dependencies(protocol)
+    if isinstance(sample.get("image"), dict):
+        image_bytes(sample["image"])
     if any(c["status"] not in {"succeeded", "invalid_call"} for c in candidates):
         raise RuntimeError(f"Only generated videos and invalid calls can be scored; inspect {directory}")
     for candidate in candidates:
@@ -375,7 +389,8 @@ def score_group(
             pairs = manifests["original"]["pairs"]
             by_reference = {pair["reference"]: key for key, pair in pairs.items()}
             result = {"valid_call": float(valid), "judge_comparisons": 2 * len(pairs)}
-            for reference in REFERENCE_FIELDS:
+            fields = reference_fields(protocol)
+            for reference in fields:
                 key = by_reference.get(reference)
                 result[f"vs_{reference}"] = (
                     scoring.score_pair(
@@ -384,7 +399,7 @@ def score_group(
                     if valid
                     else 0.0
                 )
-            result["score"] = sum(result[f"vs_{ref}"] for ref in REFERENCE_FIELDS) / len(REFERENCE_FIELDS)
+            result["score"] = sum(result[f"vs_{ref}"] for ref in fields) / len(fields)
             rewards = [result]
         else:
             manifests = tournament_manifests(sample, candidates, protocol)

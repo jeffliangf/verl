@@ -27,9 +27,10 @@ from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ, AgentLoopWorkerTQBase
 from verl.utils.tensordict_utils import get_non_tensor_data
 
-from .config import REFERENCE_FIELDS
+from .config import REFERENCE_FIELDS, judging_protocol, reference_fields
 from .h3 import generation_slot
 from .h3_request import tool_request
+from .image_assets import image_bytes, upright_observation
 from .observability import ProviderError, failure_record, record_event, timed_stage
 from .storage import item_key, write_json
 from .streaming_judge import StreamingJudge
@@ -52,6 +53,9 @@ class SolH3Tool(BaseTool):
         self.protocol_path = Path(config["protocol"])
         self.output_dir = Path(config.get("output_dir", self.protocol_path.parent))
         self.protocol = load_protocol(self.protocol_path)
+        self.samples = {
+            split: {sample["id"]: sample for sample in rows} for split, rows in self.protocol["samples"].items()
+        }
         self.slots = asyncio.Semaphore(self.protocol["h3_concurrency_per_worker"])
 
     def get_openai_tool_schema(self):
@@ -62,13 +66,18 @@ class SolH3Tool(BaseTool):
         return OpenAIFunctionToolSchema.model_validate(row["tools"][0])
 
     @staticmethod
-    def build_request(parameters, schema):
+    def build_request(parameters, schema, *, sample=None):
         """Validate and apply the defaults advertised in this dataset row."""
-        return tool_request(parameters, schema)
+        return tool_request(parameters, schema, sample=sample)
 
     async def execute(self, instance_id, parameters, **kwargs):
         agent_data = kwargs["agent_data"]
-        request = self.build_request(parameters, agent_data._active_tool_schemas[0])
+        request = await asyncio.to_thread(
+            self.build_request,
+            parameters,
+            agent_data._active_tool_schemas[0],
+            sample=getattr(self, "bound_sample", None),
+        )
         directory = self.output_dir / "videos" / item_key(instance_id)
         timing_path = getattr(agent_data, "_video_timing_path", directory / "timings.jsonl")
         with timed_stage(timing_path, "h3_slot_wait", artifact=str(directory)):
@@ -143,7 +152,13 @@ class H3TerminalLoop(ToolAgentLoop):
             reason = f"unknown tool {calls[0].name!r}"
         else:
             try:
-                self.tools["sol_h3"].build_request(json.loads(calls[0].arguments), agent_data._active_tool_schemas[0])
+                tool = self.tools["sol_h3"]
+                await asyncio.to_thread(
+                    tool.build_request,
+                    json.loads(calls[0].arguments),
+                    agent_data._active_tool_schemas[0],
+                    sample=getattr(tool, "bound_sample", None),
+                )
             except ValidationError as exc:
                 reason = f"invalid arguments: {exc.message}"
             except (ValueError, TypeError) as exc:
@@ -179,6 +194,12 @@ class H3TerminalLoop(ToolAgentLoop):
         tool = copy(self.tools["sol_h3"])
         tool.output_dir = Path(self.config.video_rl.output_dir)
         tool.protocol = runtime_protocol(tool.protocol, self.config.video_rl)
+        if tool.protocol.get("tool_contract") == "urn:verl:sol-h3:3":
+            info = kwargs["extra_info"]
+            tool.bound_sample = tool.samples[info["split"]][info["id"]]
+            if tool.bound_sample.get("image"):
+                await asyncio.to_thread(image_bytes, tool.bound_sample["image"])
+                kwargs["raw_prompt"] = await asyncio.to_thread(upright_observation, kwargs["raw_prompt"])
         tool.tool_schema = OpenAIFunctionToolSchema.model_validate(schemas[0])
         self.tools = {"sol_h3": tool}
         # Render the raw schema so JSON Schema fields such as maxLength survive
@@ -268,11 +289,12 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 f"Use {expected_n} sampled rollouts for this {'validation' if validate else 'training'} group"
             )
         sample = self.samples[partition][prompt["extra_info"]["id"]]
+        protocol = judging_protocol(self.protocol, validate=validate)
         await tq.async_kv_put(key=uid, partition_id=partition, tag={"status": "running"})
         stream = None
         try:
             if self.protocol.get("judge_streaming", False):
-                stream = StreamingJudge(directory, self.protocol, sample, validate=validate)
+                stream = StreamingJudge(directory, protocol, sample, validate=validate)
                 await stream.start()
 
             async def rollout(i):
@@ -321,7 +343,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
             rewards = await asyncio.to_thread(
                 score_group,
                 directory,
-                self.protocol,
+                protocol,
                 sample,
                 [output.extra_fields["h3_result"] for output in results],
                 validate=validate,
@@ -333,7 +355,13 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 output.extra_fields["reward_extra_info"] = reward
                 await super()._agent_loop_postprocess(output, validate, session_id=i, **prompt)
             await tq.async_kv_put(key=uid, partition_id=partition, tag={"status": "finished"})
-            return {"dropped": False, "uid": uid, "sample_id": sample["id"], "rewards": rewards}
+            return {
+                "dropped": False,
+                "uid": uid,
+                "sample_id": sample["id"],
+                "rewards": rewards,
+                **({"task": sample["task"]} if "task" in sample else {}),
+            }
         except BaseException as exc:
             # A held-out prompt that cannot be scored for any reason is excluded
             # and reported in eval-summary.json; evaluation never stops training.
@@ -348,6 +376,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 uid=uid,
                 sample_id=sample["id"],
                 policy_step=int(prompt["global_steps"]),
+                **({"task": sample["task"]} if "task" in sample else {}),
             )
             write_json(directory / "failure.json", failure)
             log(
@@ -376,7 +405,11 @@ class TournamentManager(AgentLoopManagerTQ):
         super().__init__(*args, **kwargs)
         if not self.config.trainer.use_v1 or self.config.trainer.v1.trainer_mode != "sync":
             raise ValueError("H3 tournaments require the native synchronous V1 trainer")
-        group_size = load_protocol(Path(self.config.video_rl.protocol))["group_size"]
+        protocol = load_protocol(Path(self.config.video_rl.protocol))
+        group_size = protocol["group_size"]
+        self.reference_fields = reference_fields(protocol)
+        self.eval_judge_model = protocol.get("eval_judge", protocol["judge"])["judge_model"]
+        self.reference_notes = protocol.get("reference_notes", [])
         if self.rollout_config.n != group_size or self.rollout_config.val_kwargs.n != 1:
             raise ValueError(f"Use rollout.n={group_size} and rollout.val_kwargs.n=1")
         if self.config.video_rl.max_dropped_groups_per_step < 1:
@@ -428,6 +461,8 @@ class TournamentManager(AgentLoopManagerTQ):
         if getattr(self, "_judge_step", None) != step:
             self._judge_step = step
             self._judge_groups = self._judge_comparisons = self._judge_fallbacks = 0
+            self._task_records = []
+        self._task_records.extend(records)
         for record in records:
             if not record["dropped"]:
                 # Each of the four trajectory rewards repeats these group totals.
@@ -436,6 +471,11 @@ class TournamentManager(AgentLoopManagerTQ):
                 self._judge_comparisons += reward["judge_comparisons"]
                 self._judge_fallbacks += reward.get("judge_fallback_comparisons", 0)
         fraction = self._judge_fallbacks / self._judge_comparisons if self._judge_comparisons else 0.0
+        if any("task" in record for record in self._task_records):
+            write_json(
+                Path(self.config.video_rl.output_dir) / "train" / f"step_{step}" / "task-summary.json",
+                training_task_summary(self._task_records),
+            )
         record_event(
             Path(self.config.video_rl.output_dir) / "timings.jsonl",
             "judge_coverage",
@@ -460,8 +500,26 @@ class TournamentManager(AgentLoopManagerTQ):
         self._eval_records.extend(records)
         output_dir = Path(self.config.video_rl.output_dir)
         path = output_dir / "val" / f"step_{step}" / "eval-summary.json"
-        summary = evaluation_summary(step, self._eval_records, self.config.video_rl.min_valid_eval_fraction)
+        summary = evaluation_summary(
+            step,
+            self._eval_records,
+            self.config.video_rl.min_valid_eval_fraction,
+            fields=getattr(self, "reference_fields", REFERENCE_FIELDS),
+        )
+        if hasattr(self, "eval_judge_model"):
+            summary["judge_model"] = self.eval_judge_model
+        if getattr(self, "reference_notes", None):
+            summary["reference_notes"] = self.reference_notes
         write_json(path, summary)
+        for task, report in summary.get("by_task", {}).items():
+            write_json(
+                path.with_name(f"eval-summary-{task}.json"),
+                {
+                    **report,
+                    "judge_model": summary.get("judge_model"),
+                    "reference_notes": [n for n in summary.get("reference_notes", []) if n["task"] == task],
+                },
+            )
         record_event(
             output_dir / "timings.jsonl",
             "evaluation",
@@ -478,7 +536,28 @@ class TournamentManager(AgentLoopManagerTQ):
             raise RuntimeError(f"Every held-out prompt in the batch failed at step {step}; inspect {path}")
 
 
-def evaluation_summary(step: int, records: list[dict], min_valid_fraction: float) -> dict:
+def training_task_summary(records):
+    """Report task coverage without modifying rewards or group-relative advantages."""
+    result = {}
+    for task in sorted({r["task"] for r in records if "task" in r}):
+        groups = [r for r in records if r.get("task") == task]
+        rewards = [reward for r in groups if not r["dropped"] for reward in r["rewards"]]
+        scored = [r["rewards"][0] for r in groups if not r["dropped"]]
+        comparisons = sum(r["judge_comparisons"] for r in scored)
+        fallbacks = sum(r.get("judge_fallback_comparisons", 0) for r in scored)
+        result[task] = {
+            "groups": len(groups),
+            "dropped": sum(r["dropped"] for r in groups),
+            "score": sum(r["score"] for r in rewards) / len(rewards) if rewards else None,
+            "valid_call_fraction": sum(r["valid_call"] for r in rewards) / len(rewards) if rewards else None,
+            "judge_comparisons": comparisons,
+            "judge_fallbacks": fallbacks,
+            "judge_coverage": 1 - fallbacks / comparisons if comparisons else None,
+        }
+    return result
+
+
+def evaluation_summary(step: int, records: list[dict], min_valid_fraction: float, *, fields=REFERENCE_FIELDS) -> dict:
     """Valid-only held-out means; invalid policy calls stay in the denominator as 0."""
     valid = [record["rewards"][0] for record in records if not record["dropped"]]
     fraction = len(valid) / len(records) if records else 0.0
@@ -486,7 +565,7 @@ def evaluation_summary(step: int, records: list[dict], min_valid_fraction: float
     def mean(key):
         return sum(reward[key] for reward in valid) / len(valid) if valid else None
 
-    return {
+    summary = {
         "policy_step": step,
         "prompts": len(records),
         "valid": len(valid),
@@ -494,7 +573,7 @@ def evaluation_summary(step: int, records: list[dict], min_valid_fraction: float
         "valid_fraction": fraction,
         "degraded": fraction < min_valid_fraction,
         "score": mean("score"),
-        **{f"vs_{reference}": mean(f"vs_{reference}") for reference in REFERENCE_FIELDS},
+        **{f"vs_{reference}": mean(f"vs_{reference}") for reference in fields},
         "invalid_calls": sum(reward["valid_call"] == 0 for reward in valid),
         "dropped_examples": sorted(
             (
@@ -510,3 +589,17 @@ def evaluation_summary(step: int, records: list[dict], min_valid_fraction: float
             key=lambda row: row["sample_id"],
         ),
     }
+    if any("task" in record for record in records):
+        summary["by_task"] = {
+            task: evaluation_summary(
+                step,
+                [{k: v for k, v in r.items() if k != "task"} for r in records if r.get("task") == task],
+                min_valid_fraction,
+                fields=fields,
+            )
+            for task in sorted({r["task"] for r in records if "task" in r})
+        }
+        summary["degraded"] |= any(r["degraded"] for r in summary["by_task"].values())
+        scores = [r["score"] for r in summary["by_task"].values()]
+        summary["task_macro_score"] = sum(scores) / len(scores) if all(s is not None for s in scores) else None
+    return summary

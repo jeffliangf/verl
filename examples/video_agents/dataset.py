@@ -229,6 +229,13 @@ def reference_inventory(rows: list[dict], reference_dir: Path, probe) -> tuple[l
 def verify_references(samples: list[dict]):
     """Check frozen reference bytes before generation, judging, or scoring."""
     for sample in samples:
+        if isinstance(sample.get("image"), dict):
+            from .image_assets import image_bytes
+
+            image_bytes(sample["image"])
         for reference in sample["references"].values():
             if file_sha256(Path(reference["path"])) != reference["sha256"]:
                 raise ValueError(f"Frozen reference video changed: {reference['path']}")
+            for path, digest in reference.get("provenance", {}).items():
+                if file_sha256(Path(path)) != digest:
+                    raise ValueError(f"Frozen reference provenance changed: {path}")

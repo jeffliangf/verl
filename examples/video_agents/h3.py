@@ -32,7 +32,7 @@ from math import isfinite
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from .h3_request import request_output
+from .h3_request import MAX_IMAGE_BYTES, request_output
 from .observability import record_event, timed_stage
 from .storage import file_sha256, fingerprint, load_external, read_json, write_json
 
@@ -100,7 +100,9 @@ def configuration(endpoints, profile, reference_manifest, token_file=None):
             "settings": deepcopy(reference_manifest["settings"]),
             "endpoint": reference_manifest["endpoint"],
             "endpoints": list(reference_manifest["h3_endpoints"]),
-        },
+        }
+        if reference_manifest is not None
+        else {"source": "per-reference provenance in samples.val"},
     }
     token_file = token_file or os.environ.get("H3_SELF_HOSTED_TOKEN_FILE")
     if token_file:
@@ -202,6 +204,25 @@ def available_workers(client, endpoints, *, timeout=2):
     return [(origin, health) for origin, _, health in sorted(ready, key=lambda row: row[1])]
 
 
+def check_unified_api(health):
+    """Mixed runs need the complete v2 contract on every ready gateway worker."""
+    api = health.get("api") or {}
+    if (
+        api.get("version") != 2
+        or not {"t2va", "fl2va"}.issubset(api.get("tasks", []))
+        or api.get("workers") != health.get("workers_ready")
+        or not health.get("workers_ready")
+        or api.get("num_frames") != {"min": 124, "max": 345, "step": 17}
+        or not {"auto", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}.issubset(api.get("aspect_ratios", []))
+        or 768 not in api.get("short_edges", [])
+        or api.get("fps") != 24
+        or [0] not in api.get("keyframe_frame_indices", [])
+        or not {"png", "jpg", "webp"}.issubset(api.get("image_formats", []))
+        or api.get("max_image_bytes", 0) < MAX_IMAGE_BYTES
+    ):
+        raise ValueError("The Sol-H3 gateway must advertise the complete v2 T2V/I2V contract on all ready workers")
+
+
 def server_status(protocol, *, timeout=5):
     """Read public health endpoints without credentials or submitting any jobs.
 
@@ -225,6 +246,8 @@ def server_status(protocol, *, timeout=5):
                 health = json.load(response)
             if not isinstance(health, dict):
                 raise ValueError("Expected a health JSON object")
+            if protocol.get("h3_api_version") == 2:
+                check_unified_api(health)
             observed = {key: health[key] for key in expected if key in health}
             if "steps" not in observed and "transformer_forwards" in health:
                 observed["steps"] = health["transformer_forwards"]
@@ -565,6 +588,9 @@ class _Generation:
                     )
                 if workers:
                     origin, health = workers[0]
+                    if self.protocol.get("h3_api_version") == 2:
+                        self.error_stage = "configuration"
+                        check_unified_api(health)
                     keyed = health.get("idempotency_key") is True
                     self.save(
                         status="submitting",

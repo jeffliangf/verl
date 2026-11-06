@@ -36,6 +36,18 @@ REFERENCE_VIDEO_FIELDS = {
 CANDIDATE = "video_agent"
 
 
+def reference_fields(protocol):
+    """New runs freeze their reference list; old runs retain the original three."""
+    return tuple(protocol.get("reference_fields", REFERENCE_FIELDS))
+
+
+def judging_protocol(protocol, *, validate):
+    """Evaluation may use Argon while training retains its original judge settings."""
+    if validate and "eval_judge" in protocol:
+        return {**protocol, "judge": protocol["eval_judge"]}
+    return protocol
+
+
 def build_sft_messages(prompt: str) -> list[dict[str, str]]:
     """Build the prompt-rewrite SFT input from the original request.
 
