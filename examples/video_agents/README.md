@@ -65,11 +65,52 @@ The tool's prompt argument briefly describes Context-IR's visual, soundscape,
 and music sections as optional guidance. It does not require that format or
 add a formatting reward.
 
-The only tool is `sol_h3(prompt, duration=10, seed=42)`. Its prompt must contain
-1–8,000 characters; duration is 5 or 10 seconds; seed is an integer from 0 through
+The generation tool is `sol_h3(prompt, duration=10, seed=42, image=..., aspect_ratio=...)`.
+Its prompt must contain 1–8,000 characters; seed is an integer from 0 through
 9223372036854775807. The model's chat template and verl's native `qwen3_coder`
-parser handle tool-call syntax. Model/adapter selection and resolution are fixed
-service settings, not policy arguments.
+parser handle tool-call syntax. Model and adapter selection remain fixed service settings.
+
+Newly prepared rows use Sana's SGLang request form on `POST /v1/videos`:
+`task: t2va` for text, or `task: fl2va` with one image condition at `frame_index: 0`.
+The client polls `/v1/videos/{id}` until `completed` and downloads
+`/v1/videos/{id}/content`. Saved datasets with the old tool schema and legacy
+reference requests retain their original request bodies, hashes, and `/v1/jobs` routes.
+Prepare a new run to expose the new arguments; do not edit a frozen dataset in place.
+
+`image` accepts a local PNG/JPEG/WebP path or a supplied base64 image URI. The file
+must be readable by the Ray worker executing the tool. The client validates and
+embeds its bytes before saving the request, so retries use the identical image
+even if the source file changes. Images are limited to 20 MiB, 32–8,192 pixels per
+side, and 40 million pixels. First-frame handling requires Pillow. The FastH3
+adapter's first-frame conditioning is experimental, as documented by Sana.
+
+Without an explicit `aspect_ratio`, text requests use `16:9` (1344×768), and image
+requests follow the first frame's EXIF-upright shape (`auto`, between 1:4 and 4:1).
+Explicit ratios are `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, and `9:16`; they stretch
+the first frame onto the selected canvas. Dimensions follow H3's 768-pixel short
+edge, 1344×768 area cap, and rounding to multiples of 32.
+
+`duration` is converted to frames at 24 fps, then rounded up to a supported
+`17n+5` frame count from 124 through 345. For example, 5 seconds gives 124 frames,
+8 gives 192, and 10 gives 243. For an exact count, use `duration=frames / 24`.
+Values outside that frame range are rejected before submission, even within the
+API's outer 4–15 second bounds. Download checks use the requested geometry and
+duration while continuing to verify audio, codecs, and gateway checksums.
+
+For direct client use, construct the same request without an agent:
+
+```python
+from examples.video_agents.h3_request import video_request
+
+request = video_request(
+    "The subject turns toward the camera; birds chirp nearby.",
+    image="/shared/first_frame.png",
+    duration=8,
+    seed=42,
+)
+# Pass request to tournament.generate_video(directory, protocol, request),
+# or store it in an h3.generate_one task's request field.
+```
 
 ## Rewards and validation
 

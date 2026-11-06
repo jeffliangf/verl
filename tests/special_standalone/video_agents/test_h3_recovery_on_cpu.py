@@ -27,6 +27,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from examples.video_agents import h3
+from examples.video_agents.h3_request import video_request
 from examples.video_agents.storage import file_sha256, read_json
 
 MEDIA = {
@@ -170,8 +171,16 @@ def test_accepted_502_polls_without_replaying(candidate):
     assert c.state()["task_id"] == c.client.posts[0][2]
 
 
-def test_interrupted_submission_reuses_key_after_restart(candidate):
+@pytest.mark.parametrize("image_conditioned", [False, True])
+def test_interrupted_submission_reuses_key_after_restart(candidate, image_conditioned):
     c = candidate
+    if image_conditioned:
+        from PIL import Image
+
+        image = Path(c.task["state"]).with_name("frame.png")
+        Image.new("RGB", (64, 64), (40, 120, 200)).save(image)
+        c.task["request"] = video_request(**c.task["request"], image=image, aspect_ratio="16:9")
+        image.unlink()
     c.client.post_errors = [KeyboardInterrupt()]
     with pytest.raises(KeyboardInterrupt):
         c.run()
@@ -181,6 +190,12 @@ def test_interrupted_submission_reuses_key_after_restart(candidate):
     assert len(c.client.jobs) == 1 and len(c.client.posts) == 2
     assert c.client.health_calls == 1
     assert c.state()["deadline_at"] == before["deadline_at"]
+    assert c.client.posts[0][1] == c.client.posts[1][1] == before["request"]
+    if image_conditioned:
+        assert (
+            c.client.posts[0][1]["conditions"][0]["uri"]
+            not in Path(c.task["state"]).with_name("timings.jsonl").read_text()
+        )
 
 
 def test_submission_retry_budget_survives_restart(candidate):
@@ -497,15 +512,18 @@ def phased(candidate, monkeypatch):
     return c
 
 
-def test_long_queue_does_not_consume_render_budget(phased):
+@pytest.mark.parametrize("sglang", [False, True])
+def test_long_queue_does_not_consume_render_budget(phased, sglang):
     c = phased
+    if sglang:
+        c.task["request"] = video_request(**c.task["request"])
     c.snapshots = [
         (300, {"status": "queued", "created_at": c.epoch}),
         (320, {"status": "running", "created_at": c.epoch, "started_at": c.epoch + 300}),
         (
             340,
             {
-                "status": "succeeded",
+                "status": "completed" if sglang else "succeeded",
                 "created_at": c.epoch,
                 "started_at": c.epoch + 300,
                 "finished_at": c.epoch + 340,
@@ -514,9 +532,7 @@ def test_long_queue_does_not_consume_render_budget(phased):
     ]
     assert c.run()
     assert c.clock.elapsed == 340 and len(c.client.posts) == 1
-    assert (
-        c.client.posts[0][1] == c.task["request"] == {"prompt": "Preserve this exact prompt", "duration": 10, "seed": 7}
-    )
+    assert c.client.posts[0][1] == c.task["request"]
     assert list(c.state()["phase_usage_by_job"].values()) == [{"queue": 300, "generation": 40}]
 
 

@@ -165,9 +165,9 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
             or any(state.get(key) != value for key, value in h3.identity(task, protocol).items())
             or state.get("sha256") != file_sha256(path)
             or state.get("bytes") != path.stat().st_size
-            or h3.media_profile(state.get("media", {}), duration=request["duration"]) != protocol["media_profile"]
         ):
             raise RuntimeError(f"Incomplete or mismatched H3 result: {directory}")
+        h3.validate_media(state.get("media", {}), request, protocol["media_profile"])
         return {
             "status": "succeeded",
             "prompt": request["prompt"],

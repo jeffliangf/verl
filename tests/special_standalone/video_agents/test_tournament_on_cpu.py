@@ -24,6 +24,7 @@ from omegaconf import OmegaConf
 
 from examples.video_agents import h3, judge, rl, tournament
 from examples.video_agents.config import CANDIDATE, DEFAULT_REFERENCES, JUDGE_SETTINGS, REFERENCE_VIDEO_FIELDS
+from examples.video_agents.h3_request import video_request
 from examples.video_agents.judge import EXTERNAL_FILES
 from examples.video_agents.observability import ProviderError
 from examples.video_agents.storage import file_sha256, fingerprint, read_json, read_jsonl, write_json, write_jsonl
@@ -660,7 +661,8 @@ def test_gemini_failed_judgment_is_droppable_but_runner_crash_is_fatal(prepared_
 
 
 @pytest.mark.parametrize("duration,seed", [(5, 0), (10, 9223372036854775807)])
-def test_h3_adapter_reuses_existing_worker_and_validates_artifacts(prepared_rl, monkeypatch, duration, seed):
+@pytest.mark.parametrize("sglang", [False, True])
+def test_h3_adapter_reuses_existing_worker_and_validates_artifacts(prepared_rl, monkeypatch, duration, seed, sglang):
     directory, protocol, _ = prepared_rl
     posts = []
     job_id = "338a55c9-c8f3-4dc4-982b-df72221cd893"
@@ -682,6 +684,8 @@ def test_h3_adapter_reuses_existing_worker_and_validates_artifacts(prepared_rl, 
 
     monkeypatch.setattr(tournament.subprocess, "run", run)
     request = {"prompt": "Exact prompt", "duration": duration, "seed": seed}
+    if sglang:
+        request = video_request(**request)
     first = tournament.generate_video(directory / "candidate", protocol, request)
     second = tournament.generate_video(directory / "candidate", protocol, request)
     assert first == second and len(posts) == 1
@@ -749,7 +753,7 @@ def test_prepare_records_tool_schema_and_reference_provenance(prepared_rl, fresh
         row = read_jsonl(args.data_dir / f"{split}.jsonl")[0]
         schema = row["tools"][0]["function"]
         assert "Sol-H3" in schema["description"] and "10 seconds" not in schema["description"]
-        assert set(schema["parameters"]["properties"]) == {"prompt", "duration", "seed"}
+        assert set(schema["parameters"]["properties"]) == {"prompt", "duration", "seed", "image", "aspect_ratio"}
         assert schema["parameters"]["properties"]["prompt"]["maxLength"] == 8000
         assert "SECRET" not in json.dumps(row)
 
@@ -1171,7 +1175,7 @@ def loop_factory(prepared_rl, monkeypatch):
 async def test_native_tool_loop_executes_once_and_preserves_policy_masks(loop_factory, model_request):
     make, generated = loop_factory
     output = await make().run({}, **model_request)
-    assert generated == [{"prompt": "A clear scene", "duration": 10, "seed": 42}]
+    assert generated == [video_request("A clear scene")]
     assert output.extra_fields["h3_result"]["status"] == "succeeded"
     assert output.response_ids[: len(VALID_CALL)] == list(VALID_CALL.encode())
     assert output.response_mask[: len(VALID_CALL)] == [1] * len(VALID_CALL)
@@ -1237,7 +1241,7 @@ async def test_row_tools_and_template_options_are_the_actual_model_input(loop_fa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("duration,seed", [(5, 0), (10, 9223372036854775807)])
+@pytest.mark.parametrize("duration,seed", [(5, 0), (10, 9223372036854775807), (8.5, 7)])
 async def test_native_sol_h3_call_forwards_duration_and_seed(loop_factory, model_request, duration, seed):
     make, generated = loop_factory
     text = VALID_CALL.replace(
@@ -1245,7 +1249,20 @@ async def test_native_sol_h3_call_forwards_duration_and_seed(loop_factory, model
         f"<parameter=duration>{duration}</parameter><parameter=seed>{seed}</parameter></function>",
     )
     output = await make(text).run({}, **model_request)
-    assert generated == [{"prompt": "A clear scene", "duration": duration, "seed": seed}]
+    assert generated == [video_request("A clear scene", duration=duration, seed=seed)]
+    assert output.extra_fields["h3_result"]["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_native_sol_h3_call_embeds_first_frame(loop_factory, model_request, tmp_path):
+    from PIL import Image
+
+    make, generated = loop_factory
+    path = tmp_path / "frame.png"
+    Image.new("RGB", (64, 96), (40, 120, 200)).save(path)
+    text = VALID_CALL.replace("</function>", f"<parameter=image>{path}</parameter></function>")
+    output = await make(text).run({}, **model_request)
+    assert generated == [video_request("A clear scene", image=path)]
     assert output.extra_fields["h3_result"]["status"] == "succeeded"
 
 
@@ -1256,7 +1273,7 @@ async def test_omitted_tool_arguments_use_defaults_from_the_row(loop_factory, mo
     properties["duration"]["default"] = 5
     properties["seed"]["default"] = 7
     await make().run({}, **model_request)
-    assert generated == [{"prompt": "A clear scene", "duration": 5, "seed": 7}]
+    assert generated == [video_request("A clear scene", duration=5, seed=7)]
 
 
 @pytest.mark.asyncio
@@ -1264,7 +1281,7 @@ async def test_omitted_tool_arguments_use_defaults_from_the_row(loop_factory, mo
     "name,value",
     [
         ("duration", "15"),
-        ("duration", "5.5"),
+        ("duration", "4.4"),
         ("seed", "-1"),
         ("seed", "9223372036854775808"),
         ("seed", "true"),
@@ -1317,7 +1334,7 @@ def test_token_check_and_previews_render_the_saved_row(prepared_rl, monkeypatch)
         ("I cannot generate a video.", "no tool call"),
         (VALID_CALL.replace("function=sol_h3", "function=unknown"), "unknown tool 'unknown'"),
         (VALID_CALL.replace("function=sol_h3", "function=h3_max"), "unknown tool 'h3_max'"),
-        (VALID_CALL.replace("A clear scene", " "), "invalid arguments: Sol-H3 requires nonblank prompt"),
+        (VALID_CALL.replace("A clear scene", " "), "invalid arguments: Sol-H3 needs a nonempty prompt"),
         (VALID_CALL.replace("<parameter=prompt>", "<parameter=unexpected>"), "invalid arguments: "),
         (VALID_CALL + VALID_CALL, "expected one tool call, got 2"),
     ],

@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import ray
 import transfer_queue as tq
-from jsonschema import Draft202012Validator, ValidationError
+from jsonschema import ValidationError
 
 from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
 from verl.tools.base_tool import BaseTool
@@ -29,6 +29,7 @@ from verl.utils.tensordict_utils import get_non_tensor_data
 
 from .config import REFERENCE_FIELDS
 from .h3 import generation_slot
+from .h3_request import tool_request
 from .observability import ProviderError, failure_record, record_event, timed_stage
 from .storage import item_key, write_json
 from .streaming_judge import StreamingJudge
@@ -63,18 +64,7 @@ class SolH3Tool(BaseTool):
     @staticmethod
     def build_request(parameters, schema):
         """Validate and apply the defaults advertised in this dataset row."""
-        spec = schema["function"]["parameters"]
-        validator = Draft202012Validator(spec)
-        validator.validate(parameters)
-        request = {key: value["default"] for key, value in spec["properties"].items() if "default" in value}
-        request.update(parameters)
-        validator.validate(request)
-        # The gateway uses strict integer fields and strips surrounding prompt
-        # whitespace. JSON Schema alone accepts integral floats and blank text.
-        if not request["prompt"].strip() or any(type(request[key]) is not int for key in ("duration", "seed")):
-            raise ValueError("Sol-H3 requires nonblank prompt text and integer duration/seed")
-        request["prompt"] = request["prompt"].strip()
-        return request
+        return tool_request(parameters, schema)
 
     async def execute(self, instance_id, parameters, **kwargs):
         agent_data = kwargs["agent_data"]

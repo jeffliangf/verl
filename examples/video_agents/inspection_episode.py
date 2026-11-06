@@ -15,6 +15,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
+from .h3_request import request_summary, tool_request
 from .observability import ProviderError
 from .storage import write_json
 
@@ -63,13 +64,10 @@ class InspectionEpisode:
         if name not in self.environment()["available_actions"]:
             raise InvalidAction(f"Action {name} is unavailable in this state")
         if name == "sol_h3":
-            spec = self.schemas[name]["function"]["parameters"]["properties"]
-            request = {key: field["default"] for key, field in spec.items() if "default" in field}
-            request.update(parameters)
-            if not request["prompt"].strip() or any(type(request[k]) is not int for k in ("duration", "seed")):
-                raise InvalidAction("Generation requires a nonblank prompt and integer duration/seed")
-            request["prompt"] = request["prompt"].strip()
-            return request
+            try:
+                return tool_request(parameters, self.schemas[name])
+            except ValueError as exc:
+                raise InvalidAction(str(exc)) from exc
         key = "video_id" if name == "inspect_video" else "final_video_id"
         if parameters[key] not in self.videos:
             raise InvalidAction("Video ID does not belong to this episode")
@@ -80,7 +78,8 @@ class InspectionEpisode:
     async def execute(self, name, parameters):
         parameters = self.validate_action(name, parameters)
         start = time.monotonic()
-        event = {"tool": name, "parameters": parameters, "status": "started"}
+        summary = request_summary(parameters) if name == "sol_h3" else parameters
+        event = {"tool": name, "parameters": summary, "status": "started"}
         self.events.append(event)
         self.save()
         if name == "sol_h3":
@@ -92,7 +91,7 @@ class InspectionEpisode:
             self.videos[video_id] = result
             if self.generation_calls == 2:
                 self.final_result, self.terminal_reason = result, "second_generation"
-            response = {"status": "succeeded", "video_id": video_id, "generation_request": parameters}
+            response = {"status": "succeeded", "video_id": video_id, "generation_request": summary}
         elif name == "inspect_video":
             self.inspection_calls += 1
             video_id = parameters["video_id"]

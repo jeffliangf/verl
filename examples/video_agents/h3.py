@@ -32,6 +32,7 @@ from math import isfinite
 from pathlib import Path
 from uuid import UUID, uuid4
 
+from .h3_request import request_output
 from .observability import record_event, timed_stage
 from .storage import file_sha256, fingerprint, load_external, read_json, write_json
 
@@ -110,7 +111,7 @@ def configuration(endpoints, profile, reference_manifest, token_file=None):
 
 
 def request_body(prompt, settings):
-    """Reconstruct the ten-second requests used to generate reference videos."""
+    """Reconstruct legacy ten-second reference requests without changing their hashes."""
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000:
         raise ValueError("Self-hosted H3 needs a nonempty prompt of at most 8000 characters")
     if settings["duration"] != 10:
@@ -170,11 +171,12 @@ class Client:
         with self.open(origin + ENDPOINT, body=body, timeout=timeout, idempotency_key=idempotency_key) as response:
             return json.load(response)
 
-    def download(self, origin, job_id, output, *, timeout=30):
+    def download(self, origin, job_id, output, *, timeout=30, sglang=False):
         """Authenticate the MP4 request and publish the local file atomically."""
         temporary = output.with_suffix(".mp4.part")
         try:
-            with self.open(f"{origin}/v1/jobs/{job_id}/video", timeout=timeout) as source:
+            route = f"/v1/videos/{job_id}/content" if sglang else f"/v1/jobs/{job_id}/video"
+            with self.open(origin + route, timeout=timeout) as source:
                 with temporary.open("wb") as target:
                     shutil.copyfileobj(source, target, length=1024 * 1024)
             temporary.replace(output)
@@ -312,6 +314,19 @@ def remux_container(path, timeout):
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def validate_media(media, request, profile):
+    """Check the requested canvas and clip length while retaining the audio/codec contract."""
+    output = request_output(request)
+    expected = dict(profile)
+    if "task" in request:
+        expected.update({key: output[key] for key in ("width", "height", "fps")})
+    if media_profile(media, duration=output["duration_seconds"]) != expected:
+        raise ValueError("H3 media format differs from the requested output")
+    frames = (media.get("video") or {}).get("frames")
+    if frames is not None and frames != output["num_frames"]:
+        raise ValueError("H3 frame count differs from the requested output")
 
 
 class DownloadIntegrityError(ValueError):
@@ -599,14 +614,15 @@ class _Generation:
 
     def poll_once(self, timeout):
         identifier = self.state["task_id"]
-        response = self.client.get_json(f"{self.state['worker_url']}/v1/jobs/{identifier}", timeout=timeout)
+        route = ENDPOINT if "task" in self.task["request"] else "/v1/jobs"
+        response = self.client.get_json(f"{self.state['worker_url']}{route}/{identifier}", timeout=timeout)
         if (
             not isinstance(response, dict)
             or response.get("id") != identifier
-            or response.get("status") not in {"queued", "running", "failed", "succeeded"}
+            or response.get("status") not in {"queued", "running", "failed", "succeeded", "completed"}
         ):
             raise ValueError("H3 status returned a different job ID or an invalid job state")
-        return response
+        return {**response, "status": "succeeded" if response["status"] == "completed" else response["status"]}
 
     def download(self, response):
         expected_hash, expected_bytes = response.get("video_sha256"), response.get("video_bytes")
@@ -624,7 +640,10 @@ class _Generation:
         self.output.parent.mkdir(parents=True, exist_ok=True)
 
         def fetch(timeout):
-            self.client.download(self.state["worker_url"], self.state["task_id"], self.output, timeout=timeout)
+            options = {"sglang": True} if "task" in self.task["request"] else {}
+            self.client.download(
+                self.state["worker_url"], self.state["task_id"], self.output, timeout=timeout, **options
+            )
             digest, size = file_sha256(self.output), self.output.stat().st_size
             if verify and (digest != expected_hash or size != expected_bytes):
                 self.output.unlink(missing_ok=True)
@@ -639,8 +658,7 @@ class _Generation:
             if media.get("duration_s") == 0 and (media.get("video") or {}).get("frames") == 0:
                 remux_container(self.output, self.remaining())
                 media, remuxed = self.probe(self.output), True
-            if media_profile(media, duration=self.task["request"]["duration"]) != self.protocol["media_profile"]:
-                raise ValueError(f"H3 media format differs from the reference videos: {self.output}")
+            validate_media(media, self.task["request"], self.protocol["media_profile"])
         provider_timings = {
             key: response[key]
             for key in ("created_at", "started_at", "finished_at", "pipeline_s", "processing_s")

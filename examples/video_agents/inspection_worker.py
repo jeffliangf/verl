@@ -16,15 +16,30 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .h3 import generation_slot
+from .h3_request import request_output
 from .inspection_agent import feedback
 from .observability import ProviderError, timed_stage
 from .storage import load_external, read_json, write_json
 
 _CLEANUP = ThreadPoolExecutor(max_workers=2, thread_name_prefix="inspection-cleanup")
+
+
+def inspect_generation(video, original_request, directory, eval_repo):
+    """Supply new clip lengths without changing the frozen V1 inspector or legacy runs."""
+    inspector = feedback
+    if "task" in video["request"]:
+        # Use a separate module namespace so concurrent/legacy callers retain
+        # the original validator. The rubric and source hash stay unchanged.
+        inspector = load_external(Path(feedback.__file__))
+        inspector.validate_feedback = partial(
+            inspector.validate_feedback, duration=request_output(video["request"])["duration_seconds"]
+        )
+    return inspector.inspect(video, original_request, [], directory, eval_repo)
 
 
 def schedule_cleanup(directory, eval_repo):
@@ -147,7 +162,7 @@ def main():
     data = read_json(args.input)
     directory = Path(data["directory"])
     try:
-        report = feedback.inspect(data["video"], data["original_request"], [], directory, data["eval_repo"])
+        report = inspect_generation(data["video"], data["original_request"], directory, data["eval_repo"])
         result = {"status": "succeeded", "report": report}
     except Exception as exc:
         result = {

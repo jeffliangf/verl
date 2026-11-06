@@ -23,6 +23,7 @@ from test_tournament_on_cpu import TemplateTokenizer, prepared_rl  # noqa: F401
 
 from examples.video_agents import inspection_rl, rl
 from examples.video_agents.h3_deadlines import phase_budgets, worker_timeout
+from examples.video_agents.h3_request import video_request
 from examples.video_agents.inspection_episode import InvalidAction
 from examples.video_agents.observability import ProviderError
 from examples.video_agents.storage import file_sha256, read_json, read_jsonl, write_json
@@ -243,7 +244,7 @@ async def test_native_paths_full_feedback_and_exact_policy_masks(native_factory,
     output = await loop.run({}, **row)
     assert len(generated) == generations
     assert len(inspected) == inspections
-    assert all(request["duration"] == 5 and request["seed"] == 123456789 for request in generated)
+    assert all(request["target"]["duration_seconds"] == 5 and request["seed"] == 123456789 for request in generated)
     assert output.extra_fields["h3_result"]["status"] == "succeeded"
     assert output.extra_fields["episode"]["assistant_turns"] == len(turns)
     assert len(output.response_ids) == len(output.response_mask) == len(output.response_logprobs)
@@ -496,7 +497,7 @@ async def test_original_generator_extremes(native_factory, duration, seed):
     make, row, generated, _, _, _ = native_factory
     output = await make([call("sol_h3", prompt="Original constraints", duration=duration, seed=seed), F]).run({}, **row)
     assert output.extra_fields["h3_result"]["status"] == "succeeded"
-    assert generated == [{"prompt": "Original constraints", "duration": duration, "seed": seed}]
+    assert generated == [video_request("Original constraints", duration=duration, seed=seed)]
 
 
 @pytest.mark.asyncio

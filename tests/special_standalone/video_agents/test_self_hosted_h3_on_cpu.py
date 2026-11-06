@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from examples.video_agents import h3
+from examples.video_agents.h3_request import video_request
 from examples.video_agents.storage import read_json, write_json
 
 MEDIA = {
@@ -221,9 +222,26 @@ def test_generated_media_must_match_the_requested_duration(job, duration):
 
 
 @pytest.mark.parametrize("execution", ["client", "worker"])
-def test_http_generation_authenticates_and_resumes_without_reposting(job, monkeypatch, execution):
+@pytest.mark.parametrize("request_format", ["legacy", "t2va", "fl2va"])
+def test_http_generation_authenticates_and_resumes_without_reposting(job, monkeypatch, execution, request_format):
     task, protocol = job
     requests = []
+    media = MEDIA
+    if request_format != "legacy":
+        options = {}
+        if request_format == "fl2va":
+            from PIL import Image
+
+            first_frame = Path(task["state"]).with_name("frame.png")
+            Image.new("RGB", (64, 96), (40, 120, 200)).save(first_frame)
+            options["image"] = first_frame
+        task["request"] = video_request("Exact video prompt", duration=8, **options)
+        media = {**MEDIA, "duration_s": 8}
+        if options:
+            media["video"] = {**MEDIA["video"], "width": 768, "height": 1152}
+            first_frame.unlink()  # Subprocesses and retries consume the frozen inline image.
+    status_route = f"/v1/jobs/{JOB}" if request_format == "legacy" else f"/v1/videos/{JOB}"
+    content_route = status_route + ("/video" if request_format == "legacy" else "/content")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -246,10 +264,11 @@ def test_http_generation_authenticates_and_resumes_without_reposting(job, monkey
         def do_GET(self):
             if self.path == "/healthz":
                 self.respond({"status": "ready", "queued": 0, "queue_capacity": 8})
-            elif self.path.endswith("/video"):
+            elif self.path == content_route:
                 self.respond(b"test MP4")
             else:
-                self.respond({"id": JOB, "status": "succeeded"})
+                assert self.path == status_route
+                self.respond({"id": JOB, "status": "succeeded" if request_format == "legacy" else "completed"})
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -264,7 +283,7 @@ def test_http_generation_authenticates_and_resumes_without_reposting(job, monkey
             directory = Path(task["state"]).parent
             repo = directory / "eval-repo"
             (repo / "bestofn").mkdir(parents=True)
-            (repo / "bestofn/normalize.py").write_text(f"def probe(path): return {MEDIA!r}\n")
+            (repo / "bestofn/normalize.py").write_text(f"def probe(path): return {media!r}\n")
             protocol["eval_repo"] = str(repo)
             write_json(directory / "protocol.json", protocol)
             write_json(directory / "generation.json", [task])
@@ -276,7 +295,7 @@ def test_http_generation_authenticates_and_resumes_without_reposting(job, monkey
         else:
 
             def generate():
-                assert h3.generate_one(task, protocol, h3.Client("test-token"), lambda path: MEDIA)
+                assert h3.generate_one(task, protocol, h3.Client("test-token"), lambda path: media)
 
         generate()
         generate()
@@ -284,7 +303,7 @@ def test_http_generation_authenticates_and_resumes_without_reposting(job, monkey
         generate()
         assert read_json(Path(task["state"]))["status"] == "succeeded"
         assert sum(method == "POST" for method, _, _ in requests) == 1
-        assert requests[-1] == ("GET", f"/v1/jobs/{JOB}/video", "Bearer test-token")
+        assert requests[-1] == ("GET", content_route, "Bearer test-token")
     finally:
         server.shutdown()
         thread.join()
