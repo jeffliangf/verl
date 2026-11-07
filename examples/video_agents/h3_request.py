@@ -203,26 +203,43 @@ def tool_request(parameters, schema, *, sample=None):
         conditions = request["conditions"]
         if (expected == "fl2va" and len(conditions) != 1) or (expected == "t2va" and conditions):
             raise ValueError("I2V requires its supplied first frame; T2V requires empty conditions")
+        strict_controls = "request" in sample
+        required = sample.get("target", {})
+        if strict_controls and (missing := required.keys() - request["target"].keys()):
+            raise ValueError(
+                f"Tool call must explicitly supply requested output settings: {', '.join(sorted(missing))}"
+            )
         image = None
         if expected == "fl2va":
             asset = sample["image"]
             image = f"data:{asset['mime_type']};base64," + base64.b64encode(image_bytes(asset)).decode("ascii")
         target_spec = spec["properties"]["target"]["properties"]
         target = {key: deepcopy(value["default"]) for key, value in target_spec.items() if "default" in value}
-        target.update(sample.get("target", {}))
+        if not strict_controls:
+            target.update(required)
         target.update(request["target"])
-        # Explicit sample constraints take precedence over policy choices.
-        if any(target.get(key) != value for key, value in sample.get("target", {}).items()):
+        if not strict_controls and any(target.get(key) != value for key, value in required.items()):
             raise ValueError("Tool target contradicts the sample's requested output settings")
         if target.get("short_edge", 768) != 768:
             raise ValueError("Sol-H3 only supports short_edge 768")
-        return video_request(
+        result = video_request(
             request["prompt"],
             duration=target["duration_seconds"],
             aspect_ratio=target.get("aspect_ratio"),
             image=image,
             seed=42 if request["seed"] is None else request["seed"],
         )
+        if strict_controls and required:
+            actual = request_output(result)
+            expected_output = request_output({**result, "target": {**result["target"], **required}})
+            fields = []
+            if "duration_seconds" in required:
+                fields.append("num_frames")
+            if "aspect_ratio" in required:
+                fields.extend(("width", "height"))
+            if any(actual[key] != expected_output[key] for key in fields):
+                raise ValueError("Tool target contradicts the request's required output settings")
+        return result
     if "aspect_ratio" in spec["properties"]:
         return video_request(**request)
     # Old prepared datasets remain byte-compatible with their persisted jobs.

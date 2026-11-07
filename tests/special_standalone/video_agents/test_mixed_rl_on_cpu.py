@@ -46,6 +46,7 @@ def make_sample(tmp_path, name="frame", *, kind="PNG", color="red"):
     return {
         "id": name,
         "prompt": "The person waves.",
+        "request": "Animate this image. The person waves.",
         "source": "test",
         "task": "i2v",
         "image": image_asset(path),
@@ -67,6 +68,11 @@ def test_normalize_preserves_all_prompts_and_excludes_teacher_text(tmp_path):
     assert "<image>" in records[0]["prompt"][1]["content"]
     assert all(not row["images"] for row in records[1:])
     assert [r["extra_info"]["id"] for r in records] == [r["id"] for r in normalized]
+    for sample, record in zip(normalized, records, strict=True):
+        user_text = record["prompt"][1]["content"]
+        assert sample["request"] in user_text
+        assert all(label not in user_text for label in ("sol_h3", "fl2va", "t2va", "image_ref", "input_image"))
+        assert sample["target"] == {}
     with pytest.raises(ValueError, match="image"):
         mixed_data.check_splits(normalized, [{**normalized[0], "id": "different", "prompt": "Different."}])
 
@@ -129,6 +135,54 @@ def test_unified_defaults_constraints_and_changed_asset(tmp_path):
         )
 
 
+@pytest.mark.parametrize("task", ["t2v", "i2v"])
+@pytest.mark.parametrize("duration", [None, 8, 10, 10.125])
+def test_requested_eval_duration_checks_emitted_arguments(tmp_path, task, duration):
+    sample = make_sample(tmp_path)
+    if task == "t2v":
+        sample.update(task=task, image=None)
+    sample["request"] = mixed_data.natural_request(sample["prompt"], image=bool(sample["image"]), evaluation=True)
+    sample["target"] = {"duration_seconds": 10}
+    parameters = {
+        "task": "fl2va" if sample["image"] else "t2va",
+        "prompt": "Wave.",
+        "conditions": [CONDITION] if sample["image"] else [],
+        "target": {"aspect_ratio": "9:16", **({"duration_seconds": duration} if duration is not None else {})},
+    }
+    if duration in (None, 8):
+        with pytest.raises(ValueError, match="explicitly supply" if duration is None else "contradicts"):
+            h3_request.tool_request(parameters, SCHEMA, sample=sample)
+    else:
+        request = h3_request.tool_request(parameters, SCHEMA, sample=sample)
+        assert h3_request.request_output(request)["num_frames"] == 243
+        assert request["target"]["aspect_ratio"] == "9:16"  # No hidden evaluation aspect constraint.
+
+
+def test_generic_request_has_no_duration_or_aspect_matching_penalty(tmp_path):
+    sample = make_sample(tmp_path)
+    for duration, ratio in ((5, "1:1"), (8, "9:16"), (14, "21:9")):
+        request = h3_request.tool_request(
+            {
+                "task": "fl2va",
+                "prompt": "Wave.",
+                "conditions": [CONDITION],
+                "target": {"duration_seconds": duration, "aspect_ratio": ratio},
+            },
+            SCHEMA,
+            sample=sample,
+        )
+        assert request["target"]["duration_seconds"] == duration
+        assert request["target"]["aspect_ratio"] == ratio
+
+
+def test_hidden_controls_never_rewrite_the_visible_request(tmp_path):
+    sample = {**make_sample(tmp_path), "target": {"duration_seconds": 8, "aspect_ratio": "9:16"}}
+    text = mixed_data.observation(sample)
+    assert text == "<image>\n" + sample["request"]
+    assert mixed_data.original_request(sample) == sample["request"]
+    assert "8" not in text and "9:16" not in text
+
+
 def test_generated_image_payload_stays_out_of_rollout_records(prepared_rl, tmp_path, monkeypatch):
     from test_tournament_on_cpu import MEDIA
 
@@ -179,6 +233,31 @@ async def test_native_parser_executes_nested_unified_tool(loop_factory, model_re
     assert not hasattr(shared, "bound_sample")  # Concurrent episodes do not mutate the shared tool.
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duration", [None, 8])
+async def test_native_loop_rejects_noncompliant_duration_before_generation(loop_factory, model_request, duration):
+    make, generated = loop_factory
+    text = "<tool_call><function=sol_h3><parameter=task>t2va</parameter><parameter=prompt>A clear scene</parameter>"
+    if duration is not None:
+        text += '<parameter=target>{"duration_seconds":8}</parameter>'
+    text += "</function></tool_call>"
+    loop = make(text)
+    shared = loop.tools["sol_h3"]
+    shared.protocol = {**shared.protocol, "tool_contract": "urn:verl:sol-h3:3"}
+    info = model_request["extra_info"]
+    shared.samples[info["split"]][info["id"]] = {
+        "task": "t2v",
+        "image": None,
+        "request": "Make a 10-second video of a clear scene.",
+        "target": {"duration_seconds": 10},
+    }
+    model_request["tools"] = [SCHEMA]
+    output = await loop.run({}, **model_request)
+    assert generated == []
+    assert output.extra_fields["h3_result"]["status"] == "invalid_call"
+    assert ("explicitly supply" if duration is None else "contradicts") in output.extra_fields["h3_result"]["reason"]
+
+
 def test_native_dataset_and_token_check_keep_actual_image(tmp_path):
     from omegaconf import OmegaConf
 
@@ -209,7 +288,8 @@ def test_native_dataset_and_token_check_keep_actual_image(tmp_path):
     native = dataset[0]
     content = native["raw_prompt"][1]["content"]
     assert [item for item in content if item["type"] == "image"][0]["image"] == sample["image"]["path"]
-    assert "input_image" in str(content)
+    assert "input_image" not in str(content)
+    assert sample["request"] in str(content)
     assert isinstance(dataset[1]["raw_prompt"][1]["content"], str)
     count, _ = rl.prompt_tokens(records[0], TemplateTokenizer(), Processor(), config)
     assert count == 987  # Includes processor-expanded image tokens, not text-only tokenization.
@@ -255,6 +335,7 @@ def test_eval_selects_argon_and_four_references_while_training_keeps_rewards(pre
     for order in ("original", "swapped"):
         assert len(captured[-1][1][order]["pairs"]) == 4
         assert all(p["reference_image"] == sample["image"] for p in captured[-1][1][order]["pairs"].values())
+        assert all(p["prompt"] == sample["request"] for p in captured[-1][1][order]["pairs"].values())
     assert protocol["judge"] == JUDGE_SETTINGS
 
 
@@ -462,7 +543,12 @@ def test_mixed_prepare_freezes_native_files_and_separate_judges(prepared_rl, tmp
         val_file,
         [
             {"id": "eval-i", "prompt": "Wave.", "image": eval_image["image"]["path"]},
-            {"id": "eval-t", "prompt": "Forest."},
+            {
+                "id": "eval-t",
+                "prompt": "[0-2s] Forest. [2-8s] River.",
+                "request": "Make a vertical video of this scene: [0-2s] Forest. [2-8s] River.",
+                "target": {"duration_seconds": 8},
+            },
         ],
     )
     ref = legacy["samples"]["val"][0]["references"]["best_of_4"]
@@ -505,6 +591,19 @@ def test_mixed_prepare_freezes_native_files_and_separate_judges(prepared_rl, tmp
     protocol = tournament.load_protocol(args.run_dir / "protocol.json")
     assert protocol["judge"] == JUDGE_SETTINGS
     assert judging_protocol(protocol, validate=True)["judge"]["judge_model"] == "gemini-4-argon"
+    assert protocol["eval_duration_seconds"] == summary["evaluation_duration_seconds"] == 10
+    assert all(s["target"] == {} for s in protocol["samples"]["train"])
+    for sample in protocol["samples"]["val"]:
+        assert sample["target"] == {"duration_seconds": 10}
+        assert "10-second video" in sample["request"]
+        assert "adapting" in sample["request"]
+        assert sample["prompt"] in sample["request"]
+        if sample["id"] == "eval-t":
+            assert "Make a vertical video of this scene" in sample["request"]
+        assert sample["control_metadata"]["duration_seconds"]["effective_num_frames"] == 243
+    for row in read_jsonl(args.data_dir / "val.jsonl"):
+        assert "10-second video" in row["prompt"][1]["content"]
+        assert "Requested output settings" not in row["prompt"][1]["content"]
     assert len(read_jsonl(args.combined_file)) == 2
     assert "SECRET" not in (args.data_dir / "train.jsonl").read_text()
     assert mixed_data.prepare(args) == summary

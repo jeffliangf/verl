@@ -14,7 +14,7 @@ Run in the existing Python environment with the video-agent dependencies:
 .. code-block:: bash
 
    python -m examples.video_agents.rl prepare-mixed \
-     --run-dir data/prompt_rewrite_mixed_rl/run \
+     --run-dir data/prompt_rewrite_mixed_rl_v2/run \
      --h3-endpoints http://127.0.0.1:28080
 
 The default inputs are:
@@ -24,11 +24,13 @@ The default inputs are:
 * ``data/prompt_rewrite_sft.jsonl``: 3,000 T2V samples. Only the original prompts
   enter RL; teacher rewrites are excluded.
 
-Preparation writes ``data/prompt_rewrite_mixed_rl.jsonl`` with all 8,291 normalized
+Preparation writes ``data/prompt_rewrite_mixed_rl_v2.jsonl`` with all 8,291 normalized
 samples, plus native ``train.jsonl`` and ``val.jsonl`` inside
-``data/prompt_rewrite_mixed_rl``. Each normalized sample has ``id``, ``task``
-(``t2v``/``i2v``), ``prompt``, ``source``, ``image`` (null or a path/checksum/media
-record), ``target`` (explicit user constraints), and source-file provenance.
+``data/prompt_rewrite_mixed_rl_v2``. Each normalized sample has ``id``, ``task``
+(``t2v``/``i2v``), original ``prompt``, natural ``request``, ``source``, ``image``
+(null or a path/checksum/media record), ``target`` (required controls), and
+source-file provenance. Only the natural request and attached image enter the
+policy user message; task and control labels remain backend metadata.
 The natural mixture is approximately 61% T2V and 39% I2V. All requested rows are
 retained, including ten repeated T2V prompt occurrences under distinct IDs.
 
@@ -94,14 +96,18 @@ Generation and judging use the original image. Image files must remain readable
 at their recorded paths on every rollout host.
 
 Duration defaults to 10 seconds and aspect ratio defaults to 16:9 for T2V or
-``auto`` for I2V. These are defaults, not forced overrides. Explicit sample
-``target`` constraints take precedence over policy choices. A null or omitted
+``auto`` for I2V. These defaults apply to free choices. For explicit sample
+``target`` constraints, the policy must emit the corresponding arguments;
+missing or conflicting controls are invalid. Effective frame/canvas equivalence
+is accepted. The executor does not insert hidden ground-truth controls.
+A null or omitted
 seed resolves to 42; integer seeds range from 0 through 2^63-1.
 
 See ``control_targets.rst`` for the proposed follow-up on extracting explicit
 controls, annotating suggestions, mixing fixed and free choices, and measuring
-instruction compliance. Those annotations and benchmark control assignments are
-not applied to this prepared dataset.
+instruction compliance. Training annotations and a synthetic control curriculum
+remain proposals. The natural requests and fixed 10-second evaluation are
+implemented in the v2 preparation.
 
 The deployed worker supports 124 + 17*k frames for k=0..13 at 24 fps, approximately
 5.167 through 14.375 seconds. It rounds a requested duration to a supported frame
@@ -132,6 +138,12 @@ Evaluation uses ``gemini-4-argon`` for both:
 
 * T2V: ``data/prompt_rewrite_aa_moviegen_eval_200.jsonl`` (200 samples).
 * I2V: ``data/aa_i2v_eval_200.jsonl`` (200 samples).
+
+All 400 requests explicitly ask for a nominal 10-second video, including
+MovieGen. The wording asks to adapt any storyboard timing to this duration.
+The backend requires the emitted duration to resolve to 243 frames at 24 fps
+(10.125 seconds); it adds no benchmark aspect-ratio constraint. The quality judge
+receives the same natural request as the policy.
 
 Each candidate is compared against these exact columns:
 
@@ -164,16 +176,16 @@ Launch preview and checks
 .. code-block:: bash
 
    python -m examples.video_agents.rl train \
-     --run-dir data/prompt_rewrite_mixed_rl/run \
-     --data-dir data/prompt_rewrite_mixed_rl
+     --run-dir data/prompt_rewrite_mixed_rl_v2/run \
+     --data-dir data/prompt_rewrite_mixed_rl_v2
 
    python -m examples.video_agents.rl status \
-     --run-dir data/prompt_rewrite_mixed_rl/run
+     --run-dir data/prompt_rewrite_mixed_rl_v2/run
 
    python -m examples.video_agents.rl evaluate \
-     --run-dir data/prompt_rewrite_mixed_rl/run \
-     --data-dir data/prompt_rewrite_mixed_rl \
-     --output-dir data/prompt_rewrite_mixed_rl/evaluation-checkpoint \
+     --run-dir data/prompt_rewrite_mixed_rl_v2/run \
+     --data-dir data/prompt_rewrite_mixed_rl_v2 \
+     --output-dir data/prompt_rewrite_mixed_rl_v2/evaluation-checkpoint \
      --model /path/to/exported-vision-policy
 
 Train/evaluate commands preview configuration and cost until ``--execute`` is

@@ -1,164 +1,152 @@
-Duration and aspect-ratio supervision: proposed next step
-=======================================================
+Natural requests and control supervision
+========================================
 
-This is a design for extending the implemented mixed-run format. The current
-implementation accepts explicit ``target`` constraints, binds source images, and
-uses a flexible generation instruction. It does not yet infer targets, synthesize
-control requests, or assign fixed evaluation durations. Those annotation and
-reward changes should be introduced as a new prepared experiment.
-
-Separate requirements from suggestions
+Implemented in the v2 prepared dataset
 -------------------------------------
 
-A prompt can require a duration/shape, suggest one, or leave the decision to the
-policy. An inferred suitable duration is not ground truth about the user's intent.
-Keep required values in the existing ``target`` object. Add ``preferred_target``
-for advisory annotations and ``control_metadata`` for their origin and evidence.
-An absent required field means the policy is free to choose any supported value.
+New preparations store a natural ``request`` separately from the original
+``prompt``. Only that request and any attached image enter the policy's user
+message. The ordinary system message and tool definition remain available.
+``task``, ``target``, and ``control_metadata`` are backend labels for validation,
+rewards, and reporting; they are not appended to the user message.
+
+Generic training requests say "Make a video of the following scene: ..." or
+"Animate this image: ...". They have no duration/aspect matching requirement.
+Documented tool defaults and worker capability validation still apply.
+
+All 400 evaluation requests now explicitly ask for a nominal 10-second video,
+including AA T2V, AA I2V, and MovieGen. The natural wording asks to adapt the scene
+to that duration, so a pasted storyboard with a different timeline is deliberately
+retimed for this benchmark. The original prompt remains unchanged for provenance.
+There is no additional benchmark aspect-ratio constraint.
 
 .. code-block:: json
 
    {
      "id": "example-001",
      "task": "t2v",
-     "prompt": "A red fox crosses a snowy clearing.",
+     "prompt": "A fox crosses a snowy clearing.",
      "image": null,
-     "target": {
-       "duration_seconds": 8,
-       "aspect_ratio": "9:16"
-     },
-     "preferred_target": {},
+     "request": "Create a 10-second video, adapting the following scene to fit that duration:\n\nA fox crosses a snowy clearing.",
+     "target": {"duration_seconds": 10},
      "control_metadata": {
        "duration_seconds": {
-         "source": "synthetic_request",
-         "effective_num_frames": 192
-       },
-       "aspect_ratio": {
-         "source": "synthetic_request"
-       },
-       "annotation_version": 1
+         "source": "benchmark_request",
+         "effective_num_frames": 243
+       }
      }
    }
 
-Render the policy's user message deterministically from the required fields:
-"Generate an approximately 8-second video in 9:16 portrait format of: ...".
-For I2V, include the source image and its ``input_image`` handle. With no required
-fields, render "Generate a video of: ... Choose a suitable duration and aspect
-ratio." Required settings must also be visible in the original request supplied
-to the judge. Teacher rewrites and annotation reasoning stay out of the policy
-observation.
+The policy must emit a requested control. The executor checks its arguments
+instead of supplying the answer from a hidden target. For example, omitting
+duration or choosing 8 seconds fails the evaluation request; 10 and 10.125 seconds
+both satisfy it because the worker produces 243 frames at 24 fps. Exact aspect
+requirements, when present, compare the resolved worker canvas rather than an
+ideal mathematical ratio. Old frozen rows without a natural ``request`` field
+retain their previous defaults and validation semantics.
 
-An inferred-only example would have ``target: {}``,
-``preferred_target: {"duration_seconds": 8}``, and metadata recording
-``source: gemini_inference``, the model ID, evidence, confidence, and annotation
-version. It remains a free-choice task. Suggestions may help choose plausible
-synthetic requests and support analysis; they do not create a hard reward penalty.
+The policy and Gemini quality judge receive the same natural request. Existing
+quality scoring, GRPO, and invalid-call accounting remain unchanged. Evaluation
+invalid calls receive zero wins. Generic training samples can choose any supported
+duration/aspect ratio without a control-matching penalty.
 
-How to assign controls
-----------------------
+Training annotation: proposed next step
+---------------------------------------
 
-1. Extract explicit requests and timelines first. Preserve direct duration and
-   aspect-ratio instructions, recording the matching text as evidence. Distinguish
-   clip duration from action timestamps, object counts, frame rates, and historical
-   eras such as "1980s". A list of timestamps needs a timeline interpretation,
-   not a naive numeric maximum.
-2. Use a cached Gemini annotation pass only for ambiguous requests or optional
-   suggestions. Require structured output separating ``explicit``, ``inferred``,
-   ``unspecified``, and ``unsupported``. Check evidence against the original text
-   and validate every proposed value against the worker. The annotation cache
-   should include prompt/image hashes, model ID, and annotation version. No Gemini
-   call is needed during RL to determine the requested controls.
-3. For otherwise unspecified training samples, start with a simple seeded 50/50
-   split between synthetic explicit requests and free-choice requests. Keep each
-   sample's assignment fixed in the prepared dataset. This changes the rendered
-   request, not the GRPO sampler or objective.
-4. Cover nominal durations 5, 8, 10, 12, and 14 seconds in the synthetic half, and
-   all six explicit T2V aspect ratios. Preserve I2V's source-image shape with
-   ``auto`` initially; use a different I2V ratio when a shape change is explicitly
-   requested. The worker stretches a first frame for a different explicit ratio,
-   so automatic random shape changes should not masquerade as image-preserving
-   animation requests.
+No Gemini annotation pass, synthetic training-control curriculum, or semantic
+timeline/orientation extractor has been implemented or run yet.
 
-Never overwrite an explicit original constraint with a sampled or inferred one.
-Explicit durations outside the worker's range need a recorded resolution. Keep
-such rows in the master corpus and flag them for review; either omit them from the
-first strict-control training view or prepare clearly labeled retimed requests,
-such as "Adapt this storyboard into a 10-second clip, preserving event order."
-Silently clamping an original 30-second requirement to 10 seconds would produce
-contradictory supervision.
+An offline Gemini pass over unique training examples can provide two distinct
+outputs: requirements supported by the original request, and suggested settings
+for otherwise unspecified controls. Cache by prompt/image content, annotation
+model, and annotation version. Include the source image for I2V when interpreting
+its contents; its dimensions already give a deterministic shape preference.
 
-The current training files contain multi-shot prompts with timelines extending
-beyond this worker's maximum duration. They also contain era references that a
-simple seconds regex would misread. Explicit extraction and inference therefore
-need separate provenance, even if both are produced by one annotation pass.
+Preserve the original scene text. Use short, varied prefixes/postfixes to construct
+natural requests, for example "Make this about eight seconds long", "Use a portrait
+format", or "Animate this image, keeping its original shape." Preserve existing
+instructions, and do not manufacture requirements from vague language.
 
-Reward signal
--------------
+Keep required exact values in ``target``, advisory values in a proposed
+``preferred_target``, and evidence/origin/confidence in ``control_metadata``.
+If a Gemini suggestion is deliberately turned into a visible request for eight
+seconds, eight becomes a requirement of that constructed request. If the request
+stays generic, the suggestion remains advisory and never produces a matching
+penalty. Annotation reasoning is not policy input.
 
-Keep the existing Gemini quality preference and GRPO computation. Treat required
-duration/aspect settings as part of tool-call correctness, using the existing
-invalid-call penalty rather than introducing a weighted reward sum.
+A simple initial mixture could put explicit controls in approximately half the
+otherwise unspecified samples and keep half free-choice. Include duration-only,
+aspect-only, and combined requests, with ordinary phrasing as well as precise
+numbers. All siblings in a GRPO group share the same final request. The exact
+mixture is a proposal, not an applied training setting.
 
-For training, let Q be the existing group tournament reward:
+Cover supported nominal durations such as 5, 8, 10, 12, and 14 seconds, and the
+six T2V aspect ratios. For I2V, prefer the source image's shape through ``auto``;
+make preservation a hard requirement only when the visible request asks for it.
+The worker stretches a first frame for a different explicit aspect ratio, so
+shape-changing requests need to reflect that operation.
+
+Interpret only what the user actually requests
+----------------------------------------------
+
+* "Make a video of ..." has no exact duration or aspect requirement.
+* "Make it vertical" constrains orientation; both 3:4 and 9:16 can satisfy it.
+  Do not secretly require 9:16.
+* "Make it square" supports a 1:1 requirement.
+* "A short clip" does not establish a unique numeric duration.
+* A complete output timeline "[0-2s] ... [3-10s] ..." specifies a nominal
+  10-second video. Use the final endpoint, not the sum of interval lengths:
+  the gap from 2 to 3 seconds does not make it a 9-second clip.
+
+Store the kind and evidence of coarse constraints separately instead of inventing
+an exact target. An incomplete timeline may establish only a lower bound.
+Timestamps into an existing source video, independently timed alternatives, and
+historical dates are not automatically output duration. Ambiguous cases need
+semantic annotation; uncertainty must not become an unjustified exact penalty.
+
+Do not silently clamp explicit durations outside the worker's supported range.
+Keep the original row and record a resolution: flag it for review or deliberately
+construct a retimed request. The current training corpus includes long multi-shot
+timelines as well as historical eras that a naive seconds regex would misread.
+The fixed 10-second evaluation benchmark explicitly requests retiming; this does
+not establish a general rule for the training set.
+
+Reward for annotated training controls
+--------------------------------------
+
+Continue using the existing tournament quality reward Q:
 
 .. code-block:: text
 
-   required_controls_ok = duration_ok AND aspect_ratio_ok
-   reward = Q       if the tool call is valid and required_controls_ok
-   reward = -1      for an invalid or noncompliant policy call
+   reward = Q   for a valid call satisfying all visible requirements
+   reward = -1  for an invalid call or a violated requirement
 
-When a control is unspecified, its correctness flag is automatically true.
-Preferred/inferred settings never produce the -1 penalty. Existing neutral
-fallback accounting, provider-failure handling, and GRPO advantages stay intact.
-Noncompliant calls can be rejected before H3 generation, saving generation and
-judging work. In evaluation, retain the existing invalid-call behavior of zero
-wins and report compliance separately.
+Unspecified controls automatically pass this gate. Inferred suggestions never
+create a matching penalty. Worker failures remain execution failures rather than
+evidence that the policy chose the wrong arguments.
 
-Compare effective worker settings rather than raw floats:
+For exact duration requests, compare effective frame counts. For exact aspect
+requests, compare effective canvas dimensions, including source-image geometry
+for ``auto``. For qualitative constraints, evaluate the actual meaning:
+orientation for "vertical", rather than an arbitrary exact ratio. Gemini keeps
+the quality rubric and evaluates the same natural request and source image.
 
-* Duration: compare ``frame_count(actual_seconds)`` with
-  ``frame_count(required_seconds)``. Both 10 and 10.125 produce 243 frames and
-  should satisfy a nominal 10-second request. The current implementation checks
-  explicit target values literally; this equivalence check is a proposed refinement.
-* Aspect ratio: resolve the requested and actual settings through the worker's
-  canvas calculation, including the source image for ``auto``. For example,
-  16:9 maps to 1344x768 under this deployment. Do not penalize that output for
-  failing an ideal mathematical 16:9 pixel ratio.
+Future reports should distinguish applicable constraints, duration compliance,
+aspect compliance, missing arguments, and quality. Compute compliance rates only
+over applicable requirements. All-invalid sibling groups have equal penalties
+and no relative control-learning signal; monitor their frequency before deciding
+whether a supervised warm-up is needed.
 
-Record ``duration_ok``, ``aspect_ratio_ok``, requested/effective frames, requested/
-effective canvas, and ``valid_call`` as diagnostics. Keep Q separately available
-in reports so a quality improvement can be distinguished from better instruction
-following. A worker returning the wrong geometry after a compliant call is an
-execution failure, not evidence that the policy chose the wrong tool arguments.
+Evaluation policy
+-----------------
 
-Evaluation policy and observed evidence
---------------------------------------
+The fixed-duration benchmark contains 100 AA T2V, 100 MovieGen T2V, and 200 AA I2V
+samples. All use explicit nominal 10-second requests and Gemini 4 Argon, with the
+four saved references per sample. The 1,600 reference slots also contain 243 video
+frames at 24 fps, or 10.125 seconds.
 
-The current evaluation files contain:
-
-* 100 ``aa_eval`` and 100 ``movie_gen_video_bench`` T2V prompts.
-* 100 ``aa-i2v`` and 100 ``aa-i2v-batch2`` I2V prompts.
-
-All 1,600 saved reference slots contain 243 video frames at 24 fps, or 10.125
-seconds. The MovieGen prompts have no numeric seconds expressions in the local
-audit; absence of explicit timing does not establish an intended shorter duration.
-
-For the requested comparisons with the existing four baselines, set a required
-nominal duration of 10 seconds on all AA samples. Also use 10 seconds on MovieGen
-for this fixed-baseline benchmark, recording
-``source: benchmark_reference_profile`` rather than inventing a user-specified
-duration. This makes the main comparison consistent with the saved reference
-videos. Preserve explicit aspect requirements; otherwise record the benchmark
-shape policy explicitly (16:9 T2V, source-image ``auto`` I2V), and disclose any
-shape difference from the saved landscape reference exports.
-
-Gemini-inferred MovieGen durations can be retained as suggestions and evaluated
-in a separate variable-duration/control suite. To claim a controlled comparison
-against the same baselines at those new durations, regenerate the reference
-videos under the same requested settings and freeze that as a separate benchmark.
-Keep those results separate from the existing 200-prompt T2V comparison.
-
-Use Gemini 4 Argon for both evaluation tasks as already requested. Report quality
-win rates against each of the four references together with duration compliance,
-aspect compliance, invalid calls, and service/judge coverage. This adds a precise
-instruction-following signal while leaving the Gemini quality rubric unchanged.
+MovieGen duration suggestions may still be annotated for analysis or a future
+variable-duration benchmark. They do not change this agreed 10-second evaluation.
+Reference lengths establish the baselines' generation settings, not the original
+prompts' intended duration. Any future benchmark with different requested controls
+must disclose mismatches or regenerate references under those same controls.

@@ -55,7 +55,7 @@ def build_manifests(protocol: dict, candidate_videos: dict[str, dict]) -> dict[s
                 "video_path_B": sample["references"][reference]["path"],
                 **reference_image_fields(sample),
             }
-            if sample.get("target"):
+            if "request" in sample or sample.get("target"):
                 from .mixed_data import original_request
 
                 pair["prompt"] = original_request(sample)

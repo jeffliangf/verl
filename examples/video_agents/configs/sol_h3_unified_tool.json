@@ -10,7 +10,7 @@
         "task": {
           "type": "string",
           "enum": ["t2va", "fl2va"],
-          "description": "Use the task assigned in the request: t2va for text only, fl2va when a first frame is supplied."
+          "description": "Infer the task from the user's request and attached image: t2va for text-to-video, fl2va to animate a supplied first-frame image."
         },
         "prompt": {
           "type": "string",
@@ -48,7 +48,7 @@
               "minimum": 4,
               "maximum": 15,
               "default": 10,
-              "description": "Defaults to 10 seconds. The worker rounds to 24 fps then up to 124 + 17*k frames, k=0..13. The rounded result must be 124..345 frames (5.167..14.375 seconds); 4 and 15 are invalid despite the outer numeric bounds. 5, 8, and 10 are accepted. For exact lengths send frames/24, e.g. 10.125 for 243 frames."
+              "description": "Infer duration from the user's instructions, including any complete output timeline, and supply this field when a duration is requested. Otherwise defaults to 10 seconds. The worker rounds to 24 fps then up to 124 + 17*k frames, k=0..13. The rounded result must be 124..345 frames (5.167..14.375 seconds); 4 and 15 are invalid despite the outer numeric bounds. 5, 8, and 10 are accepted. For exact lengths send frames/24, e.g. 10.125 for 243 frames."
             },
             "aspect_ratio": {
               "type": "string",

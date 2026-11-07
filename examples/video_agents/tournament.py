@@ -205,7 +205,7 @@ def tournament_manifests(sample: dict, candidates: list[dict], protocol: dict) -
             "video_path_B": candidates[j]["path"],
             **reference_image_fields(sample),
         }
-        if sample.get("target"):
+        if "request" in sample or sample.get("target"):
             from .mixed_data import original_request
 
             pairs[f"{i}_vs_{j}"]["prompt"] = original_request(sample)

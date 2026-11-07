@@ -35,8 +35,18 @@ REFERENCE_COLUMNS = (
     "best_of_4_h3_50step",
     "best_of_16_h3_50step",
 )
-DATA_DIR = ROOT / "data/prompt_rewrite_mixed_rl"
+DATA_DIR = ROOT / "data/prompt_rewrite_mixed_rl_v2"
 OBSERVATION_MAX_PIXELS = 768 * 768
+EVAL_DURATION_SECONDS = 10
+
+
+def natural_request(prompt, *, image, evaluation=False):
+    """Express the user's video request without exposing backend task labels."""
+    if evaluation:
+        instruction = "Animate this image into a 10-second video" if image else "Create a 10-second video"
+        return f"{instruction}, adapting the following scene to fit that duration:\n\n{prompt}"
+    instruction = "Animate this image" if image else "Make a video of the following scene"
+    return f"{instruction}:\n\n{prompt}"
 
 
 def normalize_sources(paths):
@@ -65,6 +75,9 @@ def normalize_sources(paths):
             task = "i2v" if image else "t2v"
             if row.get("task", task) != task:
                 raise ValueError(f"Task does not match the supplied image: {row['id']}")
+            request = row.get("request", natural_request(row["prompt"], image=bool(image)))
+            if not isinstance(request, str) or not request.strip():
+                raise ValueError(f"Expected a nonempty natural request: {row['id']}")
             target = row.get("target", {})
             if not isinstance(target, dict) or set(target) - {"duration_seconds", "aspect_ratio", "short_edge"}:
                 raise ValueError(f"Invalid output settings: {row['id']}")
@@ -81,6 +94,7 @@ def normalize_sources(paths):
                     "id": row["id"],
                     "task": task,
                     "prompt": row["prompt"],
+                    "request": request,
                     "source": source,
                     "image": image,
                     "target": target,
@@ -104,7 +118,9 @@ def check_splits(train, validation):
 
 
 def original_request(sample):
-    """Share explicit user output constraints between the policy and the judge."""
+    """Give the judge the visible request; retain old frozen-run semantics."""
+    if "request" in sample:
+        return sample["request"]
     text = sample["prompt"]
     if sample.get("target"):
         text += "\nRequested output settings: " + json.dumps(sample["target"], sort_keys=True)
@@ -113,6 +129,9 @@ def original_request(sample):
 
 def observation(sample):
     """Use native image placeholders; the executor binds the same asset separately."""
+    if "request" in sample:
+        return ("<image>\n" if sample["image"] else "") + sample["request"]
+    # Frozen v3 rows retain their old rendering when explicitly reproduced.
     task = "fl2va" if sample["task"] == "i2v" else "t2va"
     text = f"Generate a video with sol_h3 using task {task}. Preserve the user's request.\n"
     if sample["task"] == "i2v":
@@ -154,6 +173,22 @@ def prepare(args):
     if rubric.INSTRUCTIONS_VERSION != JUDGE_SETTINGS["instructions_version"]:
         raise ValueError("Expected the existing v4 Gemini rubric")
     validation = reference_inventory(validation, rows, load_external(repo / "bestofn/normalize.py").probe)
+    validation = [
+        {
+            **sample,
+            "request": natural_request(
+                row.get("request", sample["prompt"]), image=bool(sample["image"]), evaluation=True
+            ),
+            "target": {**sample["target"], "duration_seconds": EVAL_DURATION_SECONDS},
+            "control_metadata": {
+                "duration_seconds": {
+                    "source": "benchmark_request",
+                    "effective_num_frames": frame_count(EVAL_DURATION_SECONDS),
+                }
+            },
+        }
+        for sample, row in zip(validation, rows, strict=True)
+    ]
     reference_notes = [
         {"sample_id": sample["id"], "task": sample["task"], "reference": field, "selection": recipe}
         for sample in validation
@@ -176,7 +211,7 @@ def prepare(args):
     for key in ("duration", "seed", "width", "height"):
         service["h3"].pop(key)
     protocol = {
-        "schema_version": 3,
+        "schema_version": 4,
         "task": "h3_tournament",
         "tool_contract": "urn:verl:sol-h3:3",
         "h3_api_version": 2,
@@ -195,6 +230,7 @@ def prepare(args):
         "groups_per_worker": args.groups_per_worker,
         "h3_concurrency_per_worker": args.h3_concurrency_per_worker,
         "observation_max_pixels": OBSERVATION_MAX_PIXELS,
+        "eval_duration_seconds": EVAL_DURATION_SECONDS,
         **service,
     }
     contents = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in train)
@@ -210,6 +246,7 @@ def prepare(args):
         reference_fields=list(REFERENCE_COLUMNS),
         training_judge=protocol["judge"]["judge_model"],
         evaluation_judge=protocol["eval_judge"]["judge_model"],
+        evaluation_duration_seconds=EVAL_DURATION_SECONDS,
         videos_per_evaluation=len(validation),
         judgments_per_evaluation=len(validation) * len(REFERENCE_COLUMNS) * 2,
         reference_notes=reference_notes,
@@ -222,7 +259,7 @@ def add_parser(commands):
     parser = commands.add_parser("prepare-mixed", help="Prepare unified T2V/I2V RL and four-baseline evaluation")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
-    parser.add_argument("--combined-file", type=Path, default=ROOT / "data/prompt_rewrite_mixed_rl.jsonl")
+    parser.add_argument("--combined-file", type=Path, default=ROOT / "data/prompt_rewrite_mixed_rl_v2.jsonl")
     parser.add_argument("--train-files", nargs="+", type=Path, default=TRAIN_FILES)
     parser.add_argument("--eval-datasets", nargs="+", type=Path, default=EVAL_FILES)
     parser.add_argument("--eval-repo", type=Path, default=DEFAULT_EVAL_REPO)
