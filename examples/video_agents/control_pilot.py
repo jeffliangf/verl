@@ -29,6 +29,7 @@ from .control_constraints import FRAME_COUNTS, RATIOS, allowed_arguments, ratio_
 from .h3_request import ASPECT_RATIOS, frame_count, tool_request
 from .image_assets import image_bytes
 from .judge_worker import gemini_address_family
+from .request_wording import render_request, wording_config, wording_summary
 from .storage import (
     atomic_text,
     file_sha256,
@@ -259,7 +260,7 @@ def aspect_ratios(sample, rule):
     return [ratio for ratio in RATIOS if ratio_canvas(sample, ratio) == expected]
 
 
-def materialize(sample, annotation, annotation_dir, model):
+def materialize(sample, annotation, annotation_dir, model, *, wording_seed=42):
     """Keep scene text intact and derive allowed arguments from the visible augmentation."""
     duration, aspect = deepcopy(annotation["duration"]), deepcopy(annotation["aspect_ratio"])
     uncertain_duration = duration["confidence"] == "low"
@@ -270,40 +271,35 @@ def materialize(sample, annotation, annotation_dir, model):
         aspect = {"kind": "unspecified", "value": None}
     desired = annotation["recommended"]
     mode = sample["pilot_mode"]
-    additions, origins = [], {"duration_seconds": "original_request", "aspect_ratio": "original_request"}
+    added_duration, added_aspect = None, None
+    origins = {"duration_seconds": "original_request", "aspect_ratio": "original_request"}
     retimed = not duration_frames(duration)
     if not uncertain_duration and (
         retimed or (mode in {"duration", "both"} and duration["kind"] in {"unspecified", "qualitative"})
     ):
         duration = {"kind": "exact", "seconds": desired["duration_seconds"], "max_seconds": None}
-        additions.append(f"Keep it about {desired['duration_seconds']} seconds long.")
+        added_duration = desired["duration_seconds"]
         origins["duration_seconds"] = "explicit_retiming" if retimed else "synthetic_request"
     if not uncertain_aspect and mode in {"aspect", "both"} and aspect["kind"] == "unspecified":
         ratio = desired["aspect_ratio"]
         if sample["image"] and ratio == "auto":
             aspect = {"kind": "preserve_source", "value": "auto"}
-            additions.append("Keep the image's original aspect ratio.")
         elif ratio == "1:1":
             aspect = {"kind": "ratio", "value": ratio}
-            additions.append("Make it square.")
         elif int(fingerprint(sample["id"])[0], 16) % 2:
             orientation = "portrait" if ratio_canvas(sample, ratio)[0] < ratio_canvas(sample, ratio)[1] else "landscape"
             aspect = {"kind": "orientation", "value": orientation}
-            additions.append("Use a vertical frame." if orientation == "portrait" else "Use a landscape frame.")
         else:
             aspect = {"kind": "ratio", "value": ratio}
-            additions.append(f"Use a {ratio} frame.")
+        added_aspect = aspect
         origins["aspect_ratio"] = "synthetic_request"
-    request = sample["request"]
-    if retimed:
-        request = (
-            f"Adapt the following scene into a video lasting {desired['duration_seconds']} seconds, "
-            "adjusting its original timeline while preserving event order:\n\n" + request
-        )
-        additions = [text for text in additions if not text.startswith("Keep it about")]
-    if additions:
-        extra = " ".join(additions)
-        request = extra + "\n\n" + request if int(fingerprint(sample["id"])[1], 16) % 2 else request + "\n\n" + extra
+    request, wording = render_request(
+        sample,
+        duration_seconds=None if retimed else added_duration,
+        aspect=added_aspect,
+        retime_seconds=desired["duration_seconds"] if retimed else None,
+        seed=wording_seed,
+    )
     target = {}
     if duration["kind"] == "exact":
         target["duration_seconds"] = duration["seconds"]
@@ -324,6 +320,7 @@ def materialize(sample, annotation, annotation_dir, model):
         "sources": origins,
         "retimed": retimed,
         "review_required": retimed or any(annotation[k]["confidence"] == "low" for k in ("duration", "aspect_ratio")),
+        "wording": wording,
     }
     frames = duration_frames(duration)
     output["allowed_video_gen_args"] = allowed_arguments(
@@ -392,6 +389,7 @@ def save_outputs(directory, samples):
         "review_required": sum(s["control_metadata"]["review_required"] for s in samples),
         "examples": examples,
         "renderer_sha256": file_sha256(Path(__file__)),
+        "wording": wording_summary(samples),
     }
     write_json(directory / "summary.json", summary)
     return summary
@@ -407,6 +405,9 @@ def main(argv=None):
     parser.add_argument("--all", action="store_true", help="Retain every input row, including repeated prompts")
     parser.add_argument("--annotation-cache", type=Path, help="Reuse annotations under this directory")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--wording-seed", type=int, default=42, help="Reproducible phrase selection; does not change labels"
+    )
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--execute", action="store_true")
@@ -426,6 +427,7 @@ def main(argv=None):
         "policy_sha256": fingerprint(policy),
         "schema": ANNOTATION_SCHEMA,
         "seed": args.seed,
+        "request_wording": wording_config(args.wording_seed),
         "samples": selected,
     }
     if args.all or args.annotation_cache:
@@ -469,7 +471,9 @@ def main(argv=None):
                 try:
                     annotation, root = future.result()
                     for sample in siblings:
-                        completed[sample["id"]] = materialize(sample, annotation, root, args.model)
+                        completed[sample["id"]] = materialize(
+                            sample, annotation, root, args.model, wording_seed=args.wording_seed
+                        )
                         print(
                             json.dumps(
                                 {

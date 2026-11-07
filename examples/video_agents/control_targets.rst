@@ -88,6 +88,53 @@ responses before a full pass. The full pass does not change the frozen pilot.
 Use ``--render-only`` to rebuild from existing annotations without provider calls;
 missing annotations remain reported failures, retaining their original reasons.
 
+Varied training wording
+~~~~~~~~~~~~~~~~~~~~~~~
+
+``request_wording.py`` uses the reviewed ``configs/request_wording.json`` catalog:
+100 openings for T2V, 100 for I2V, and separate phrase banks for duration, exact
+aspect ratio, portrait, landscape, square, and source-image proportions. Controls
+can appear within the opening sentence or in natural instructions before or after
+the scene. Durations vary between digits and words. For example:
+
+.. code-block:: text
+
+   Could you turn this scene into a video, about eight seconds long and in portrait format?
+
+   A fox crosses a snowy clearing.
+
+Each row receives one reproducible wording selected by sample ID and
+``--wording-seed`` (default 42). Original scene text, images, annotation decisions,
+and training weights are preserved. A custom supplied request is retained
+verbatim. Exact ratios stay exact, orientations remain broad, and generic
+requests acquire no synthetic duration/aspect requirements in free mode.
+Unsupported timelines still receive an explicit retiming instruction.
+
+The wording seed and catalog/renderer checksums are frozen in the manifest;
+``control_metadata.wording`` records the choices for each row. The annotation
+cache remains bound to the original scene and image, so phrasing changes reuse
+existing Gemini analysis. The allowed-argument contract is rebound to the new
+visible request. Evaluation keeps its existing fixed requests.
+
+Use fresh output paths when changing wording, for example:
+
+.. code-block:: bash
+
+   python -m examples.video_agents.control_pilot --all --render-only \
+     --output-dir data/prompt_rewrite_controls_wording_v2 \
+     --annotation-cache data/prompt_rewrite_control_annotations \
+     --wording-seed 42
+
+   python -m examples.video_agents.rl prepare-mixed \
+     --train-files data/prompt_rewrite_controls_wording_v2/samples.jsonl \
+     --run-dir data/prompt_rewrite_mixed_rl_controls_v2/run \
+     --data-dir data/prompt_rewrite_mixed_rl_controls_v2 \
+     --combined-file data/prompt_rewrite_mixed_rl_controls_v2.jsonl \
+     --h3-endpoints http://127.0.0.1:28080
+
+The summary reports actual opening and layout coverage. Missing cached annotations
+remain failures for review; a wording rebuild does not retry provider refusals.
+
 Original scene text is preserved inside short natural prefixes/postfixes. Exact
 requirements are stored in ``target``; advisory values in ``preferred_target``;
 evidence, origins, confidence, and review flags in ``control_metadata``. The

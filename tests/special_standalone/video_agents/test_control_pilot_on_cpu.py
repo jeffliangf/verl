@@ -23,7 +23,7 @@ from PIL import Image
 from test_tournament_on_cpu import loop_factory, model_request, native_worker, prepared_rl, votes  # noqa: F401
 
 from examples.video_agents import control_pilot as pilot
-from examples.video_agents import h3_request, mixed_data, rl
+from examples.video_agents import h3_request, mixed_data, request_wording, rl
 from examples.video_agents.control_constraints import FRAME_COUNTS, RATIOS, validate_contract
 from examples.video_agents.image_assets import image_asset
 from examples.video_agents.storage import fingerprint, read_json, read_jsonl, write_json, write_jsonl
@@ -62,11 +62,11 @@ def annotation(*, task="t2v"):
     }
 
 
-def materialize(tmp_path, source, value):
+def materialize(tmp_path, source, value, *, wording_seed=42):
     pilot.validate_annotation(value, source)
     root = tmp_path / "annotation"
     write_json(root / "annotation.json", value)
-    return pilot.materialize(source, value, root, "gemini-4-argon")
+    return pilot.materialize(source, value, root, "gemini-4-argon", wording_seed=wording_seed)
 
 
 def call(row, *, duration=8, aspect="16:9", omit=()):
@@ -92,7 +92,8 @@ def test_generic_requests_do_not_inherit_gemini_recommendations(tmp_path, task):
     for duration, ratio in ((5, "1:1"), (14, "21:9"), (8, "9:16")):
         call(row, duration=duration, aspect=ratio)
     call(row, omit=("duration_seconds", "aspect_ratio"))
-    assert row["request"] == source["request"]
+    assert source["prompt"] in row["request"]
+    assert row["control_metadata"]["wording"]["layout"] == "none"
 
 
 def test_complete_timeline_uses_endpoint_and_preserves_original_requirement(tmp_path):
@@ -107,7 +108,7 @@ def test_complete_timeline_uses_endpoint_and_preserves_original_requirement(tmp_
     }
     row = materialize(tmp_path, source, value)
     assert row["allowed_video_gen_args"]["target"]["duration_seconds"]["allowed_num_frames"] == [243]
-    assert "Keep it about 8 seconds" not in row["request"]
+    assert "duration" not in row["control_metadata"]["wording"]["choices"]
     ratio = row["allowed_video_gen_args"]["target"]["aspect_ratio"]["allowed_values"][0]
     call(row, duration=10.125, aspect=ratio)
     with pytest.raises(ValueError, match="contradicts"):
@@ -145,7 +146,7 @@ def test_landscape_annotation_accepts_all_supported_wide_shapes(tmp_path):
 
 def test_i2v_requested_shape_preservation_binds_source_geometry(tmp_path):
     row = materialize(tmp_path, sample(tmp_path, task="i2v", mode="both"), annotation(task="i2v"))
-    assert "Keep the image's original aspect ratio" in row["request"]
+    assert row["control_metadata"]["wording"]["aspect_wording"] == "preserve_source"
     assert row["allowed_video_gen_args"]["target"]["aspect_ratio"]["allowed_values"] == ["auto"]
     call(row, aspect="auto")
     with pytest.raises(ValueError, match="contradicts"):
@@ -160,7 +161,7 @@ def test_short_is_advisory_until_a_numeric_request_is_added(tmp_path):
     assert not row["allowed_video_gen_args"]["target"]["duration_seconds"]["required"]
     source["pilot_mode"] = "duration"
     row = materialize(tmp_path, source, value)
-    assert "Keep it about 8 seconds long" in row["request"]
+    assert "8 seconds" in row["request"] or "eight seconds" in row["request"]
     assert row["allowed_video_gen_args"]["target"]["duration_seconds"]["allowed_num_frames"] == [192]
 
 
@@ -190,7 +191,8 @@ def test_unsupported_timeline_is_retimed_visibly_instead_of_silently_clamped(tmp
     row = materialize(tmp_path, source, value)
     assert row["control_metadata"]["retimed"]
     assert row["control_metadata"]["review_required"]
-    assert "Adapt the following scene into a video lasting 8 seconds" in row["request"]
+    assert "8 seconds" in row["request"] or "eight seconds" in row["request"]
+    assert "retiming" in row["control_metadata"]["wording"]["choices"]
     assert source["prompt"] in row["request"]
     assert row["allowed_video_gen_args"]["target"]["duration_seconds"]["allowed_num_frames"] == [192]
 
@@ -202,7 +204,58 @@ def test_low_confidence_is_flagged_without_hardening_uncertain_labels(tmp_path):
     row = materialize(tmp_path, source, value)
     assert row["control_metadata"]["review_required"]
     assert not row["allowed_video_gen_args"]["target"]["duration_seconds"]["required"]
-    assert "Keep it about" not in row["request"]
+    assert "duration" not in row["control_metadata"]["wording"]["choices"]
+
+
+@pytest.mark.parametrize("task", ["t2v", "i2v"])
+@pytest.mark.parametrize("mode", ["free", "duration", "aspect", "both"])
+def test_wording_changes_are_reproducible_without_changing_allowed_calls(tmp_path, task, mode):
+    source = sample(tmp_path, task=task, mode=mode)
+    value = annotation(task=task)
+    rows = [materialize(tmp_path, source, value, wording_seed=seed) for seed in (0, 1, 9, 42, 117, 999)]
+    assert len({row["request"] for row in rows}) > 1
+    assert rows[3] == materialize(tmp_path, source, value, wording_seed=42)
+    baseline = {k: v for k, v in rows[0]["allowed_video_gen_args"].items() if k != "request_sha256"}
+    for row in rows:
+        assert row["request"].count(source["prompt"]) == 1
+        assert "{settings}" not in row["request"]
+        assert {k: v for k, v in row["allowed_video_gen_args"].items() if k != "request_sha256"} == baseline
+        rules = row["allowed_video_gen_args"]["target"]
+        ratio = rules["aspect_ratio"]["allowed_values"][0]
+        call(row, aspect=ratio)
+        if rules["duration_seconds"]["required"]:
+            with pytest.raises(ValueError):
+                call(row, duration=5, aspect=ratio)
+            with pytest.raises(ValueError, match="explicitly supply"):
+                call(row, aspect=ratio, omit=("duration_seconds",))
+        else:
+            call(row, duration=5, aspect=ratio, omit=("duration_seconds",))
+        if rules["aspect_ratio"]["required"]:
+            with pytest.raises(ValueError, match="explicitly supply"):
+                call(row, aspect=ratio, omit=("aspect_ratio",))
+        else:
+            call(row, aspect="1:1")
+        # Wording changes must reuse the same original-scene annotation.
+        assert pilot.annotation_identity(row, "model", "policy") == pilot.annotation_identity(source, "model", "policy")
+
+
+def test_wording_catalog_has_100_distinct_openings_per_task():
+    for task in ("t2v", "i2v"):
+        templates = request_wording.LIBRARY[task]
+        assert len(templates) == len(set(templates)) == 100
+        for template in templates:
+            assert template.count("{settings}") == 1
+            rendered = template.format(settings="")
+            assert not any(word in rendered for word in ("sol_h3", "fl2va", "t2va", "input_image"))
+
+
+def test_custom_request_is_retained_when_varying_synthetic_controls(tmp_path):
+    source = sample(tmp_path, mode="both")
+    source["request"] = "Here's my video idea.\n\n" + source["prompt"]
+    row = materialize(tmp_path, source, annotation())
+    assert source["request"] in row["request"]
+    assert row["control_metadata"]["wording"]["custom_request_preserved"]
+    assert row["control_metadata"]["wording"]["layout"] in {"prefix", "suffix"}
 
 
 def test_evidence_and_constraint_identity_are_validated(tmp_path):
