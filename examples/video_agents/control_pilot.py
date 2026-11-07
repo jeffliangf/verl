@@ -494,9 +494,27 @@ def main(argv=None):
                     )
         samples = [completed[s["id"]] for s in selected if s["id"] in completed]
         write_json(directory / "errors.json", errors)
+        source_by_id = {sample["id"]: sample for sample in selected}
+        write_jsonl(
+            directory / "provider-review.jsonl",
+            [
+                {
+                    **error,
+                    "annotation_status": "provider_refused" if "prohibited_content" in error["error"] else "failed",
+                    "original_sample": source_by_id[error["id"]],
+                }
+                for error in errors
+            ],
+        )
         summary = save_outputs(directory, samples)
+        accounted = set(completed) | {error["id"] for error in errors}
         summary.update(
-            model=args.model, selected=len(selected), complete=len(samples) == len(selected), errors=len(errors)
+            model=args.model,
+            selected=len(selected),
+            complete=len(samples) == len(selected),
+            errors=len(errors),
+            accounted_for=len(accounted),
+            processing_complete=len(accounted) == len(selected),
         )
         write_json(directory / "summary.json", summary)
         print(json.dumps(summary, indent=2))

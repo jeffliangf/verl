@@ -133,6 +133,10 @@ Each output directory contains:
 * ``t2v.allowed-args.json`` and ``i2v.allowed-args.json``: their backend constraints.
 * ``summary.json``, ``errors.json``, and ``manifest.json``: counts, failures, and
   frozen selection/provenance. ``complete`` must be true before using the full set.
+* ``provider-review.jsonl``: failed rows with their original sample and failure
+  reason, preserving coverage without inventing annotations. ``accounted_for``
+  and ``processing_complete`` include these rows; ``complete`` counts only
+  successfully annotated rows. A processed batch can therefore still need review.
 
 The example controls are checked with the actual request builder; they are not
 model-generated rewrites. ``prepare-mixed --train-files .../samples.jsonl`` carries

@@ -26,7 +26,7 @@ from examples.video_agents import control_pilot as pilot
 from examples.video_agents import h3_request, mixed_data, rl
 from examples.video_agents.control_constraints import FRAME_COUNTS, RATIOS, validate_contract
 from examples.video_agents.image_assets import image_asset
-from examples.video_agents.storage import read_json, read_jsonl, write_json
+from examples.video_agents.storage import fingerprint, read_json, read_jsonl, write_json, write_jsonl
 
 SCHEMA = read_json(rl.CONFIG_DIR / "sol_h3_unified_tool.json")
 
@@ -268,6 +268,27 @@ def test_annotation_cache_reuses_real_response_without_another_call(tmp_path):
 def test_cache_only_never_calls_provider_for_missing_annotations(tmp_path):
     with pytest.raises(ValueError, match="No validated cached annotation"):
         pilot.annotate(sample(tmp_path), tmp_path, "gemini-4-argon", "Policy", None, None, cache_only=True)
+
+
+def test_cache_only_cli_accounts_for_every_row_and_preserves_refusal(tmp_path, monkeypatch):
+    rows = [sample(tmp_path, task=task) for task in ("t2v", "i2v")]
+    source, output = tmp_path / "input.jsonl", tmp_path / "output"
+    write_jsonl(source, rows)
+    identity = pilot.annotation_identity(rows[0], "gemini-4-argon", pilot.POLICY_PATH.read_text())
+    write_json(output / "annotations" / fingerprint(identity) / "annotation.json", annotation())
+    refusal = {"id": rows[1]["id"], "error": "HTTP 400: prohibited_content"}
+    write_json(output / "errors.json", [refusal])
+    monkeypatch.setattr(pilot, "load_external", lambda path: pytest.fail("Offline rendering needs no provider"))
+    assert pilot.main(["--input", str(source), "--output-dir", str(output), "--per-task", "1", "--render-only"]) == 1
+    summary = read_json(output / "summary.json")
+    assert summary["selected"] == summary["accounted_for"] == 2
+    assert summary["processing_complete"] and not summary["complete"]
+    assert summary["samples"] == summary["errors"] == 1
+    review = read_jsonl(output / "provider-review.jsonl")
+    assert review[0]["annotation_status"] == "provider_refused"
+    assert review[0]["error"] == refusal["error"]
+    assert review[0]["original_sample"]["prompt"] == rows[1]["prompt"]
+    assert review[0]["original_sample"]["image"] == rows[1]["image"]
 
 
 def test_full_selection_retains_duplicate_weight_and_pilot_modes(tmp_path):
