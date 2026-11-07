@@ -160,7 +160,7 @@ def annotation_identity(sample, model, policy):
     }
 
 
-def annotate(sample, directory, model, policy, runner, key):
+def annotate(sample, directory, model, policy, runner, key, *, cache_only=False):
     """Resume validated annotations and retain each real provider response."""
     identity = annotation_identity(sample, model, policy)
     root = directory / "annotations" / fingerprint(identity)
@@ -168,6 +168,8 @@ def annotate(sample, directory, model, policy, runner, key):
         freeze_json(root / "identity.json", identity)
         if (root / "annotation.json").exists():
             return validate_annotation(read_json(root / "annotation.json"), sample), root
+        if cache_only:
+            raise ValueError("No validated cached annotation is available")
         client = runner.GeminiRestClient(key, max_attempts=3, request_timeout=180, file_timeout=60)
         inputs = [{"type": "text", "text": "Original scene text:\n" + sample["prompt"]}]
         if sample["image"]:
@@ -323,11 +325,14 @@ def materialize(sample, annotation, annotation_dir, model):
         "retimed": retimed,
         "review_required": retimed or any(annotation[k]["confidence"] == "low" for k in ("duration", "aspect_ratio")),
     }
+    frames = duration_frames(duration)
     output["allowed_video_gen_args"] = allowed_arguments(
         output,
-        frames=duration_frames(duration),
+        frames=frames,
         ratios=aspect_ratios(output, aspect),
-        require_duration=duration["kind"] not in {"unspecified", "qualitative"},
+        # A two-second sub-action imposes no extra choice on a worker whose
+        # shortest output is already over five seconds. Defaults satisfy it too.
+        require_duration=frames != list(FRAME_COUNTS),
         require_aspect=aspect["kind"] != "unspecified",
     )
     return output
@@ -405,6 +410,7 @@ def main(argv=None):
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--render-only", action="store_true", help="Rebuild outputs from cache without provider calls")
     args = parser.parse_args(argv)
     if args.per_task < 1 or args.concurrency < 1 or (args.limit is not None and args.limit < 1):
         raise ValueError("Sample and concurrency limits must be positive")
@@ -424,17 +430,26 @@ def main(argv=None):
     }
     if args.all or args.annotation_cache:
         config.update(all_rows=args.all, annotation_cache=str(cache))
-    if not args.execute:
+    if not args.execute and not args.render_only:
         print(
             json.dumps({"samples": len(selected), "model": args.model, "output_dir": str(directory), "execute": False})
         )
         return 0
-    runner = load_external(args.eval_repo / "scripts/run_gemini_pairwise_eval.py")
-    key = os.environ.get("GEMINI_API_KEY") or runner.read_env_file(args.eval_repo / "arena/.env").get("GEMINI_API_KEY")
-    if not key:
-        raise RuntimeError("Configured Gemini credential is unavailable")
+    runner, key = None, None
+    if not args.render_only:
+        runner = load_external(args.eval_repo / "scripts/run_gemini_pairwise_eval.py")
+        key = os.environ.get("GEMINI_API_KEY") or runner.read_env_file(args.eval_repo / "arena/.env").get(
+            "GEMINI_API_KEY"
+        )
+        if not key:
+            raise RuntimeError("Configured Gemini credential is unavailable")
     with run_lock(directory), gemini_address_family("ipv4"):
         freeze_json(directory / "manifest.json", config)
+        previous_errors = (
+            {row["id"]: row["error"] for row in read_json(directory / "errors.json")}
+            if (directory / "errors.json").exists()
+            else {}
+        )
         tasks = [[s for s in selected if s["task"] == task] for task in ("t2v", "i2v")]
         interleaved = [s for pair in zip_longest(*tasks) for s in pair if s is not None]
         pending = interleaved if args.limit is None else interleaved[: args.limit]
@@ -444,7 +459,9 @@ def main(argv=None):
             unique.setdefault(fingerprint(annotation_identity(sample, args.model, policy)), []).append(sample)
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             jobs = {
-                pool.submit(annotate, siblings[0], cache, args.model, policy, runner, key): siblings
+                pool.submit(
+                    annotate, siblings[0], cache, args.model, policy, runner, key, cache_only=args.render_only
+                ): siblings
                 for siblings in unique.values()
             }
             for future in as_completed(jobs):
@@ -465,7 +482,11 @@ def main(argv=None):
                             flush=True,
                         )
                 except Exception as error:
-                    errors.extend({"id": s["id"], "error": runner.safe_error_text(error, key)} for s in siblings)
+                    message = str(error) if args.render_only else runner.safe_error_text(error, key)
+                    errors.extend(
+                        {"id": s["id"], "error": previous_errors.get(s["id"], message) if args.render_only else message}
+                        for s in siblings
+                    )
                     write_json(directory / "errors.json", errors)
                     print(
                         json.dumps({"failed": [s["id"] for s in siblings], "error": errors[-1]["error"][:400]}),

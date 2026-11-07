@@ -164,6 +164,25 @@ def test_short_is_advisory_until_a_numeric_request_is_added(tmp_path):
     assert row["allowed_video_gen_args"]["target"]["duration_seconds"]["allowed_num_frames"] == [192]
 
 
+@pytest.mark.parametrize("seconds", [2, 4, 10])
+def test_partial_timing_only_restricts_worker_choices_when_necessary(tmp_path, seconds):
+    source = sample(tmp_path, prompt=f"Hide the fox for {seconds} seconds, then reveal it.")
+    value = annotation()
+    value["duration"].update(kind="minimum", seconds=seconds, evidence=[f"{seconds} seconds"])
+    row = materialize(tmp_path, source, value)
+    required = seconds == 10
+    assert row["allowed_video_gen_args"]["target"]["duration_seconds"]["required"] is required
+    if required:
+        with pytest.raises(ValueError, match="explicitly supply"):
+            call(row, omit=("duration_seconds",))
+        with pytest.raises(ValueError, match="duration violates"):
+            call(row, duration=5)
+    else:
+        call(row, omit=("duration_seconds",))
+        call(row, duration=5)
+    call(row, duration=14)
+
+
 def test_unsupported_timeline_is_retimed_visibly_instead_of_silently_clamped(tmp_path):
     source = sample(tmp_path, prompt="[0-30s] A fox walks away.")
     value = annotation()
@@ -244,6 +263,11 @@ def test_annotation_cache_reuses_real_response_without_another_call(tmp_path):
     assert first == second == value and len(calls) == 1
     assert calls[0]["input"][-1]["type"] == "image" and calls[0]["input"][-1]["data"]
     assert read_json(root / "response-1.json")["model"] == "gemini-4-argon"
+
+
+def test_cache_only_never_calls_provider_for_missing_annotations(tmp_path):
+    with pytest.raises(ValueError, match="No validated cached annotation"):
+        pilot.annotate(sample(tmp_path), tmp_path, "gemini-4-argon", "Policy", None, None, cache_only=True)
 
 
 def test_full_selection_retains_duplicate_weight_and_pilot_modes(tmp_path):

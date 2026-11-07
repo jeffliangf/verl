@@ -85,6 +85,8 @@ and cached annotations. ``--all`` retains repeated prompt rows and their trainin
 weight, while requesting only one annotation per unique prompt/image identity.
 Copy the pilot's ``annotations`` directory into the shared cache to reuse its
 responses before a full pass. The full pass does not change the frozen pilot.
+Use ``--render-only`` to rebuild from existing annotations without provider calls;
+missing annotations remain reported failures, retaining their original reasons.
 
 Original scene text is preserved inside short natural prefixes/postfixes. Exact
 requirements are stored in ``target``; advisory values in ``preferred_target``;
@@ -161,6 +163,9 @@ Interpret only what the user actually requests
   Do not secretly require 9:16.
 * "Make it square" supports a 1:1 requirement.
 * "A short clip" does not establish a unique numeric duration.
+* "Hide the subject for two seconds" establishes a lower bound for a sub-action.
+  When every supported worker duration satisfies that bound, omitting an overall
+  duration argument is valid too; there is no duration matching penalty.
 * A complete output timeline "[0-2s] ... [3-10s] ..." specifies a nominal
   10-second video. Use the final endpoint, not the sum of interval lengths:
   the gap from 2 to 3 seconds does not make it a 9-second clip.
