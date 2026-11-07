@@ -239,6 +239,10 @@ def tool_request(parameters, schema, *, sample=None):
                 fields.extend(("width", "height"))
             if any(actual[key] != expected_output[key] for key in fields):
                 raise ValueError("Tool target contradicts the request's required output settings")
+        if "allowed_video_gen_args" in sample:
+            from .control_constraints import validate_call
+
+            validate_call(sample, parameters, result)
         return result
     if "aspect_ratio" in spec["properties"]:
         return video_request(**request)

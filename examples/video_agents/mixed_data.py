@@ -12,6 +12,7 @@
 
 import json
 from collections import Counter
+from copy import deepcopy
 from math import isfinite
 from pathlib import Path
 
@@ -35,16 +36,23 @@ REFERENCE_COLUMNS = (
     "best_of_4_h3_50step",
     "best_of_16_h3_50step",
 )
-DATA_DIR = ROOT / "data/prompt_rewrite_mixed_rl_v2"
+DATA_DIR = ROOT / "data/prompt_rewrite_mixed_rl_v3"
 OBSERVATION_MAX_PIXELS = 768 * 768
 EVAL_DURATION_SECONDS = 10
+EVAL_T2V_ASPECT_RATIO = "16:9"
+EVAL_T2V_CANVAS = dict(zip(("width", "height"), canvas_size(16, 9), strict=True))
 
 
 def natural_request(prompt, *, image, evaluation=False):
     """Express the user's video request without exposing backend task labels."""
     if evaluation:
-        instruction = "Animate this image into a 10-second video" if image else "Create a 10-second video"
-        return f"{instruction}, adapting the following scene to fit that duration:\n\n{prompt}"
+        if image:
+            instruction = f"Animate this image into a {EVAL_DURATION_SECONDS}-second video"
+            return f"{instruction}, adapting the following scene to fit that duration:\n\n{prompt}"
+        return (
+            f"Create a {EVAL_DURATION_SECONDS}-second video in {EVAL_T2V_ASPECT_RATIO} landscape format, "
+            f"adapting the following scene to fit that duration and format:\n\n{prompt}"
+        )
     instruction = "Animate this image" if image else "Make a video of the following scene"
     return f"{instruction}:\n\n{prompt}"
 
@@ -101,6 +109,13 @@ def normalize_sources(paths):
                     "provenance": {"file": str(path), "line": line, "original_id": row["id"]},
                 }
             )
+            for field in ("preferred_target", "control_metadata", "allowed_video_gen_args"):
+                if field in row:
+                    samples[-1][field] = deepcopy(row[field])
+            if "allowed_video_gen_args" in samples[-1]:
+                from .control_constraints import validate_contract
+
+                validate_contract(samples[-1], samples[-1]["allowed_video_gen_args"])
             rows.append(row)
     return samples, rows
 
@@ -179,12 +194,21 @@ def prepare(args):
             "request": natural_request(
                 row.get("request", sample["prompt"]), image=bool(sample["image"]), evaluation=True
             ),
-            "target": {**sample["target"], "duration_seconds": EVAL_DURATION_SECONDS},
+            "target": {
+                **sample["target"],
+                "duration_seconds": EVAL_DURATION_SECONDS,
+                **({"aspect_ratio": EVAL_T2V_ASPECT_RATIO} if sample["task"] == "t2v" else {}),
+            },
             "control_metadata": {
                 "duration_seconds": {
                     "source": "benchmark_request",
                     "effective_num_frames": frame_count(EVAL_DURATION_SECONDS),
-                }
+                },
+                **(
+                    {"aspect_ratio": {"source": "benchmark_request", "effective_canvas": EVAL_T2V_CANVAS}}
+                    if sample["task"] == "t2v"
+                    else {}
+                ),
             },
         }
         for sample, row in zip(validation, rows, strict=True)
@@ -231,6 +255,7 @@ def prepare(args):
         "h3_concurrency_per_worker": args.h3_concurrency_per_worker,
         "observation_max_pixels": OBSERVATION_MAX_PIXELS,
         "eval_duration_seconds": EVAL_DURATION_SECONDS,
+        "eval_t2v_aspect_ratio": EVAL_T2V_ASPECT_RATIO,
         **service,
     }
     contents = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in train)
@@ -247,6 +272,8 @@ def prepare(args):
         training_judge=protocol["judge"]["judge_model"],
         evaluation_judge=protocol["eval_judge"]["judge_model"],
         evaluation_duration_seconds=EVAL_DURATION_SECONDS,
+        evaluation_t2v_aspect_ratio=EVAL_T2V_ASPECT_RATIO,
+        evaluation_t2v_canvas=EVAL_T2V_CANVAS,
         videos_per_evaluation=len(validation),
         judgments_per_evaluation=len(validation) * len(REFERENCE_COLUMNS) * 2,
         reference_notes=reference_notes,
@@ -259,7 +286,7 @@ def add_parser(commands):
     parser = commands.add_parser("prepare-mixed", help="Prepare unified T2V/I2V RL and four-baseline evaluation")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
-    parser.add_argument("--combined-file", type=Path, default=ROOT / "data/prompt_rewrite_mixed_rl_v2.jsonl")
+    parser.add_argument("--combined-file", type=Path, default=ROOT / "data/prompt_rewrite_mixed_rl_v3.jsonl")
     parser.add_argument("--train-files", nargs="+", type=Path, default=TRAIN_FILES)
     parser.add_argument("--eval-datasets", nargs="+", type=Path, default=EVAL_FILES)
     parser.add_argument("--eval-repo", type=Path, default=DEFAULT_EVAL_REPO)

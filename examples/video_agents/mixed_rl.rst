@@ -14,7 +14,7 @@ Run in the existing Python environment with the video-agent dependencies:
 .. code-block:: bash
 
    python -m examples.video_agents.rl prepare-mixed \
-     --run-dir data/prompt_rewrite_mixed_rl_v2/run \
+     --run-dir data/prompt_rewrite_mixed_rl_v3/run \
      --h3-endpoints http://127.0.0.1:28080
 
 The default inputs are:
@@ -24,9 +24,9 @@ The default inputs are:
 * ``data/prompt_rewrite_sft.jsonl``: 3,000 T2V samples. Only the original prompts
   enter RL; teacher rewrites are excluded.
 
-Preparation writes ``data/prompt_rewrite_mixed_rl_v2.jsonl`` with all 8,291 normalized
+Preparation writes ``data/prompt_rewrite_mixed_rl_v3.jsonl`` with all 8,291 normalized
 samples, plus native ``train.jsonl`` and ``val.jsonl`` inside
-``data/prompt_rewrite_mixed_rl_v2``. Each normalized sample has ``id``, ``task``
+``data/prompt_rewrite_mixed_rl_v3``. Each normalized sample has ``id``, ``task``
 (``t2v``/``i2v``), original ``prompt``, natural ``request``, ``source``, ``image``
 (null or a path/checksum/media record), ``target`` (required controls), and
 source-file provenance. Only the natural request and attached image enter the
@@ -103,11 +103,12 @@ is accepted. The executor does not insert hidden ground-truth controls.
 A null or omitted
 seed resolves to 42; integer seeds range from 0 through 2^63-1.
 
-See ``control_targets.rst`` for the proposed follow-up on extracting explicit
-controls, annotating suggestions, mixing fixed and free choices, and measuring
-instruction compliance. Training annotations and a synthetic control curriculum
-remain proposals. The natural requests and fixed 10-second evaluation are
-implemented in the v2 preparation.
+See ``control_targets.rst`` for the implemented Gemini annotation pass, completed
+100-row pilot, full-corpus command, and request-bound ``allowed_video_gen_args``.
+The native executor validates these hidden constraints without adding labels to
+policy inputs. Generic requests allow every supported duration and aspect choice.
+The v3 preparation uses explicit 10-second evaluation requests and additionally
+requires the 1344x768 canvas for T2V.
 
 The deployed worker supports 124 + 17*k frames for k=0..13 at 24 fps, approximately
 5.167 through 14.375 seconds. It rounds a requested duration to a supported frame
@@ -142,8 +143,9 @@ Evaluation uses ``gemini-4-argon`` for both:
 All 400 requests explicitly ask for a nominal 10-second video, including
 MovieGen. The wording asks to adapt any storyboard timing to this duration.
 The backend requires the emitted duration to resolve to 243 frames at 24 fps
-(10.125 seconds); it adds no benchmark aspect-ratio constraint. The quality judge
-receives the same natural request as the policy.
+(10.125 seconds). T2V requests also explicitly require 16:9 landscape format,
+which this worker resolves to 1344x768; I2V has no additional benchmark aspect
+constraint. The quality judge receives the same natural request as the policy.
 
 Each candidate is compared against these exact columns:
 
@@ -176,16 +178,16 @@ Launch preview and checks
 .. code-block:: bash
 
    python -m examples.video_agents.rl train \
-     --run-dir data/prompt_rewrite_mixed_rl_v2/run \
-     --data-dir data/prompt_rewrite_mixed_rl_v2
+     --run-dir data/prompt_rewrite_mixed_rl_v3/run \
+     --data-dir data/prompt_rewrite_mixed_rl_v3
 
    python -m examples.video_agents.rl status \
-     --run-dir data/prompt_rewrite_mixed_rl_v2/run
+     --run-dir data/prompt_rewrite_mixed_rl_v3/run
 
    python -m examples.video_agents.rl evaluate \
-     --run-dir data/prompt_rewrite_mixed_rl_v2/run \
-     --data-dir data/prompt_rewrite_mixed_rl_v2 \
-     --output-dir data/prompt_rewrite_mixed_rl_v2/evaluation-checkpoint \
+     --run-dir data/prompt_rewrite_mixed_rl_v3/run \
+     --data-dir data/prompt_rewrite_mixed_rl_v3 \
+     --output-dir data/prompt_rewrite_mixed_rl_v3/evaluation-checkpoint \
      --model /path/to/exported-vision-policy
 
 Train/evaluate commands preview configuration and cost until ``--execute`` is

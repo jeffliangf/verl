@@ -137,11 +137,11 @@ def test_unified_defaults_constraints_and_changed_asset(tmp_path):
 
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 @pytest.mark.parametrize("duration", [None, 8, 10, 10.125])
-def test_requested_eval_duration_checks_emitted_arguments(tmp_path, task, duration):
+def test_requested_duration_checks_emitted_arguments(tmp_path, task, duration):
     sample = make_sample(tmp_path)
     if task == "t2v":
         sample.update(task=task, image=None)
-    sample["request"] = mixed_data.natural_request(sample["prompt"], image=bool(sample["image"]), evaluation=True)
+    sample["request"] = "Make a 10-second video of a person waving."
     sample["target"] = {"duration_seconds": 10}
     parameters = {
         "task": "fl2va" if sample["image"] else "t2va",
@@ -155,7 +155,28 @@ def test_requested_eval_duration_checks_emitted_arguments(tmp_path, task, durati
     else:
         request = h3_request.tool_request(parameters, SCHEMA, sample=sample)
         assert h3_request.request_output(request)["num_frames"] == 243
-        assert request["target"]["aspect_ratio"] == "9:16"  # No hidden evaluation aspect constraint.
+        assert request["target"]["aspect_ratio"] == "9:16"  # A duration-only request leaves aspect free.
+
+
+@pytest.mark.parametrize("ratio", [None, "9:16", "1:1", "16:9", "auto"])
+def test_t2v_eval_requires_landscape_canvas(ratio):
+    sample = {
+        "task": "t2v",
+        "image": None,
+        "request": mixed_data.natural_request("A forest.", image=False, evaluation=True),
+        "target": {"duration_seconds": 10, "aspect_ratio": "16:9"},
+    }
+    parameters = {
+        "task": "t2va",
+        "prompt": "A forest.",
+        "target": {"duration_seconds": 10, **({"aspect_ratio": ratio} if ratio is not None else {})},
+    }
+    if ratio in (None, "9:16", "1:1"):
+        with pytest.raises(ValueError, match="explicitly supply" if ratio is None else "contradicts"):
+            h3_request.tool_request(parameters, SCHEMA, sample=sample)
+    else:
+        output = h3_request.request_output(h3_request.tool_request(parameters, SCHEMA, sample=sample))
+        assert (output["width"], output["height"], output["num_frames"]) == (1344, 768, 243)
 
 
 def test_generic_request_has_no_duration_or_aspect_matching_penalty(tmp_path):
@@ -592,9 +613,19 @@ def test_mixed_prepare_freezes_native_files_and_separate_judges(prepared_rl, tmp
     assert protocol["judge"] == JUDGE_SETTINGS
     assert judging_protocol(protocol, validate=True)["judge"]["judge_model"] == "gemini-4-argon"
     assert protocol["eval_duration_seconds"] == summary["evaluation_duration_seconds"] == 10
+    assert protocol["eval_t2v_aspect_ratio"] == summary["evaluation_t2v_aspect_ratio"] == "16:9"
+    assert summary["evaluation_t2v_canvas"] == {"width": 1344, "height": 768}
     assert all(s["target"] == {} for s in protocol["samples"]["train"])
     for sample in protocol["samples"]["val"]:
-        assert sample["target"] == {"duration_seconds": 10}
+        expected = {"duration_seconds": 10}
+        if sample["task"] == "t2v":
+            expected["aspect_ratio"] = "16:9"
+            assert "16:9 landscape format" in sample["request"]
+            assert "duration and format" in sample["request"]
+            assert sample["control_metadata"]["aspect_ratio"]["effective_canvas"] == {"width": 1344, "height": 768}
+        else:
+            assert "landscape" not in sample["request"] and "aspect_ratio" not in sample["control_metadata"]
+        assert sample["target"] == expected
         assert "10-second video" in sample["request"]
         assert "adapting" in sample["request"]
         assert sample["prompt"] in sample["request"]
