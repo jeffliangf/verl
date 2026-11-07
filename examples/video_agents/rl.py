@@ -213,6 +213,8 @@ def training_config(args):
     output = local_path(args.output_dir) if evaluation else directory
     if evaluation and output == directory:
         raise ValueError("Evaluation needs its own --output-dir, separate from the training run")
+    protocol = load_protocol(directory / "protocol.json")
+    has_images = any(sample.get("image") for samples in protocol["samples"].values() for sample in samples)
     overrides = [
         f"hydra.searchpath=[file://{ROOT / 'verl/trainer/config'}]",
         f"video_rl.protocol={json.dumps(str(directory / 'protocol.json'))}",
@@ -224,6 +226,7 @@ def training_config(args):
         f"trainer.default_local_dir={json.dumps(str(output / 'checkpoints'))}",
         f"trainer.rollout_data_dir={json.dumps(str(output / 'rollouts'))}",
         f"trainer.validation_data_dir={json.dumps(str(output / 'validation'))}",
+        *(["actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image=1"] if has_images else []),
         *(
             [
                 f"actor_rollout_ref.model.path={json.dumps(args.model)}",
@@ -246,7 +249,8 @@ def training_config(args):
         or config.actor_rollout_ref.model.path != args.model
     ):
         raise ValueError("Evaluation loads --model and requires val_only, val_before_train, and resume_mode=disable")
-    protocol = load_protocol(directory / "protocol.json")
+    if has_images and config.actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image < 1:
+        raise ValueError("I2V samples require vLLM limit_mm_per_prompt.image >= 1")
     runtime_protocol(protocol, config.video_rl)
     group_size = protocol["group_size"]
     if (

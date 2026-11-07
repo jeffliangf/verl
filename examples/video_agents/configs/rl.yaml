@@ -154,7 +154,8 @@ actor_rollout_ref:
 
     enforce_eager: true
 
-    # The policy emits text/tool calls; Gemini consumes the generated videos.
+    # The launcher enables one source image when prepared samples include I2V.
+    # Generated videos are consumed by Gemini, not by the policy.
     engine_kwargs:
       vllm:
         limit_mm_per_prompt:

@@ -638,6 +638,15 @@ def test_mixed_prepare_freezes_native_files_and_separate_judges(prepared_rl, tmp
     assert len(read_jsonl(args.combined_file)) == 2
     assert "SECRET" not in (args.data_dir / "train.jsonl").read_text()
     assert mixed_data.prepare(args) == summary
+    common = ["--run-dir", str(args.run_dir), "--data-dir", str(args.data_dir)]
+    for mode in (["train"], ["evaluate", "--model", "/checkpoint", "--output-dir", str(tmp_path / "eval")]):
+        launch = rl.parse_args([*mode, *common])
+        config, overrides = rl.training_config(launch)
+        assert config.actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image == 1
+        assert "actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image=1" in overrides
+        launch.overrides = ["actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image=0"]
+        with pytest.raises(ValueError, match="I2V samples require"):
+            rl.training_config(launch)
 
 
 def test_legacy_evaluator_is_accepted_only_without_image_adapter():

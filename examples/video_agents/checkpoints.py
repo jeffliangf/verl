@@ -14,6 +14,7 @@ import logging
 import math
 import shutil
 import zipfile
+from collections import Counter
 from pathlib import Path
 
 from verl.trainer.ppo.checkpoint_callback import CheckpointCallback
@@ -26,13 +27,15 @@ SCORE_METRICS = (
     "val-aux/aa_eval/score/mean@1",
     "val-aux/movie_gen_video_bench/score/mean@1",
 )
+TASK_SCORE_METRICS = {task: f"val-core/{task}/score/mean@1" for task in ("t2v", "i2v")}
 OVERALL_SCORE = "val-core/overall/score/mean@1"
 COMPLETE_MARKER = "checkpoint_complete.json"
 
 
 def overall_score(metrics):
-    """Return the equal-weight mean of both datasets, never a partial mean."""
-    scores = [metrics.get(key) for key in SCORE_METRICS]
+    """Balance the two tasks for mixed runs, or the two legacy T2V datasets."""
+    keys = TASK_SCORE_METRICS.values() if any(key in metrics for key in TASK_SCORE_METRICS.values()) else SCORE_METRICS
+    scores = [metrics.get(key) for key in keys]
     if any(value is None or not math.isfinite(value) for value in scores):
         return None
     return sum(float(value) for value in scores) / len(scores)
@@ -140,13 +143,43 @@ class VideoCheckpointCallback(CheckpointCallback):
         write_json(directory / COMPLETE_MARKER, {"step": global_step})
         self._prune()
 
+    def _selection_metrics(self, global_step, metrics):
+        if not any(key.startswith(("val-aux/t2v/", "val-aux/i2v/")) for key in metrics):
+            return {key: metrics.get(key) for key in SCORE_METRICS}
+        # Native metrics are grouped by source, whose batch sizes can differ.
+        # Use the task means already computed from individual valid prompts.
+        path = Path(self.config.video_rl.output_dir) / "val" / f"step_{global_step}" / "eval-summary.json"
+        if not path.exists():
+            return {}
+        summary = read_json(path)
+        samples = read_json(Path(self.config.video_rl.protocol))["samples"]["val"]
+        expected = Counter(sample["task"] for sample in samples)
+        tasks = summary.get("by_task", {})
+        if (
+            set(expected) != set(TASK_SCORE_METRICS)
+            or set(tasks) != set(expected)
+            or summary.get("policy_step") != global_step
+            or summary.get("prompts") != len(samples)
+            or summary.get("degraded", True)
+            or any(
+                tasks[task].get("prompts") != count or tasks[task].get("degraded", True)
+                for task, count in expected.items()
+            )
+        ):
+            return {}
+        return {metric: tasks[task].get("score") for task, metric in TASK_SCORE_METRICS.items()}
+
     def on_validation(self, trainer, global_step, metrics, **kwargs):
-        score = overall_score(metrics)
+        selection = self._selection_metrics(global_step, metrics)
+        score = overall_score(selection)
         if score is None:
-            logger.warning("Skipping overall score at step %s: both finite dataset scores are required", global_step)
+            logger.warning(
+                "Skipping overall score at step %s: complete, finite evaluation scores are required", global_step
+            )
             return
         # The trainer logs this same dict to TensorBoard, including initial and
         # validation-only passes that do not have a training checkpoint.
+        metrics.update(selection)
         metrics[OVERALL_SCORE] = score
         if self.config.trainer.get("val_only", False):
             return
@@ -160,7 +193,7 @@ class VideoCheckpointCallback(CheckpointCallback):
             "step": global_step,
             "checkpoint": directory.name,
             "score": score,
-            "metrics": {key: float(metrics[key]) for key in SCORE_METRICS},
+            "metrics": {key: float(value) for key, value in selection.items()},
         }
         # Publish the new winner before releasing the previous best checkpoint.
         write_json(self.best_path, best)

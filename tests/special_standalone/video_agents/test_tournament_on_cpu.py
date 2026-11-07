@@ -1006,6 +1006,7 @@ def test_launcher_preview_uses_base_model_and_never_executes(prepared_rl, monkey
     config, _ = rl.training_config(args)
     assert config.data.train_files == str(prepared_args.data_dir / "train.jsonl")
     assert config.data.val_files == str(prepared_args.data_dir / "val.jsonl")
+    assert config.actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image == 0
     assert config.trainer.use_v1 and config.trainer.v1.trainer_mode == "sync"
     assert config.actor_rollout_ref.rollout.agent.agent_loop_manager_class.endswith("TournamentManager")
     args.overrides = ["actor_rollout_ref.rollout.n=8"]

@@ -11,6 +11,7 @@
 """Balanced evaluation scores and durable best-plus-latest checkpoint retention."""
 
 import zipfile
+from pathlib import Path
 
 import pytest
 from hydra import compose, initialize_config_dir
@@ -95,6 +96,84 @@ def test_native_metrics_write_overall_scalar_to_tensorboard(config, tmp_path, mo
     tracking.logger["tensorboard"].finish()
     events = EventAccumulator(str(log_dir)).Reload().Scalars(OVERALL_SCORE)
     assert [(event.step, event.value) for event in events] == [(0, pytest.approx(expected))]
+
+
+def mixed_evaluation(config, step):
+    from examples.video_agents.agent import evaluation_summary
+    from examples.video_agents.config import REFERENCE_FIELDS
+    from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+
+    sources = ["t2v/aa_eval", "t2v/aa_eval", "t2v/movie_gen_video_bench", "i2v/aa-i2v", "i2v/aa-i2v-batch2"]
+    scores = [0.1, 0.3, 0.9, 0.6, 0.8]
+    records = [
+        {
+            "sample_id": str(i),
+            "task": source.split("/")[0],
+            "dropped": False,
+            "rewards": [{"score": score, "valid_call": 1, **{f"vs_{r}": score for r in REFERENCE_FIELDS}}],
+        }
+        for i, (source, score) in enumerate(zip(sources, scores, strict=True))
+    ]
+    config.video_rl.output_dir = str(Path(config.trainer.default_local_dir).parent / "run")
+    config.video_rl.protocol = str(Path(config.video_rl.output_dir) / "protocol.json")
+    write_json(Path(config.video_rl.protocol), {"samples": {"val": records}})
+    path = Path(config.video_rl.output_dir) / "val" / f"step_{step}" / "eval-summary.json"
+    write_json(path, evaluation_summary(step, records, 0.9))
+    metrics = PPOTrainer._val_metrics_update(
+        None, sources, [str(i) for i in range(len(scores))], {"score": scores, "reward": scores}, []
+    )
+    return metrics, path
+
+
+def test_mixed_checkpoint_balances_tasks_and_survives_restart(config):
+    metrics, path = mixed_evaluation(config, 0)
+    callback = build_checkpoint_callback(config)
+    callback.on_validation(None, 0, metrics)
+    expected = ((0.1 + 0.3 + 0.9) / 3 + (0.6 + 0.8) / 2) / 2
+    assert metrics[OVERALL_SCORE] == pytest.approx(expected)
+    assert metrics[OVERALL_SCORE] == read_json(path)["task_macro_score"]
+    assert not callback.root.exists()
+    checkpoint(callback, 1)
+    metrics, _ = mixed_evaluation(config, 1)
+    callback.on_validation(None, 1, metrics)
+    best = read_json(callback.best_path)
+    assert best["step"] == 1 and best["score"] == pytest.approx(expected)
+    assert set(best["metrics"]) == set(checkpoints.TASK_SCORE_METRICS.values())
+    callback = build_checkpoint_callback(config)
+    checkpoint(callback, 2)
+    metrics, _ = mixed_evaluation(config, 2)
+    callback.on_validation(None, 2, metrics)
+    assert read_json(callback.best_path) == best  # A tied task macro keeps the prior winner.
+
+
+@pytest.mark.parametrize(
+    "problem", ["missing", "stale", "partial", "missing_task", "degraded", "task_degraded", "no_score"]
+)
+def test_incomplete_mixed_evaluation_cannot_select_a_checkpoint(config, problem):
+    metrics, path = mixed_evaluation(config, 1)
+    callback = build_checkpoint_callback(config)
+    checkpoint(callback, 1)
+    summary = read_json(path)
+    if problem == "missing":
+        path.unlink()
+    else:
+        if problem == "stale":
+            summary["policy_step"] = 0
+        elif problem == "partial":
+            summary["by_task"]["t2v"]["prompts"] -= 1
+        elif problem == "missing_task":
+            del summary["by_task"]["i2v"]
+        elif problem == "degraded":
+            summary["degraded"] = True
+        elif problem == "task_degraded":
+            summary["by_task"]["i2v"]["degraded"] = True
+        else:
+            summary["by_task"]["i2v"]["score"] = None
+        write_json(path, summary)
+    metrics.update(dict.fromkeys(SCORE_METRICS, 1.0))  # Never fall back to T2V-only scores.
+    callback.on_validation(None, 1, metrics)
+    assert OVERALL_SCORE not in metrics
+    assert not callback.best_path.exists()
 
 
 def test_keep_latest_two_and_best_then_replace_winner(config):
