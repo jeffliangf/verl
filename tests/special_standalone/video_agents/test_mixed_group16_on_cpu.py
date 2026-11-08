@@ -45,6 +45,22 @@ def test_rejects_a_different_previous_launch(setting):
         mixed_group16.mixed_overrides(previous + [setting])
 
 
+@pytest.mark.parametrize("limit", [32, 64, 128])
+def test_shared_h3_limit_keeps_rollout_groups_and_judge_capacity(limit):
+    settings = dict(item.split("=", 1) for item in mixed_group16.mixed_overrides(previous_overrides(), limit))
+    assert settings["video_rl.h3_max_inflight"] == str(limit)
+    assert settings["data.train_batch_size"] == "32"
+    assert settings["actor_rollout_ref.rollout.n"] == "16"
+    assert settings["video_rl.judge_concurrency"] == "500"
+    assert settings["video_rl.max_judge_fallback_fraction"] == "0.25"
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_shared_h3_limit_rejects_invalid_capacity(limit):
+    with pytest.raises(ValueError, match="positive integer"):
+        mixed_group16.mixed_overrides(previous_overrides(), limit)
+
+
 def test_run_local_files_preserve_frozen_bytes_and_original_previews(tmp_path):
     original_data = tmp_path / "approved"
     original_data.mkdir()

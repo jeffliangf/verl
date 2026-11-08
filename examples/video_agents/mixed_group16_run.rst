@@ -24,7 +24,9 @@ gateway connection, checking both judge models, requiring 32 compatible H3
 workers, and deriving evaluation size from the frozen protocol.
 
 Training keeps 32 prompts with 16 rollouts, eight agent workers, four prompt
-groups per worker, 16 H3 slots per worker, and 128 shared H3 slots. The judge
+groups per worker, and 16 H3 slots per worker. The shared H3 admission limit
+defaults to 32 for the newly validated fleet; ``--h3-max-inflight`` sets this
+limit across both policy nodes. The previous run used 128 shared slots. The judge
 concurrency is 500 and the maximum fallback fraction is 0.25. The model can
 observe one source image. The optimizer, offloading, tensor parallelism,
 checkpoint cadence, and 72-hour budget with a two-hour finish reserve follow
