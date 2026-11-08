@@ -61,6 +61,26 @@ def test_shared_h3_limit_rejects_invalid_capacity(limit):
         mixed_group16.mixed_overrides(previous_overrides(), limit)
 
 
+def test_evaluation_capacity_does_not_change_training_or_judge_settings():
+    settings = dict(
+        item.split("=", 1)
+        for item in mixed_group16.mixed_overrides(previous_overrides(), 64, eval_groups_per_worker=16)
+    )
+    assert settings["video_rl.eval_groups_per_worker"] == "16"
+    assert settings["video_rl.h3_max_inflight"] == "64"
+    assert settings["actor_rollout_ref.rollout.agent.num_workers"] == "8"
+    assert settings["data.train_batch_size"] == "32"
+    assert settings["actor_rollout_ref.rollout.n"] == "16"
+    assert settings["video_rl.judge_concurrency"] == "500"
+    assert settings["video_rl.max_judge_fallback_fraction"] == "0.25"
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_evaluation_capacity_rejects_invalid_limits(limit):
+    with pytest.raises(ValueError, match="positive integer"):
+        mixed_group16.mixed_overrides(previous_overrides(), 64, eval_groups_per_worker=limit)
+
+
 def test_run_local_files_preserve_frozen_bytes_and_original_previews(tmp_path):
     original_data = tmp_path / "approved"
     original_data.mkdir()

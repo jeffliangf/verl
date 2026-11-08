@@ -1403,6 +1403,7 @@ def native_worker(prepared_rl, monkeypatch):
     worker.protocol_path, worker.protocol = directory / "protocol.json", protocol
     worker.samples = {split: {s["id"]: s for s in protocol["samples"][split]} for split in ("train", "val")}
     worker.group_slots = asyncio.Semaphore(2)
+    worker.eval_group_slots = asyncio.Semaphore(2)
     worker.background_tasks = set()
     worker.processor, worker.reward_loop_worker_handles = None, None
     worker.distillation_enabled = False
@@ -1728,6 +1729,91 @@ def test_manager_bounds_failed_group_replacements(native_worker, monkeypatch, tm
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("validate,capacity", [(False, 4), (True, 16)])
+async def test_evaluation_slots_are_independent_and_release_on_failure(native_worker, monkeypatch, validate, capacity):
+    worker, _, _ = native_worker
+    worker.group_slots = asyncio.Semaphore(4)
+    worker.eval_group_slots = asyncio.Semaphore(16)
+    admitted, released = asyncio.Event(), asyncio.Event()
+    active = peak = entered = 0
+
+    async def group(*args):
+        nonlocal active, peak, entered
+        active += 1
+        entered += 1
+        peak = max(peak, active)
+        if entered == capacity:
+            admitted.set()
+        try:
+            await released.wait()
+            raise RuntimeError("judge failed")
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(worker, "_run_group", group)
+    tasks = [
+        asyncio.create_task(
+            worker._run_prompt(
+                {"uid": f"group-{i}", "global_steps": 1, "extra_info": {"id": f"sample-{i}"}},
+                {},
+                {"validate": validate},
+            )
+        )
+        for i in range(capacity + 1)
+    ]
+    try:
+        await asyncio.wait_for(admitted.wait(), timeout=5)
+        await asyncio.sleep(0)
+        assert entered == peak == capacity
+        untouched = worker.group_slots if validate else worker.eval_group_slots
+        assert untouched._value == (4 if validate else 16)
+    finally:
+        released.set()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    assert all(isinstance(outcome, RuntimeError) for outcome in outcomes)
+    assert entered == capacity + 1 and peak == capacity
+    assert worker.group_slots._value == 4 and worker.eval_group_slots._value == 16
+
+
+@pytest.mark.parametrize("count", [3, 400])
+def test_evaluation_distributes_ordered_tasks_without_losing_alignment(native_worker, monkeypatch, tmp_path, count):
+    import numpy as np
+
+    from examples.video_agents import agent
+    from verl.utils.tensordict_utils import assign_non_tensor_data, get_non_tensor_data, get_tensordict
+
+    worker, _, _ = native_worker
+    manager = object.__new__(agent.TournamentManager)
+    manager.config = worker.config
+    manager.config.video_rl.output_dir = str(tmp_path)
+    manager._drop_step, manager._dropped_groups = None, 0
+    observed = []
+    manager.agent_loop_workers = [
+        SimpleNamespace(generate_sequences=SimpleNamespace(remote=lambda chunk: observed.append(chunk)))
+        for _ in range(8)
+    ]
+    monkeypatch.setattr(agent.ray, "get", lambda refs: [[] for _ in refs])
+    monkeypatch.setattr(manager, "_record_evaluation", lambda *args: None)
+    ids = [f"sample-{i}" for i in range(count)]
+    tasks = ["t2v" if i < count // 2 else "i2v" for i in range(count)]
+    batch = get_tensordict({"uid": np.array(ids, dtype=object), "task": np.array(tasks, dtype=object)})
+    assign_non_tensor_data(batch, "global_steps", 0)
+    assign_non_tensor_data(batch, "validate", True)
+    manager.generate_sequences(batch)
+    assert len(observed) == min(8, count)
+    received = {}
+    for chunk in observed:
+        chunk_ids = chunk["uid"]
+        chunk_tasks = chunk["task"]
+        assert get_non_tensor_data(chunk, "validate", None) is True
+        assert not set(chunk_ids) & received.keys()
+        received.update(zip(chunk_ids, chunk_tasks, strict=True))
+        if count == 400:
+            assert list(chunk_tasks).count("t2v") == list(chunk_tasks).count("i2v") == 25
+    assert received == dict(zip(ids, tasks, strict=True))
+
+
 def test_launch_config_supplies_every_limit_and_keeps_the_frozen_identity(prepared_rl):
     directory, _, _ = prepared_rl
     frozen = tournament.load_protocol(directory / "protocol.json")
@@ -1773,6 +1859,18 @@ def test_runtime_settings_are_validated(prepared_rl, timeouts, attempts):
         complete.pop("llm")
     with pytest.raises(ValueError, match="video_rl"):
         tournament.runtime_protocol(prepared_rl[1], {"timeouts": complete, "judge_max_attempts": attempts})
+
+
+@pytest.mark.parametrize("capacity", [None, 8, 16, 0, -1, True, 1.5])
+def test_runtime_evaluation_capacity_is_validated(prepared_rl, capacity):
+    settings = OmegaConf.merge(VIDEO_RL, {"eval_groups_per_worker": capacity})
+    if capacity is None or type(capacity) is int and capacity > 0:
+        runtime = tournament.runtime_protocol(prepared_rl[1], settings)
+        assert runtime["eval_groups_per_worker"] == capacity
+        assert runtime["groups_per_worker"] == prepared_rl[1]["groups_per_worker"]
+    else:
+        with pytest.raises(ValueError, match="eval_groups_per_worker"):
+            tournament.runtime_protocol(prepared_rl[1], settings)
 
 
 def test_rl_config_timeouts_reach_the_judge_runner(prepared_rl, tmp_path, monkeypatch):

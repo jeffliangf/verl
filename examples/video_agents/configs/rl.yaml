@@ -46,6 +46,10 @@ video_rl:
   # Waiting for this slot does not consume the H3 in-flight deadline.
   h3_max_inflight: 32
 
+  # Evaluation has one rollout per prompt and can admit more groups than training.
+  # null reuses the frozen protocol's groups_per_worker setting.
+  eval_groups_per_worker: null
+
   # Initial request plus two retries, sharing one budget for transient HTTP and
   # network failures, including judgments. Each pass still has a hard deadline.
   judge_max_attempts: 3

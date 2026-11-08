@@ -230,6 +230,9 @@ class TournamentWorker(AgentLoopWorkerTQBase):
             split: {sample["id"]: sample for sample in self.protocol["samples"][split]} for split in ("train", "val")
         }
         self.group_slots = asyncio.Semaphore(self.protocol["groups_per_worker"])
+        self.eval_group_slots = asyncio.Semaphore(
+            self.protocol.get("eval_groups_per_worker") or self.protocol["groups_per_worker"]
+        )
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs):
         # Native _run_agent_loop still supplies templates, parsing, tokens and masks.
@@ -256,8 +259,9 @@ class TournamentWorker(AgentLoopWorkerTQBase):
         partition = "val" if trajectory["validate"] else "train"
         step = int(prompt["global_steps"])
         directory = self.output_dir / partition / f"step_{step}" / item_key(prompt["uid"])
+        slots = self.eval_group_slots if trajectory["validate"] else self.group_slots
         with timed_stage(directory / "timings.jsonl", "group_slot_wait"):
-            await self.group_slots.acquire()
+            await slots.acquire()
         try:
             # Run-level index: one start/end pair per group, pointing at its files.
             # An unmatched start marks a group that was in flight when the job stopped.
@@ -277,7 +281,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                     timing["scores"] = [reward["score"] for reward in record["rewards"]]
                 return record
         finally:
-            self.group_slots.release()
+            slots.release()
 
     async def _run_group(self, prompt, sampling_params, trajectory, trace, directory):
         uid, validate = prompt["uid"], trajectory["validate"]
@@ -428,7 +432,13 @@ class TournamentManager(AgentLoopManagerTQ):
             self._drop_step, self._dropped_groups = step, 0
         timings = Path(self.config.video_rl.output_dir) / "timings.jsonl"
         with timed_stage(timings, "dispatch", policy_step=step, validate=validate, prompts=len(prompts)) as timing:
-            chunks = prompts.chunk(len(self.agent_loop_workers))
+            if validate:
+                # Ordered task cohorts must reach every worker; otherwise faster
+                # T2V chunks finish while those workers cannot help the I2V chunks.
+                workers = min(len(prompts), len(self.agent_loop_workers))
+                chunks = [prompts[index::workers] for index in range(workers)]
+            else:
+                chunks = prompts.chunk(len(self.agent_loop_workers))
             results = ray.get(
                 [
                     worker.generate_sequences.remote(chunk)

@@ -33,6 +33,13 @@ checkpoint cadence, and 72-hour budget with a two-hour finish reserve follow
 the previous experiment. Selection of the best mixed checkpoint averages the
 T2V and I2V scores with equal weight.
 
+Evaluation concurrency can be increased independently with
+``--eval-groups-per-worker 16 --h3-max-inflight 64``. With eight agents this admits
+128 evaluation prompts through Qwen, H3, and Gemini, while at most 64 H3 requests
+are in flight across both nodes. Each evaluation prompt still produces one video;
+training retains four groups per agent and 16 rollouts per prompt. Evaluation
+distributes ordered task cohorts across all agents using strided assignment.
+
 Before submission, verify the composed configuration and full-dataset token
 limits, the deployed gateway's complete API-v2 contract, and all 32 workers.
 The reused batch script also checks Gemini access, 16-rank NCCL communication,

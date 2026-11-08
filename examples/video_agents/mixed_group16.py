@@ -49,10 +49,12 @@ def mixed_protocol(source, token_file, data_dir):
     return result
 
 
-def mixed_overrides(previous, h3_max_inflight=128):
+def mixed_overrides(previous, h3_max_inflight=128, *, eval_groups_per_worker=None):
     """Retain training settings and apply the deployed fleet's shared H3 limit."""
     if type(h3_max_inflight) is not int or h3_max_inflight < 1:
         raise ValueError("The shared H3 limit must be a positive integer")
+    if eval_groups_per_worker is not None and (type(eval_groups_per_worker) is not int or eval_groups_per_worker < 1):
+        raise ValueError("Evaluation groups per worker must be a positive integer or null")
     key = "video_rl.max_judge_fallback_fraction"
     image = "actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image"
     h3_limit = "video_rl.h3_max_inflight"
@@ -73,6 +75,8 @@ def mixed_overrides(previous, h3_max_inflight=128):
         raise ValueError("Previous launcher is not the approved two-node, 32 x 16 configuration")
     result = [value for value in previous if value.split("=", 1)[0] not in {key, image, h3_limit}]
     result += [f"{key}=0.25", f"{image}=1", f"{h3_limit}={h3_max_inflight}"]
+    if eval_groups_per_worker is not None:
+        result.append(f"video_rl.eval_groups_per_worker={eval_groups_per_worker}")
     return result
 
 
@@ -247,7 +251,11 @@ def prepare(args):
         if [r["extra_info"]["id"] for r in rows] != [s["id"] for s in source["samples"][split]]:
             raise ValueError("Frozen sample and dataset identities disagree")
     data_dir = output / "data"
-    overrides = mixed_overrides(read_json(previous / "common-overrides.json"), args.h3_max_inflight)
+    overrides = mixed_overrides(
+        read_json(previous / "common-overrides.json"),
+        args.h3_max_inflight,
+        eval_groups_per_worker=args.eval_groups_per_worker,
+    )
     checkout = ROOT.resolve()
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=checkout):
@@ -324,6 +332,7 @@ def prepare(args):
         evaluation_judge=protocol["eval_judge"]["judge_model"],
         max_judge_fallback_fraction=0.25,
         h3_max_inflight=args.h3_max_inflight,
+        eval_groups_per_worker=args.eval_groups_per_worker or protocol["groups_per_worker"],
         expected_h3_workers=32,
         sample_counts=counts,
         source_protocol=str(source_dir / "protocol.json"),
@@ -358,6 +367,7 @@ def prepare(args):
             "judgments_per_evaluation": 3200,
             "judge_concurrency": 500,
             "h3_max_inflight": args.h3_max_inflight,
+            "eval_groups_per_worker": manifest["eval_groups_per_worker"],
             "max_judge_fallback_fraction": 0.25,
             "run_dir": str(run),
             "common_overrides": str(output / "common-overrides.json"),
@@ -377,6 +387,11 @@ def main():
     parser.add_argument("--gateway-target", required=True)
     parser.add_argument(
         "--h3-max-inflight", type=int, default=32, help="Shared H3 admission slots across both policy nodes"
+    )
+    parser.add_argument(
+        "--eval-groups-per-worker",
+        type=int,
+        help="Concurrent evaluation prompts per agent; defaults to training capacity",
     )
     parser.add_argument("--identity-file", type=Path, default=Path("/home/jeff/.ssh/gmi"))
     parser.add_argument("--token-file", type=Path, default=Path("/home/jeff/.config/video-agents/h3.token"))

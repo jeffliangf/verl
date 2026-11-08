@@ -83,6 +83,9 @@ def runtime_protocol(protocol: dict, settings) -> dict:
     streaming = settings.get("judge_streaming", False)
     if not isinstance(streaming, bool):
         raise ValueError("video_rl.judge_streaming must be boolean")
+    eval_groups = settings.get("eval_groups_per_worker")
+    if eval_groups is not None and (type(eval_groups) is not int or eval_groups < 1):
+        raise ValueError("video_rl.eval_groups_per_worker must be a positive integer or null")
     fraction = settings.get("max_judge_fallback_fraction", 0.75)
     if (
         isinstance(fraction, bool)
@@ -100,6 +103,7 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         "judge_concurrency": concurrency,
         "judge_failure_policy": policy,
         "judge_streaming": streaming,
+        "eval_groups_per_worker": eval_groups,
         "max_judge_fallback_fraction": fraction,
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
     }
