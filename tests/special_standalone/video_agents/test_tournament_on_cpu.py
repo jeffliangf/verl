@@ -1422,7 +1422,7 @@ def native_worker(prepared_rl, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("group_size", [4, 6, 8])
+@pytest.mark.parametrize("group_size", [4, 6, 8, 16])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("failure", [None, "rollout", "judge", "h3_provider", "judge_provider", "mixed"])
 async def test_native_dispatch_waits_for_group_rewards_and_propagates_failures(

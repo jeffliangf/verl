@@ -14,6 +14,7 @@ import errno
 import hashlib
 import io
 import json
+import subprocess
 import threading
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +37,21 @@ MEDIA = {
     "audio": {"sample_rate": 32000, "channels": 2, "codec": "mp4a"},
 }
 VIDEO = b"the gateway's archived MP4"
+UNIFIED_API = {
+    "workers_ready": 32,
+    "api": {
+        "version": 2,
+        "workers": 32,
+        "tasks": ["t2va", "fl2va"],
+        "num_frames": {"min": 124, "max": 345, "step": 17},
+        "aspect_ratios": ["auto", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"],
+        "short_edges": [768],
+        "fps": 24,
+        "keyframe_frame_indices": [[0]],
+        "image_formats": ["png", "jpg", "webp"],
+        "max_image_bytes": h3.MAX_IMAGE_BYTES,
+    },
+}
 
 
 def http_error(code, *, body=None, headers=None):
@@ -84,6 +100,7 @@ class Gateway:
                 "idempotency_key": self.keyed,
                 "queued": 0,
                 "queue_capacity": 8,
+                **UNIFIED_API,
             }
         self.polls.append((url, kwargs["timeout"]))
         if self.poll_errors:
@@ -122,8 +139,8 @@ class Gateway:
         output.write_bytes(result)
 
 
-@pytest.fixture
-def candidate(tmp_path, monkeypatch):
+@pytest.fixture(params=[1, 2], ids=["legacy", "v2"])
+def candidate(tmp_path, monkeypatch, request):
     task = {
         "id": "candidate",
         "request": {"prompt": "Preserve this exact prompt", "duration": 10, "seed": 7},
@@ -134,6 +151,7 @@ def candidate(tmp_path, monkeypatch):
         "h3_endpoints": ["http://gateway:18080"],
         "media_profile": h3.media_profile(MEDIA),
         "timeouts": {"h3_request": 30},
+        "h3_api_version": request.param,
     }
     clock, client = Clock(), Gateway(task)
     monkeypatch.setattr(h3, "time", clock)
@@ -205,6 +223,58 @@ def test_submission_retry_budget_survives_restart(candidate):
     assert not c.run()
     assert len(c.client.posts) == 3 and len(c.client.jobs) == 1
     assert c.state()["status"] == "submit_unknown"
+    assert c.state()["error_stage"] == "provider"
+
+
+@pytest.mark.parametrize("code", [502, 503])
+def test_exhausted_submission_is_droppable_by_training(candidate, monkeypatch, code):
+    from examples.video_agents import tournament
+    from examples.video_agents.observability import ProviderError
+
+    c = candidate
+    c.client.post_errors = [http_error(code) for _ in range(3)]
+    directory = Path(c.task["state"]).parent
+    protocol = {
+        **c.protocol,
+        "h3": h3.SETTINGS,
+        "eval_repo": "unused",
+        "protocol_sha256": "test-protocol",
+        "poll_interval": 1,
+        "timeouts": {"h3_request": 30, "h3": 150},
+    }
+
+    def run_worker(command, **kwargs):
+        task = read_json(directory / "generation.json")[0]
+        worker_protocol = read_json(directory / "protocol.json")
+        assert not h3.generate_one(task, worker_protocol, c.client, lambda path: MEDIA, timeout=150)
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(tournament.subprocess, "run", run_worker)
+    with pytest.raises(ProviderError, match="H3 service failed") as raised:
+        tournament.generate_video(directory, protocol, c.task["request"])
+    assert raised.value.stage == "h3"
+    assert c.state()["status"] == "submit_unknown" and c.state()["error_stage"] == "provider"
+    assert len(c.client.posts) == 3 and len({row[2] for row in c.client.posts}) == 1
+    deadline = c.state()["deadline_at"]
+    assert not c.run()
+    assert len(c.client.posts) == 3 and c.state()["deadline_at"] == deadline
+
+
+def test_invalid_unified_contract_remains_fatal(candidate, monkeypatch):
+    c = candidate
+    c.protocol["h3_api_version"] = 2
+    original = c.client.get_json
+    monkeypatch.setattr(c.client, "get_json", lambda *args, **kwargs: {**original(*args, **kwargs), "api": {}})
+    assert not c.run() and not c.run()
+    assert c.state()["error_stage"] == "configuration" and not c.client.posts
+
+
+def test_latest_download_failure_is_classified_independently(candidate):
+    c = candidate
+    c.client.download_results = [b"corrupt", ConnectionResetError("network interrupted"), http_error(502)]
+    assert not c.run()
+    assert len(c.client.posts) == 1 and len(c.client.downloads) == 3
+    assert c.state()["error_stage"] == "provider"
 
 
 def test_legacy_ambiguous_submission_keeps_conservative_behavior(candidate):
@@ -455,6 +525,7 @@ def test_real_http_recovery_keeps_one_generation(candidate):
                         "queued": 0,
                         "queue_capacity": 8,
                         "idempotency_key": True,
+                        **UNIFIED_API,
                     }
                 )
             assert self.headers["Authorization"] == "Bearer test-token"

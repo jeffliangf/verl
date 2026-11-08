@@ -518,6 +518,8 @@ class _Generation:
                     self.error_stage = "protocol"
                 elif not retryable(error):
                     self.error_stage = "artifact" if stage == "h3_download" else "provider"
+                else:
+                    self.error_stage = "provider"
                 safe = (
                     not submission
                     or self.state.get("idempotency_key")
@@ -591,6 +593,7 @@ class _Generation:
                     if self.protocol.get("h3_api_version") == 2:
                         self.error_stage = "configuration"
                         check_unified_api(health)
+                        self.error_stage = "provider"
                     keyed = health.get("idempotency_key") is True
                     self.save(
                         status="submitting",
