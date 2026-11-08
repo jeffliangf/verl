@@ -38,3 +38,19 @@ limits, the deployed gateway's complete API-v2 contract, and all 32 workers.
 The reused batch script also checks Gemini access, 16-rank NCCL communication,
 the H3 gateway from each policy node, and a two-node Ray cluster with 16 GPUs.
 The run's allocation budget starts when Slurm allocates the nodes.
+
+Mixed JSONL files use ``VideoRLDataset``, which assigns an explicit type to
+``images`` even when the first JSON chunks contain only T2V rows. This preserves
+the existing native dataset behavior and all frozen records.
+
+Run ``python -m examples.video_agents.data_preflight --run-dir RUN`` with the
+production training Python environment on a policy node, before allocating GPUs.
+It loads the complete train and evaluation datasets through the actual trainer
+loader, checks every record and image binding, exercises mixed collation, and
+checks all prompt lengths. The resulting report is tied to the runtime commit,
+configuration, protocol, datasets, and Python environment.
+
+Submit with ``python -m examples.video_agents.submit_mixed --run-dir RUN`` after
+the gateway tunnel is available. Missing, partial, or stale preflight reports
+prevent submission. For a recovery attempt, pass ``--budget-from`` pointing to
+the original run's ``run-budget.json``; the original deadline is retained.

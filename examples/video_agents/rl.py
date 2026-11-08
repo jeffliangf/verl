@@ -215,6 +215,7 @@ def training_config(args):
         raise ValueError("Evaluation needs its own --output-dir, separate from the training run")
     protocol = load_protocol(directory / "protocol.json")
     has_images = any(sample.get("image") for samples in protocol["samples"].values() for sample in samples)
+    mixed = protocol.get("tool_contract") == "urn:verl:sol-h3:3"
     overrides = [
         f"hydra.searchpath=[file://{ROOT / 'verl/trainer/config'}]",
         f"video_rl.protocol={json.dumps(str(directory / 'protocol.json'))}",
@@ -227,6 +228,14 @@ def training_config(args):
         f"trainer.rollout_data_dir={json.dumps(str(output / 'rollouts'))}",
         f"trainer.validation_data_dir={json.dumps(str(output / 'validation'))}",
         *(["actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image=1"] if has_images else []),
+        *(
+            [
+                "data.custom_cls.path=pkg://examples.video_agents.native_dataset",
+                "data.custom_cls.name=VideoRLDataset",
+            ]
+            if mixed
+            else []
+        ),
         *(
             [
                 f"actor_rollout_ref.model.path={json.dumps(args.model)}",
@@ -251,6 +260,11 @@ def training_config(args):
         raise ValueError("Evaluation loads --model and requires val_only, val_before_train, and resume_mode=disable")
     if has_images and config.actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image < 1:
         raise ValueError("I2V samples require vLLM limit_mm_per_prompt.image >= 1")
+    if mixed and (
+        config.data.custom_cls.path != "pkg://examples.video_agents.native_dataset"
+        or config.data.custom_cls.name != "VideoRLDataset"
+    ):
+        raise ValueError("Mixed video RL requires VideoRLDataset's explicit image schema")
     runtime_protocol(protocol, config.video_rl)
     group_size = protocol["group_size"]
     if (

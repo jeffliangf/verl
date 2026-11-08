@@ -169,6 +169,14 @@ def adapt_helpers(previous, output, checkout, connection):
         text = source.read_text().replace(str(previous), str(output)).replace(old_checkout, str(checkout))
         if name == "canary_ops.py":
             text = adapt_evaluation_monitor(text)
+        elif name == "initialize.py":
+            text = replace_once(
+                text,
+                'manifest = json.loads((root / "launch.json").read_text())',
+                'manifest = json.loads((root / "launch.json").read_text())\n'
+                "from examples.video_agents.data_preflight import require_preflight\n"
+                "require_preflight(root)",
+            )
         elif name == "gemini-preflight.py":
             text = GEMINI_PREFLIGHT
         elif name == "ray-node.sh":
@@ -304,6 +312,7 @@ def prepare(args):
         job_name=output.name,
         code_checkout=str(checkout),
         code_commit=commit,
+        python_environment="/home/jeff/.venvs/video-agents-h100-f169e786",
         common_launcher=str(output / "common/train.py"),
         common_overrides=str(output / "common-overrides.json"),
         batch_script=str(output / "common/train.sbatch"),

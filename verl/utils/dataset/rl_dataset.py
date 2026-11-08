@@ -166,17 +166,16 @@ class RLHFDataset(Dataset):
         for i, parquet_file in enumerate(data_files):
             self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
 
+    def _load_data_file(self, data_file):
+        """Load one file; subclasses can supply an explicit schema for their format."""
+        if data_file.endswith(".parquet"):
+            return datasets.load_dataset("parquet", data_files=data_file)["train"]
+        if data_file.endswith(".json") or data_file.endswith(".jsonl"):
+            return datasets.load_dataset("json", data_files=data_file)["train"]
+        raise ValueError(f"Unsupported file format: {data_file}")
+
     def _read_files_and_tokenize(self):
-        dataframes = []
-        for parquet_file in self.data_files:
-            # read files and cache
-            if parquet_file.endswith(".parquet"):
-                dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
-            elif parquet_file.endswith(".json") or parquet_file.endswith(".jsonl"):
-                dataframe = datasets.load_dataset("json", data_files=parquet_file)["train"]
-            else:
-                raise ValueError(f"Unsupported file format: {parquet_file}")
-            dataframes.append(dataframe)
+        dataframes = [self._load_data_file(data_file) for data_file in self.data_files]
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         total = len(self.dataframe)
