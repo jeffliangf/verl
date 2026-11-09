@@ -18,12 +18,25 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlencode
 
 from .storage import load_external, read_json
 
 
 def valid_name(name):
     return isinstance(name, str) and re.fullmatch(r"files/[A-Za-z0-9_-]{1,128}", name) is not None
+
+
+def metadata_url(api_base, name):
+    """Read required status/identity fields without optional media metadata.
+
+    Gemini can fail JSON serialization of optional file metadata. Its documented
+    response field mask still preserves processing errors and ownership checks.
+    """
+    if not valid_name(name):
+        raise ValueError("Invalid Gemini file resource name")
+    fields = "name,displayName,uri,mimeType,state,error"
+    return api_base + "/" + name + "?" + urlencode({"fields": fields})
 
 
 class UploadJournal:
@@ -75,7 +88,7 @@ def reap(journal, runner, client):
         name, display = item
         try:
             remote, _ = client.request_json(
-                "GET", runner.API_BASE + "/" + name, retry_network=True, context="Verify owned upload cleanup"
+                "GET", metadata_url(runner.API_BASE, name), retry_network=True, context="Verify owned upload cleanup"
             )
         except runner.HttpFailure as exc:
             if exc.status != 404:

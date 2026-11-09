@@ -17,6 +17,7 @@ import threading
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from test_judge_recovery_on_cpu import external_runner  # noqa: F401
@@ -64,7 +65,7 @@ def interrupted_gemini():
             if operation == "start":
                 state.uploads += 1
                 self.send_header("X-Goog-Upload-URL", f"{state.url}/content/{state.uploads}")
-            name = "files/" + self.path.rsplit("/", 1)[-1]
+            name = "files/" + urlsplit(self.path).path.rsplit("/", 1)[-1]
             file = {"name": name, "uri": f"{state.url}/{name}", "state": "ACTIVE"}
             response = {"file": file} if operation == "upload" else file if operation == "poll" else {}
             payload = json.dumps(response).encode()
@@ -151,6 +152,48 @@ def test_truncated_http_error_body_is_also_retried(local_runner, interrupted_gem
     client = local_runner.GeminiRestClient("fake-key", max_attempts=3, request_timeout=1)
     assert client.evaluate({}, require_agentic_steps=False)[0]["preferred_video"] == "A"
     assert len(interrupted_gemini.calls) == 2
+
+
+@pytest.mark.parametrize("state", ["ACTIVE", "FAILED"])
+def test_file_polling_avoids_optional_metadata_serialization_but_preserves_failure(
+    external_runner,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    state,
+):
+    runner = external_runner
+
+    def request(self, method, url, **kwargs):
+        parsed = urlsplit(url)
+        assert method == "GET" and parsed.path.endswith("/files/owned")
+        mask = parse_qs(parsed.query).get("fields", [""])[0].split(",")
+        if "state" not in mask:
+            raise runner.HttpFailure(500, "Failed to convert server response to JSON")
+        assert {"name", "displayName", "uri", "mimeType", "state", "error"} <= set(mask)
+        return {}, json.dumps(
+            {
+                "name": "files/owned",
+                "state": state,
+                "uri": "https://example.test/owned",
+                "mimeType": "video/mp4",
+                "error": {"code": 13, "message": "processing failed"} if state == "FAILED" else {},
+            }
+        ).encode()
+
+    monkeypatch.setattr(runner.GeminiRestClient, "_request_once", request)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+    before = runner.GeminiRestClient("fake-key", max_attempts=1)
+    with pytest.raises(runner.HttpFailure) as raised:
+        before.wait_for_file({"name": "files/owned", "state": "PROCESSING"})
+    assert raised.value.status == 500
+
+    judge_worker.instrument_client(runner, tmp_path / "timings.jsonl")
+    client = runner.GeminiRestClient("fake-key", max_attempts=1)
+    if state == "FAILED":
+        with pytest.raises(runner.FileProcessingFailure):
+            client.wait_for_file({"name": "files/owned", "state": "PROCESSING"})
+    else:
+        assert client.wait_for_file({"name": "files/owned", "state": "PROCESSING"})["name"] == "files/owned"
 
 
 @pytest.mark.parametrize("status", [400, 401, 403])

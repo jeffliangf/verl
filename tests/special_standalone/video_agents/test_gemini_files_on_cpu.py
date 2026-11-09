@@ -13,6 +13,7 @@
 import subprocess
 import sys
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -52,7 +53,10 @@ finally:
 
     class Client:
         def request_json(self, method, url, **kwargs):
-            assert method == "GET" and url == "https://test.invalid/files/owned"
+            parsed = urlsplit(url)
+            assert method == "GET" and parsed.scheme == "https" and parsed.netloc == "test.invalid"
+            assert parsed.path == "/files/owned"
+            assert {"name", "displayName"} <= set(parse_qs(parsed.query)["fields"][0].split(","))
             if state == "absent":
                 raise HttpFailure(404)
             if state == "transient":

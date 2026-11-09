@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
-from .gemini_files import UploadJournal, valid_name
+from .gemini_files import UploadJournal, metadata_url, valid_name
 from .image_assets import image_bytes
 from .observability import record_event, timed_stage
 from .storage import load_external
@@ -142,6 +142,11 @@ def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0)
             return file_object
 
         def request_json(self, method, url, **kwargs):
+            api_base = getattr(runner, "API_BASE", None)
+            if method == "GET" and api_base and url.startswith(api_base + "/"):
+                name = url.removeprefix(api_base + "/")
+                if valid_name(name):
+                    url = metadata_url(api_base, name)
             # Reuse the uploaded files and the upstream HTTP retry budget. Do
             # not wrap evaluate() in another loop, which would multiply retries.
             if method == "POST" and url.endswith("/interactions"):
