@@ -18,7 +18,7 @@ import socket
 import threading
 import urllib.error
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -26,6 +26,18 @@ from .gemini_files import UploadJournal, metadata_url, valid_name
 from .image_assets import image_bytes
 from .observability import record_event, timed_stage
 from .storage import load_external
+
+
+@contextmanager
+def provider_slot(runner, kind):
+    limits = getattr(runner, "_verl_provider_limits", None)
+    with ExitStack() as stack:
+        if limits is not None:
+            try:
+                stack.enter_context(limits.slot(kind))
+            except TimeoutError as exc:
+                raise runner.NetworkFailure(str(exc)) from exc
+        yield
 
 
 def supports_reference_images(runner):
@@ -202,7 +214,8 @@ def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0)
                 trace.update(attempts=0, recovered=False)
                 token = interaction.set(trace)
                 try:
-                    result = super().evaluate(request_payload, require_agentic_steps=require_agentic_steps)
+                    with provider_slot(runner, "comparisons"):
+                        result = super().evaluate(request_payload, require_agentic_steps=require_agentic_steps)
                     trace["recovered"] = trace["attempts"] > 1
                     return result
                 finally:
@@ -212,7 +225,8 @@ def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0)
             with timed_stage(
                 timings, "gemini_file_delete", timeout_seconds=min(self.file_timeout, file_control_timeout)
             ):
-                result = super().delete_file(name)
+                with provider_slot(runner, "deletions"):
+                    result = super().delete_file(name)
                 journal.deleted(name)
                 return result
 
@@ -260,7 +274,8 @@ def parallel_pairs(runner, *, keep_uploaded_files=False):
                             token = admission.acquire()
                         except TimeoutError as exc:
                             raise runner.NetworkFailure(str(exc)) from exc
-                    result = upload(path)
+                    with provider_slot(runner, "uploads"):
+                        result = upload(path)
                     if admission is not None:
                         admission.succeeded(token)
                     future.set_result((self, result))

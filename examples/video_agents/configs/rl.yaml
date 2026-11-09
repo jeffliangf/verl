@@ -12,6 +12,9 @@ video_rl:
 
   output_dir: ???
 
+  # Enabled by rl.py train --async-lookahead, with matching trainer/loss settings.
+  async_lookahead: false
+
   # Stop a persistent outage after replacing at most one training batch of groups.
   max_dropped_groups_per_step: ${data.train_batch_size}
 
@@ -71,6 +74,14 @@ video_rl:
   # Upload completed clips and judge ready pairs while sibling H3 jobs run.
   # The concurrency limit covers both presentation orders together.
   judge_streaming: false
+
+  # Completed judge readers hand owned uploads to a durable run-wide reaper.
+  judge_background_cleanup: false
+  judge_limits:
+    comparisons: 256
+    uploads: 16
+    deletions: 8
+    cleanup_backlog: 128
 
   # Training only: missing judgments contribute half a vote, with provenance.
   # Set to drop to restore group replacement. Validation always requires real votes.
@@ -220,6 +231,7 @@ trainer:
 
   v1:
     trainer_mode: sync
+    trainer_class: null
 
     sampler:
       sync_refill_failed_groups: true

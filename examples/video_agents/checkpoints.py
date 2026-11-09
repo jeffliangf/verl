@@ -19,6 +19,7 @@ from pathlib import Path
 
 from verl.trainer.ppo.checkpoint_callback import CheckpointCallback
 
+from .cohort_config import TRAINER_CLASS
 from .storage import read_json, write_json
 
 logger = logging.getLogger(__name__)
@@ -59,8 +60,13 @@ class VideoCheckpointCallback(CheckpointCallback):
         if type(self.keep_latest) is not int or self.keep_latest < 1:
             raise ValueError("video_rl.checkpoint_keep_latest must be a positive integer")
         actor = config.actor_rollout_ref.actor
-        if not config.trainer.use_v1 or config.trainer.v1.trainer_mode != "sync":
-            raise ValueError("Video checkpoint selection requires the synchronous V1 trainer")
+        self.video_cohorts = (
+            config.video_rl.async_lookahead
+            and config.trainer.v1.trainer_mode == "colocate_async"
+            and config.trainer.v1.trainer_class == TRAINER_CLASS
+        )
+        if not config.trainer.use_v1 or (config.trainer.v1.trainer_mode != "sync" and not self.video_cohorts):
+            raise ValueError("Video checkpoint selection requires synchronous V1 or the video cohort trainer")
         if actor.strategy not in ("fsdp", "fsdp2") or actor.checkpoint.get("async_save", False):
             raise ValueError("Video checkpoint retention requires synchronous FSDP saves")
         if not {"model", "optimizer", "extra"}.issubset(actor.checkpoint.save_contents):
@@ -139,6 +145,16 @@ class VideoCheckpointCallback(CheckpointCallback):
             raise ValueError("Latest checkpoint marker does not match the completed save")
         if any(step > global_step for step in self._completed_steps()):
             raise ValueError("Use a new run directory when restarting from an older checkpoint")
+        if self.video_cohorts:
+            state = read_json(directory / "video-cohorts.json")
+            queue = read_json(directory / "transfer_queue/metadata.json")
+            if (
+                state["step"] != global_step
+                or queue["user_metadata"].get("global_steps") != global_step
+                or not queue["storage_saved"]
+                or not (directory / "transfer_queue/controller_state.pkl").is_file()
+            ):
+                raise ValueError("Video cohort and TransferQueue checkpoints must match the saved policy")
         self._verify(global_step)
         write_json(directory / COMPLETE_MARKER, {"step": global_step})
         self._prune()

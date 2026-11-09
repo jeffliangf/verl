@@ -34,7 +34,7 @@ from uuid import UUID, uuid4
 
 from .h3_request import MAX_IMAGE_BYTES, request_output
 from .observability import record_event, timed_stage
-from .storage import file_sha256, fingerprint, load_external, read_json, write_json
+from .storage import file_sha256, fingerprint, guard_parent, load_external, read_json, write_json
 
 BACKEND = "self-hosted"
 ENDPOINT = "/v1/videos"
@@ -917,6 +917,8 @@ def worker_command(
         str(max_generation_attempts),
         "--transport-repair-seconds",
         str(transport_repair_seconds),
+        "--parent-pid",
+        str(os.getpid()),
     ]
 
 
@@ -929,7 +931,10 @@ def main():
     parser.add_argument("--max-request-attempts", type=int, default=3)
     parser.add_argument("--max-generation-attempts", type=int, default=2)
     parser.add_argument("--transport-repair-seconds", type=float, default=0)
+    parser.add_argument("--parent-pid", type=int)
     args = parser.parse_args()
+    if args.parent_pid is not None:
+        guard_parent(args.parent_pid)
     protocol = read_json(args.run_dir / "protocol.json")
     protocol.update(
         h3_max_request_attempts=args.max_request_attempts,

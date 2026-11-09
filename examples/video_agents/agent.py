@@ -8,10 +8,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Thin H3 tool and group-scoring adapters for the native synchronous V1 trainer."""
+"""H3 tool and complete-group scoring for synchronous and lookahead V1 training."""
 
 import asyncio
 import json
+import math
 from collections import Counter
 from copy import copy
 from pathlib import Path
@@ -32,7 +33,7 @@ from .h3 import generation_slot
 from .h3_request import tool_request
 from .image_assets import image_bytes, upright_observation
 from .observability import ProviderError, failure_record, record_event, timed_stage
-from .storage import item_key, write_json
+from .storage import item_key, run_lock, write_json
 from .streaming_judge import StreamingJudge
 from .tournament import generate_video, load_protocol, runtime_protocol, score_group
 
@@ -57,6 +58,7 @@ class SolH3Tool(BaseTool):
             split: {sample["id"]: sample for sample in rows} for split, rows in self.protocol["samples"].items()
         }
         self.slots = asyncio.Semaphore(self.protocol["h3_concurrency_per_worker"])
+        self.policy_slots = asyncio.Semaphore(self.protocol["groups_per_worker"] * self.protocol["group_size"])
 
     def get_openai_tool_schema(self):
         # Bootstrap native tool registration from data, not a second prompt source.
@@ -78,7 +80,7 @@ class SolH3Tool(BaseTool):
             agent_data._active_tool_schemas[0],
             sample=getattr(self, "bound_sample", None),
         )
-        directory = self.output_dir / "videos" / item_key(instance_id)
+        directory = getattr(self, "bound_video_directory", self.output_dir / "videos" / item_key(instance_id))
         timing_path = getattr(agent_data, "_video_timing_path", directory / "timings.jsonl")
         with timed_stage(timing_path, "h3_slot_wait", artifact=str(directory)):
             await self.slots.acquire()
@@ -115,9 +117,14 @@ class H3TerminalLoop(ToolAgentLoop):
         super().__init__(*args, **kwargs)
         client = self.server_manager
         self.stop_reason = None
+        self.policy_cache = None
 
         async def generate(**request):
-            output = await client.generate(**request)
+            output = (
+                await self.policy_cache.generate(client, request)
+                if self.policy_cache is not None
+                else await client.generate(**request)
+            )
             self.stop_reason = output.stop_reason
             if output.stop_reason not in {"completed", "length"} or not output.token_ids:
                 raise RuntimeError(f"LLM request did not complete: {output.stop_reason}")
@@ -128,6 +135,17 @@ class H3TerminalLoop(ToolAgentLoop):
         self.server_manager = SimpleNamespace(generate=generate)
 
     async def _handle_generating_state(self, agent_data, sampling_params, ignore_termination=False):
+        # Admission waits do not spend the active request's stall deadline.
+        slots = self.tools["sol_h3"].policy_slots if self.policy_cache is not None else None
+        if slots is not None:
+            await slots.acquire()
+        try:
+            return await self._generate_with_deadline(agent_data, sampling_params, ignore_termination)
+        finally:
+            if slots is not None:
+                slots.release()
+
+    async def _generate_with_deadline(self, agent_data, sampling_params, ignore_termination=False):
         timeout = self.tools["sol_h3"].protocol["timeouts"]["llm"]
         agent_data._video_timing_path = self.timing_path
         with timed_stage(self.timing_path, "llm", **self.timing_fields, timeout_seconds=timeout) as timing:
@@ -194,6 +212,24 @@ class H3TerminalLoop(ToolAgentLoop):
         tool = copy(self.tools["sol_h3"])
         tool.output_dir = Path(self.config.video_rl.output_dir)
         tool.protocol = runtime_protocol(tool.protocol, self.config.video_rl)
+        if "cohort_step" in kwargs:
+            from .policy_cache import PolicyCache
+
+            directory = Path(kwargs["_video_timings"]).parent
+            session = int(kwargs["session_id"])
+            tool.bound_video_directory = directory / "videos" / str(session)
+            self.policy_cache = PolicyCache(
+                directory / "policy" / str(session),
+                kwargs["behavior_version"],
+                {
+                    "uid": kwargs["uid"],
+                    "session": session,
+                    "protocol": tool.protocol["protocol_sha256"],
+                    "sample": kwargs["extra_info"],
+                    "tools": schemas,
+                },
+                required=kwargs.get("require_cached_policy", False),
+            )
         if tool.protocol.get("tool_contract") == "urn:verl:sol-h3:3":
             info = kwargs["extra_info"]
             tool.bound_sample = tool.samples[info["split"]][info["id"]]
@@ -230,6 +266,12 @@ class TournamentWorker(AgentLoopWorkerTQBase):
             split: {sample["id"]: sample for sample in self.protocol["samples"][split]} for split in ("train", "val")
         }
         self.group_slots = asyncio.Semaphore(self.protocol["groups_per_worker"])
+        self.cohort_groups, self.cohort_outcomes = set(), {}
+        if self.config.video_rl.get("async_lookahead", False):
+            capacity = math.ceil(
+                2 * self.config.data.train_batch_size / self.config.actor_rollout_ref.rollout.agent.num_workers
+            )
+            self.group_slots = asyncio.Semaphore(capacity)
         self.eval_group_slots = asyncio.Semaphore(
             self.protocol.get("eval_groups_per_worker") or self.protocol["groups_per_worker"]
         )
@@ -245,20 +287,55 @@ class TournamentWorker(AgentLoopWorkerTQBase):
 
     async def generate_sequences(self, batch):
         """Return one record per prompt group: its rewards, or why it was dropped."""
+        cohort = "cohort_step" in batch
+        if cohort:
+            uids = set(batch["uid"])
+            if self.cohort_groups & uids:
+                raise ValueError("A cohort group was dispatched twice")
+            self.cohort_groups.update(uids)
+        before = set(self.background_tasks)
         await super().generate_sequences(batch)
+        tasks = list(self.background_tasks - before)
+        if cohort:
+            for task in tasks:
+                task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            return None
         # Sync training must observe infrastructure failures before sampling the
         # queue. The native fire-and-forget worker otherwise marks failed groups
         # sampleable, and the trainer may pad their missing trajectories.
-        results = await asyncio.gather(*list(self.background_tasks), return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
             if isinstance(result, BaseException):
                 raise result
         return results
 
+    async def cohort_status(self, uids, *, release=False):
+        result = {}
+        for uid in self.cohort_groups.intersection(uids):
+            directory = self.output_dir / "train/groups" / item_key(uid)
+            record = self.cohort_outcomes.get(uid)
+            result[uid] = {
+                "record": record,
+                "policy_ready": record is not None
+                or all(
+                    (directory / "policy" / str(i) / "response.json").exists()
+                    for i in range(self.protocol["group_size"])
+                ),
+            }
+            if release:
+                if record is None:
+                    raise RuntimeError("Cannot release a live cohort group")
+                self.cohort_outcomes.pop(uid)
+                self.cohort_groups.remove(uid)
+        return result
+
     async def _run_prompt(self, prompt, sampling_params, trajectory, trace=False):
         partition = "val" if trajectory["validate"] else "train"
         step = int(prompt["global_steps"])
         directory = self.output_dir / partition / f"step_{step}" / item_key(prompt["uid"])
+        cohort = "cohort_step" in prompt
+        if cohort:
+            directory = self.output_dir / "train/groups" / item_key(prompt["uid"])
         slots = self.eval_group_slots if trajectory["validate"] else self.group_slots
         with timed_stage(directory / "timings.jsonl", "group_slot_wait"):
             await slots.acquire()
@@ -274,12 +351,21 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 sample_id=prompt["extra_info"]["id"],
                 directory=str(directory),
             ) as timing:
-                record = await self._run_group(prompt, sampling_params, trajectory, trace, directory)
+                if cohort:
+                    with run_lock(directory / "owner"):
+                        record = await self._run_group(prompt, sampling_params, trajectory, trace, directory)
+                    self.cohort_outcomes[prompt["uid"]] = record
+                else:
+                    record = await self._run_group(prompt, sampling_params, trajectory, trace, directory)
                 if record["dropped"]:
                     timing.update(status="dropped", failure_stage=record["stage"], error_type=record["type"])
                 else:
                     timing["scores"] = [reward["score"] for reward in record["rewards"]]
                 return record
+        except BaseException as exc:
+            if cohort:
+                self.cohort_outcomes[prompt["uid"]] = {"fatal": type(exc).__name__, "error": str(exc)}
+            raise
         finally:
             slots.release()
 
@@ -297,8 +383,10 @@ class TournamentWorker(AgentLoopWorkerTQBase):
         await tq.async_kv_put(key=uid, partition_id=partition, tag={"status": "running"})
         stream = None
         try:
-            if self.protocol.get("judge_streaming", False) or (
-                validate and protocol.get("eval_repair", {}).get("enabled", False)
+            cached_judge = "cohort_step" in prompt and (directory / "rewards.json").exists()
+            if not cached_judge and (
+                self.protocol.get("judge_streaming", False)
+                or (validate and protocol.get("eval_repair", {}).get("enabled", False))
             ):
                 stream = StreamingJudge(directory, protocol, sample, validate=validate)
                 await stream.start()
@@ -353,7 +441,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 sample,
                 [output.extra_fields["h3_result"] for output in results],
                 validate=validate,
-                **({"streamed": True} if stream is not None else {}),
+                **({"streamed": True} if stream is not None or cached_judge else {}),
             )
             for i, (output, reward) in enumerate(zip(results, rewards, strict=True)):
                 reward.update(self.reward_metadata(output))
@@ -403,14 +491,18 @@ class TournamentWorker(AgentLoopWorkerTQBase):
 
 
 class TournamentManager(AgentLoopManagerTQ):
-    """Keep native worker dispatch and enforce synchronous, complete-group rewards."""
+    """Keep native worker dispatch and enforce complete-group rewards."""
 
     worker_class = TournamentWorker
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not self.config.trainer.use_v1 or self.config.trainer.v1.trainer_mode != "sync":
-            raise ValueError("H3 tournaments require the native synchronous V1 trainer")
+        if not self.config.trainer.use_v1 or self.config.trainer.v1.trainer_mode not in {"sync", "colocate_async"}:
+            raise ValueError("H3 tournaments require synchronous V1 or the video cohort trainer")
+        if self.config.trainer.v1.trainer_mode != "sync" and (
+            self.config.trainer.v1.get("trainer_class") != "examples.video_agents.cohort_trainer.VideoCohortTrainer"
+        ):
+            raise ValueError("Async H3 tournaments require VideoCohortTrainer")
         protocol = load_protocol(Path(self.config.video_rl.protocol))
         group_size = protocol["group_size"]
         self.reference_fields = reference_fields(protocol)
@@ -427,6 +519,13 @@ class TournamentManager(AgentLoopManagerTQ):
 
     def generate_sequences(self, prompts):
         """Use native dispatch and bound replacement work during a service outage."""
+        if "cohort_step" in prompts:
+            chunks = prompts.chunk(min(len(prompts), len(self.agent_loop_workers)))
+            offset = getattr(self, "_cohort_dispatch_cursor", 0)
+            workers = self.agent_loop_workers[offset:] + self.agent_loop_workers[:offset]
+            ray.get([worker.generate_sequences.remote(chunk) for worker, chunk in zip(workers, chunks, strict=False)])
+            self._cohort_dispatch_cursor = (offset + len(prompts)) % len(workers)
+            return
         step = int(get_non_tensor_data(prompts, "global_steps", 0))
         validate = bool(get_non_tensor_data(prompts, "validate", False))
         partition = "val" if validate else "train"
@@ -467,6 +566,20 @@ class TournamentManager(AgentLoopManagerTQ):
                 "stopping before an optimizer update. Inspect failure.json and timings.jsonl."
             )
         self._check_judge_coverage(step, records)
+
+    def cohort_status(self, uids, *, release=False):
+        snapshots = ray.get([worker.cohort_status.remote(uids, release=release) for worker in self.agent_loop_workers])
+        result = {}
+        for snapshot in snapshots:
+            if result.keys() & snapshot.keys():
+                raise RuntimeError("Cohort UID belongs to multiple workers")
+            result.update(snapshot)
+        if set(result) != set(uids):
+            raise RuntimeError("Cohort admission lost a group")
+        for value in result.values():
+            if value["record"] and "fatal" in value["record"]:
+                raise RuntimeError(f"Asynchronous group failed: {value['record']}")
+        return result
 
     def _check_judge_coverage(self, step, records):
         """Bound synthetic judgments over the completed batch, including refill dispatches."""

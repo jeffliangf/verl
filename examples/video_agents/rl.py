@@ -246,6 +246,19 @@ def training_config(args):
             if evaluation
             else []
         ),
+        *(
+            [
+                "video_rl.async_lookahead=true",
+                "video_rl.judge_streaming=true",
+                "video_rl.judge_background_cleanup=true",
+                "trainer.v1.trainer_mode=colocate_async",
+                "trainer.v1.trainer_class=examples.video_agents.cohort_trainer.VideoCohortTrainer",
+                "algorithm.rollout_correction.rollout_is=token",
+                "algorithm.rollout_correction.bypass_mode=false",
+            ]
+            if getattr(args, "async_lookahead", False)
+            else []
+        ),
         *args.overrides,
     ]
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
@@ -266,15 +279,22 @@ def training_config(args):
     ):
         raise ValueError("Mixed video RL requires VideoRLDataset's explicit image schema")
     runtime_protocol(protocol, config.video_rl)
+    if config.video_rl.async_lookahead:
+        from .cohort_config import validate_config
+
+        if evaluation:
+            raise ValueError("Use synchronous evaluation; lookahead applies to training")
+        validate_config(config)
+    elif config.trainer.v1.trainer_mode != "sync" or config.trainer.v1.trainer_class is not None:
+        raise ValueError("Use --async-lookahead for the video cohort trainer, or keep synchronous V1")
     group_size = protocol["group_size"]
     if (
         not config.trainer.use_v1
-        or config.trainer.v1.trainer_mode != "sync"
         or config.algorithm.adv_estimator != "grpo"
         or config.actor_rollout_ref.rollout.n != group_size
         or config.actor_rollout_ref.rollout.val_kwargs.n != 1
     ):
-        raise ValueError(f"Keep synchronous V1 GRPO, {group_size} training rollouts, and one validation rollout")
+        raise ValueError(f"Keep V1 GRPO, {group_size} training rollouts, and one validation rollout")
     multi_turn = config.actor_rollout_ref.rollout.multi_turn
     if multi_turn.max_assistant_turns is not None or multi_turn.max_user_turns is not None:
         raise ValueError("The terminal H3 loop enforces its own turn limit after executing the tool")
@@ -478,6 +498,8 @@ def parse_args(argv=None):
             launch.add_argument("--model", required=True, help="Base model or exported Hugging Face checkpoint")
         launch.add_argument("--execute", action="store_true")
         launch.add_argument("--check-tokens", action="store_true")
+        if mode == "train":
+            launch.add_argument("--async-lookahead", action="store_true", help="Prefetch one complete policy batch")
         launch.add_argument("overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if getattr(args, "overrides", None) and args.overrides[0] == "--":

@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from . import judge
@@ -32,7 +32,7 @@ from .gemini_files import UploadJournal
 from .image_assets import image_bytes
 from .judge_worker import gemini_address_family, instrument_client, parallel_pairs, parse_options, reference_images
 from .observability import ProviderError, record_event, timed_stage
-from .storage import file_sha256, freeze_json, load_external, read_json, write_json
+from .storage import file_sha256, freeze_json, guard_parent, load_external, read_json, write_json
 from .tournament import check_dependencies, tournament_manifests
 
 
@@ -145,6 +145,10 @@ class StreamingJudge:
 
     async def start(self):
         check_dependencies(self.protocol)
+        if self.protocol.get("judge_background_cleanup"):
+            from .cleanup import ensure_running
+
+            ensure_running(self.protocol)
         freeze_json(self.root / "context.json", self.context)
         for name in ("outcome.json", "fatal.json", "finished.json"):
             (self.root / name).unlink(missing_ok=True)
@@ -155,6 +159,8 @@ class StreamingJudge:
                 "-m",
                 "examples.video_agents.streaming_judge",
                 str(self.directory),
+                "--parent-pid",
+                str(os.getpid()),
                 stdout=self.log,
                 stderr=subprocess.STDOUT,
             )
@@ -202,6 +208,15 @@ class StreamingJudge:
         # The killed child cannot execute its finally blocks. Reap only its
         # recorded uploads after it exits; never list or delete another group's files.
         journal = UploadJournal(self.directory / "judge/gemini-files.jsonl")
+        if self.protocol.get("judge_background_cleanup"):
+            from .cleanup import enqueue, ensure_running
+
+            if journal.pending():
+                enqueue(self.directory, self.protocol)
+                ensure_running(self.protocol)
+            if self.log is not None:
+                self.log.close()
+            return
         if journal.pending():
             cleanup = await asyncio.create_subprocess_exec(
                 sys.executable,
@@ -280,7 +295,12 @@ def run_stream(directory, runner):
     # Uploads have their own pool, so comparisons cannot starve an upload they need.
     with (
         ThreadPoolExecutor(max_workers=count + 3) as upload_pool,
-        ThreadPoolExecutor(max_workers=protocol.get("judge_concurrency", 1)) as pair_pool,
+        # Shared admission bounds requests; also bound threads waiting for it.
+        ThreadPoolExecutor(
+            max_workers=min(protocol.get("judge_concurrency", 1), 32)
+            if protocol.get("judge_limits")
+            else protocol.get("judge_concurrency", 1)
+        ) as pair_pool,
         record_fatal(root),
     ):
         while True:
@@ -335,12 +355,34 @@ def run_stream(directory, runner):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--parent-pid", type=int)
     args = parser.parse_args()
+    if args.parent_pid is not None:
+        guard_parent(args.parent_pid)
     root = args.directory / "judge/stream"
     protocol = read_json(root / "context.json")["protocol"]
     runner = load_external(Path(protocol["eval_repo"]) / "scripts/run_gemini_pairwise_eval.py")
+    from .cleanup import readers
+    from .provider_limits import provider_limits
+    from .upload_admission import UploadAdmission
+
+    runner._verl_provider_limits = provider_limits(protocol)
+    if protocol.get("provider_recovery_root"):
+        runner._verl_upload_admission = UploadAdmission(
+            Path(protocol["provider_recovery_root"]) / "gemini-upload-quota",
+            # Training streams can start before a long policy response. This
+            # gate never waits while blocked; the parent owns the pass deadline.
+            float("inf"),
+        )
     instrument_client(runner, args.directory / "judge/timings-stream.jsonl", protocol["timeouts"]["judge_control"])
-    with record_fatal(root), gemini_address_family("ipv4"), reference_images(runner), parallel_pairs(runner):
+    deferred = protocol.get("judge_background_cleanup", False)
+    with (
+        readers(args.directory, protocol) if deferred else nullcontext(),
+        record_fatal(root),
+        gemini_address_family("ipv4"),
+        reference_images(runner),
+        parallel_pairs(runner, keep_uploaded_files=deferred),
+    ):
         run_stream(args.directory, runner)
 
 

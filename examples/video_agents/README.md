@@ -27,6 +27,8 @@ video. This is a native tool-calling agent with a deliberately small action spac
 |---|---|
 | `rl.py` | Prepare agent datasets; launch native GRPO or checkpoint validation |
 | `agent.py` | Execute the tool, end the episode, and publish group rewards |
+| `cohort_trainer.py`, `policy_cache.py` | Optional one-batch lookahead, policy-version checks, and complete-response replay |
+| `cleanup.py`, `provider_limits.py` | Durable background deletion and shared streaming-provider admission |
 | `tournament.py` | Generate candidates and score training/validation comparisons |
 | `h3.py` | Sol-H3 client, job recovery, downloads, media checks, and the generation subprocess |
 | `judge.py`, `judge_worker.py`, `scoring.py` | Gemini manifests, timed requests, verified ledgers, and pair scores |
@@ -301,9 +303,14 @@ Set `video_rl.judge_streaming=true` to upload each completed H3 video immediatel
 and start each comparison when its two uploads are ready. Both presentation
 orders share the uploads and run concurrently; `judge_concurrency` then limits
 the total comparisons across both orders per group. For group size 8 and
-concurrency 28, 32 active groups can have up to 896 judgments in flight. Uploads
+concurrency 28, each group can have up to 28 judgments in flight. Uploads
 use a separate pool so waiting judgments cannot block them. Evaluation also
 shares the candidate and reference uploads across both orders.
+
+Streaming also uses `video_rl.judge_limits` for run-wide admission: by default,
+256 comparisons, 16 uploads, and 8 deletions. When these limits are enabled,
+each group uses at most 32 comparison threads. The effective concurrency is
+bounded by both the per-group and run-wide limits.
 
 Streaming preserves complete-group rewards, invalid-call penalties, the three
 request attempts, and neutral fallback coverage checks. No reward is published
@@ -477,6 +484,12 @@ Add `--execute` to train; Hydra overrides follow `--`:
 uv run --frozen --extra fsdp --extra vllm python -m examples.video_agents.rl train \
   --run-dir outputs/video_agents/rl --execute -- trainer.total_training_steps=10
 ```
+
+Add `--async-lookahead` to overlap one extra batch's video/judge work with the
+learner, using complete cached policy responses and at most one update of actual
+policy lag. The flag also enables background Gemini cleanup and native token
+importance correction. See [the scheduling, recovery, and validation contract](async_lookahead.rst)
+before changing an existing run's frozen configuration.
 
 The preset uses Qwen3.8-27B, FSDP2, TP=4 vLLM rollout, eight GPUs, sixteen prompts
 per batch, and four samples per prompt. Four agent workers each allow five H3

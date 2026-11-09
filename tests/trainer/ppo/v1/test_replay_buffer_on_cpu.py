@@ -35,6 +35,51 @@ from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
 POLL_INTERVAL = 0.05
 
 
+def test_video_cohort_keeps_exact_groups_and_behavior_versions_across_tq_restart(tq_init, partition_id, tmp_path):
+    from examples.video_agents.cohort_trainer import CohortReplayBuffer
+
+    members = [uuid.uuid4().hex for _ in range(4)]
+    for ordinal, uid in enumerate(members):
+        for sibling in range(16):
+            tq.kv_put(
+                key=f"{uid}_{sibling}_0",
+                partition_id=partition_id,
+                fields={"input_ids": torch.tensor([ordinal, sibling])},
+                tag={"is_prompt": False, "seq_len": 2, "min_global_steps": 0, "max_global_steps": 0},
+            )
+        tq.kv_put(
+            key=uid,
+            partition_id=partition_id,
+            fields={"index": ordinal},
+            tag={"is_prompt": True, "status": "finished", "global_steps": 1 if ordinal < 2 else 2},
+        )
+
+    def sampler(uids):
+        rb = CohortReplayBuffer(
+            trainer_mode="colocate_async",
+            trainer_config={},
+            max_off_policy_threshold=None,
+            max_off_policy_strategy="wait",
+            sampler_kwargs={},
+        )
+        rb.select(dict.fromkeys(uids, 0), 16)
+        return rb
+
+    first, metrics = sampler(members[:2]).sample(1, partition_id, 2)
+    assert len(first.keys) == 32 and metrics["training/cohort/policy_lag_max"] == 0
+    tq.kv_clear(keys=first.keys, partition_id=partition_id)
+    tq.save_checkpoint(tmp_path / "queue", metadata={"global_steps": 1})
+    tq.kv_clear(keys=list(tq.kv_list(partition_id)[partition_id]), partition_id=partition_id)
+    tq.load_checkpoint(tmp_path / "queue")
+    second, metrics = sampler(members[2:]).sample(2, partition_id, 2)
+    assert len(second.keys) == 32 and metrics["training/cohort/policy_lag_max"] == 1
+    assert set(first.keys).isdisjoint(second.keys)
+    restored = tq.kv_batch_get(keys=second.keys, partition_id=partition_id)
+    assert sorted(tuple(row.tolist()) for row in restored["input_ids"].unbind()) == [
+        (ordinal, sibling) for ordinal in (2, 3) for sibling in range(16)
+    ]
+
+
 @pytest.fixture(scope="module")
 def tq_init():
     tq.init()

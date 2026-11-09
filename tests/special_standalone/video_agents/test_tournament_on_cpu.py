@@ -1020,6 +1020,29 @@ def test_launcher_preview_uses_base_model_and_never_executes(prepared_rl, monkey
         rl.training_config(args)
 
 
+def test_launcher_enables_cohort_trainer_and_correction_together(prepared_rl):
+    directory, _, prepared_args = prepared_rl
+    args = rl.parse_args(
+        [
+            "train",
+            "--run-dir",
+            str(directory),
+            "--data-dir",
+            str(prepared_args.data_dir),
+            "--async-lookahead",
+        ]
+    )
+    config, overrides = rl.training_config(args)
+    assert config.video_rl.async_lookahead and config.video_rl.judge_background_cleanup
+    assert config.trainer.v1.trainer_mode == "colocate_async"
+    assert config.trainer.v1.trainer_class.endswith("VideoCohortTrainer")
+    assert config.algorithm.rollout_correction.rollout_is == "token"
+    assert "video_rl.async_lookahead=true" in overrides
+    args.overrides = ["algorithm.rollout_correction.rollout_is=null"]
+    with pytest.raises(ValueError, match="importance correction"):
+        rl.training_config(args)
+
+
 def test_launcher_reads_saved_data_without_rebuilding_prompts(prepared_rl, monkeypatch):
     directory, _, prepared_args = prepared_rl
     args = rl.parse_args(["train", "--run-dir", str(directory), "--data-dir", str(prepared_args.data_dir)])
@@ -2229,3 +2252,73 @@ async def test_stream_cancel_reaps_child_without_publishing_rewards(prepared_rl,
     await session.close()
     assert session.process.returncode is not None
     assert not (session.directory / "rewards.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_native_cohort_admission_and_validation_do_not_wait_for_external_training(native_worker, monkeypatch):
+    import numpy as np
+
+    from examples.video_agents import agent
+    from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
+    from verl.utils.tensordict_utils import assign_non_tensor_data, get_tensordict
+
+    worker, events, published = native_worker
+    worker.cohort_groups, worker.cohort_outcomes = set(), {}
+    external_done = asyncio.Event()
+
+    async def rollout(*args, **kwargs):
+        if not kwargs["trajectory"]["validate"]:
+            directory = Path(kwargs["_video_timings"]).parent
+            write_json(directory / "policy" / str(kwargs["session_id"]) / "response.json", {})
+            await external_done.wait()
+        return AgentLoopOutput(
+            prompt_ids=[1],
+            response_ids=[2],
+            response_mask=[1],
+            response_logprobs=[-0.5],
+            metrics=AgentLoopMetrics(),
+            num_turns=1,
+            extra_fields={"h3_result": {"status": "invalid_call"}, "min_global_steps": 0, "max_global_steps": 0},
+        )
+
+    worker._run_agent_loop = rollout
+    monkeypatch.setattr(
+        agent,
+        "score_group",
+        lambda directory, protocol, sample, candidates, **kw: [{"score": 0, "valid_call": 0} for _ in candidates],
+    )
+
+    def batch(uid, validate=False):
+        result = get_tensordict(
+            {
+                "uid": np.array([uid], dtype=object),
+                "index": np.array([0]),
+                "extra_info": np.array([{"id": "eval-0" if validate else "train-0"}], dtype=object),
+            }
+        )
+        assign_non_tensor_data(result, "global_steps", 1)
+        if validate:
+            assign_non_tensor_data(result, "validate", True)
+        else:
+            assign_non_tensor_data(result, "cohort_step", 1)
+            assign_non_tensor_data(result, "behavior_version", 0)
+        return result
+
+    await asyncio.wait_for(worker.generate_sequences(batch("cohort-a")), timeout=2)
+    for _ in range(100):
+        status = await worker.cohort_status(["cohort-a"])
+        if status["cohort-a"]["policy_ready"]:
+            break
+        await asyncio.sleep(0.01)
+    assert status["cohort-a"]["policy_ready"] and status["cohort-a"]["record"] is None
+    assert not published
+    # Validation must gather only the tasks it admitted, even with an unrelated
+    # training cohort still rendering. This exercises the native worker method.
+    records = await asyncio.wait_for(worker.generate_sequences(batch("validation", True)), timeout=2)
+    assert len(records) == 1 and not records[0]["dropped"]
+    assert (await worker.cohort_status(["cohort-a"]))["cohort-a"]["record"] is None
+    external_done.set()
+    await asyncio.wait_for(asyncio.gather(*list(worker.background_tasks)), timeout=2)
+    status = await worker.cohort_status(["cohort-a"], release=True)
+    assert not status["cohort-a"]["record"]["dropped"]
+    assert len(published) == 5 and not worker.cohort_groups

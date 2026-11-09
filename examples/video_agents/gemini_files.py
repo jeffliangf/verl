@@ -17,6 +17,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -81,10 +82,10 @@ class UploadJournal:
         return pending
 
 
-def reap(journal, runner, client):
+def reap(journal, runner, client, *, limits=None):
     """Call only after the owning subprocess has exited and all threads are gone."""
 
-    def remove(item):
+    def remove_owned(item):
         name, display = item
         try:
             remote, _ = client.request_json(
@@ -98,6 +99,10 @@ def reap(journal, runner, client):
                 raise ValueError("Gemini cleanup ownership mismatch")
             client.delete_file(name)
         journal.deleted(name)
+
+    def remove(item):
+        with limits.slot("deletions") if limits is not None else nullcontext():
+            remove_owned(item)
 
     pending = journal.pending()
     failed = 0

@@ -322,3 +322,27 @@ def test_damaged_best_is_detected_before_pruning_on_restart(config):
     with pytest.raises(FileNotFoundError):
         build_checkpoint_callback(config)
     assert retained(callback) == {5, 10}
+
+
+@pytest.mark.parametrize("problem", [None, "manifest", "queue_step", "storage", "controller"])
+def test_cohort_checkpoint_publishes_only_with_matching_durable_queue(config, problem):
+    config.video_rl.async_lookahead = True
+    config.trainer.v1.trainer_mode = "colocate_async"
+    config.trainer.v1.trainer_class = "examples.video_agents.cohort_trainer.VideoCohortTrainer"
+    callback = build_checkpoint_callback(config)
+    directory = checkpoint(callback, 1, publish=False)
+    write_json(directory / "video-cohorts.json", {"step": 2 if problem == "manifest" else 1})
+    write_json(
+        directory / "transfer_queue/metadata.json",
+        {"storage_saved": problem != "storage", "user_metadata": {"global_steps": 2 if problem == "queue_step" else 1}},
+    )
+    if problem != "controller":
+        (directory / "transfer_queue/controller_state.pkl").write_bytes(b"saved queue")
+    (callback.root / "latest_checkpointed_iteration.txt").write_text("1")
+    if problem:
+        with pytest.raises(ValueError, match="must match"):
+            callback.on_save(None, 1, str(directory))
+        assert not (directory / COMPLETE_MARKER).exists()
+    else:
+        callback.on_save(None, 1, str(directory))
+        assert read_json(directory / COMPLETE_MARKER) == {"step": 1}

@@ -105,6 +105,17 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         if repair["pass_timeout"] <= attempts * repair["request_timeout"] + timeouts["judge_file"]:
             raise ValueError("Evaluation pass timeout must cover all interaction attempts, uploads and backoff")
     output = settings.get("output_dir")
+    background_cleanup = settings.get("judge_background_cleanup", False)
+    if type(background_cleanup) is not bool:
+        raise ValueError("video_rl.judge_background_cleanup must be boolean")
+    limits = dict(settings.get("judge_limits") or {})
+    if limits and (
+        set(limits) != {"comparisons", "uploads", "deletions", "cleanup_backlog"}
+        or any(type(value) is not int or value < 1 for value in limits.values())
+    ):
+        raise ValueError("video_rl.judge_limits requires positive comparisons, uploads, deletions, cleanup_backlog")
+    if background_cleanup and (not output or output == "???"):
+        raise ValueError("Background cleanup requires video_rl.output_dir")
     return {
         **protocol,
         **h3.recovery_settings(settings),
@@ -116,6 +127,8 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         "judge_streaming": streaming,
         "eval_groups_per_worker": eval_groups,
         "eval_repair": repair,
+        "judge_background_cleanup": background_cleanup,
+        "judge_limits": limits,
         **({"provider_recovery_root": str(Path(output) / "provider-recovery")} if output and output != "???" else {}),
         "max_judge_fallback_fraction": fraction,
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),

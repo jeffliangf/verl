@@ -21,6 +21,18 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+def guard_parent(parent_pid):
+    """Exit with the owning worker, leaving durable provider state for recovery."""
+    import ctypes
+    import signal
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "Cannot set provider client parent-death signal")
+    if os.getppid() != parent_pid:
+        raise SystemExit("Provider client parent exited before startup")
+
+
 def fingerprint(value) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
