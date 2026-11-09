@@ -356,16 +356,26 @@ class DownloadIntegrityError(ValueError):
     """A transfer did not match the gateway's archived artifact."""
 
 
+class PhaseDeadlineExceeded(TimeoutError):
+    """Server timestamps exceeded a queue/render budget; transport repair cannot help."""
+
+
 def recovery_settings(settings):
     """Validate launch-time recovery budgets independently of frozen inputs."""
     result = {key: settings.get(key, default) for key, default in RECOVERY_DEFAULTS.items()}
     if any(type(value) is not int or value < 1 for value in result.values()):
         raise ValueError("H3 attempt and concurrency limits must be positive integers")
+    seconds = settings.get("h3_transport_repair_seconds", 0)
+    if isinstance(seconds, bool) or not isinstance(seconds, int | float) or not isfinite(seconds) or seconds < 0:
+        raise ValueError("H3 transport repair seconds must be finite and nonnegative")
+    result["h3_transport_repair_seconds"] = seconds
     return result
 
 
 def retryable(error):
     """Retry transport failures without treating local filesystem errors as network errors."""
+    if isinstance(error, PhaseDeadlineExceeded):
+        return False
     if isinstance(error, DownloadIntegrityError):
         return True
     if isinstance(error, urllib.error.HTTPError):
@@ -485,11 +495,49 @@ class _Generation:
         time.sleep(seconds)
         self.remaining()
 
+    def repair_remaining(self):
+        """One persisted recovery window, shared by all operations and restarts."""
+        seconds = self.limits["h3_transport_repair_seconds"]
+        if not seconds:
+            raise TimeoutError("H3 transport repair is disabled")
+        expires = self.state.get("transport_repair_deadline_at")
+        if expires is None:
+            expires = min(self.state["deadline_at"], time.time() + seconds)
+            self.save(transport_repair_deadline_at=expires)
+            record_event(self.timings, "h3_recovery", "repair_started", deadline_at=expires)
+        left = min(expires, self.state["deadline_at"]) - time.time()
+        if left <= 0:
+            raise TimeoutError("H3 transport repair deadline exhausted")
+        # A download may have exhausted its ordinary transfer budget. Extend it
+        # only into the repair allowance declared in the original worker budget.
+        self.deadline = min(self.overall_deadline, max(self.deadline, time.monotonic() + left))
+        return min(left, self.remaining())
+
+    def reconcile_submission(self, timeout):
+        """A lost POST response does not imply that generation failed to start."""
+        identifier = self.state["idempotency_key"]
+        route = ENDPOINT if "task" in self.task["request"] else "/v1/jobs"
+        try:
+            response = self.client.get_json(f"{self.state['worker_url']}{route}/{identifier}", timeout=timeout)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return None  # Any subsequent POST must still reuse this key.
+            raise
+        self.validate_status(response, identifier)
+        self.save(status="submitted", task_id=identifier, error=None)
+        record_event(self.timings, "h3_recovery", "submission_reconciled", job_id=identifier)
+        return response
+
     def request(self, stage, operation, *, submission=False):
         """Share a persisted retry budget across network/HTTP errors and client restarts."""
         counts = self.state.setdefault("request_attempts", {})
-        while counts.get(stage, 0) < self.limits["h3_max_request_attempts"]:
-            limit = self.remaining()
+        repairing = counts.get(stage, 0) >= self.limits["h3_max_request_attempts"] or stage in self.state.get(
+            "repair_operations", []
+        )
+        while True:
+            if repairing and not self.limits["h3_transport_repair_seconds"]:
+                raise OSError(f"H3 {stage} request attempt budget exhausted")
+            limit = self.repair_remaining() if repairing else self.remaining()
             attempt = counts.get(stage, 0) + 1
             counts[stage] = attempt
             retries = self.state.get("transport_retries", 0) + int(attempt > 1)
@@ -504,7 +552,16 @@ class _Generation:
                     job_id=self.state.get("task_id"),
                     idempotency_key=self.state.get("idempotency_key"),
                 ) as timing:
-                    response = operation(limit)
+                    response = None
+                    if repairing:
+                        # Probe the exact route used by this worker. Admission may
+                        # be closed while existing jobs and artifacts remain readable.
+                        self.client.get_json(self.state["worker_url"] + "/healthz", timeout=min(5, limit))
+                        limit = self.repair_remaining()
+                        if submission and self.state.get("idempotency_key"):
+                            response = self.reconcile_submission(limit)
+                    if response is None:
+                        response = operation(self.repair_remaining() if repairing else limit)
                     if isinstance(response, dict):
                         timing["job_status"] = response.get("status")
                         timing["response_job_id"] = response.get("id")
@@ -525,9 +582,25 @@ class _Generation:
                     or self.state.get("idempotency_key")
                     or (isinstance(error, urllib.error.HTTPError) and error.code in {429, 503, 507})
                 )
-                if not safe or not retryable(error) or attempt >= self.limits["h3_max_request_attempts"]:
+                if not safe or not retryable(error):
                     raise
-                delay = retry_delay(error, attempt)
+                if attempt >= self.limits["h3_max_request_attempts"]:
+                    # Integrity errors retain their existing short retry budget;
+                    # the extended window is exclusively for provider transport.
+                    if (
+                        not self.limits["h3_transport_repair_seconds"]
+                        or self.error_stage != "provider"
+                        or (submission and not self.state.get("idempotency_key"))
+                    ):
+                        raise
+                    repairing = True
+                    self.save(repair_operations=sorted(set(self.state.get("repair_operations", [])) | {stage}))
+                    self.repair_remaining()
+                delay = retry_delay(error, min(attempt, 6))
+                if repairing:
+                    delay = max(5, delay) + random.uniform(0, 2)
+                    if delay >= self.state["transport_repair_deadline_at"] - time.time():
+                        raise TimeoutError("H3 transport repair cannot fit another retry") from error
                 record_event(
                     self.timings,
                     "h3_recovery",
@@ -539,14 +612,17 @@ class _Generation:
                     error_type=type(error).__name__,
                     http_status=getattr(error, "code", None),
                     backoff_seconds=delay,
+                    repairing=repairing,
                 )
                 self.pause(delay)
             else:
                 counts.pop(stage, None)
-                self.save(request_attempts=counts)
+                self.save(
+                    request_attempts=counts,
+                    repair_operations=[name for name in self.state.get("repair_operations", []) if name != stage],
+                )
                 self.error_stage = "provider"
                 return response
-        raise OSError(f"H3 {stage} request attempt budget exhausted")
 
     def submit_once(self, timeout):
         key = self.state.get("idempotency_key")
@@ -645,13 +721,17 @@ class _Generation:
         identifier = self.state["task_id"]
         route = ENDPOINT if "task" in self.task["request"] else "/v1/jobs"
         response = self.client.get_json(f"{self.state['worker_url']}{route}/{identifier}", timeout=timeout)
+        self.validate_status(response, identifier)
+        return {**response, "status": "succeeded" if response["status"] == "completed" else response["status"]}
+
+    @staticmethod
+    def validate_status(response, identifier):
         if (
             not isinstance(response, dict)
             or response.get("id") != identifier
             or response.get("status") not in {"queued", "running", "failed", "succeeded", "completed"}
         ):
             raise ValueError("H3 status returned a different job ID or an invalid job state")
-        return {**response, "status": "succeeded" if response["status"] == "completed" else response["status"]}
 
     def download(self, response):
         expected_hash, expected_bytes = response.get("video_sha256"), response.get("video_bytes")
@@ -670,9 +750,16 @@ class _Generation:
 
         def fetch(timeout):
             options = {"sglang": True} if "task" in self.task["request"] else {}
-            self.client.download(
-                self.state["worker_url"], self.state["task_id"], self.output, timeout=timeout, **options
+            complete = (
+                verify
+                and self.output.exists()
+                and self.output.stat().st_size == expected_bytes
+                and file_sha256(self.output) == expected_hash
             )
+            if not complete:
+                self.client.download(
+                    self.state["worker_url"], self.state["task_id"], self.output, timeout=timeout, **options
+                )
             digest, size = file_sha256(self.output), self.output.stat().st_size
             if verify and (digest != expected_hash or size != expected_bytes):
                 self.output.unlink(missing_ok=True)
@@ -744,11 +831,13 @@ class _Generation:
             raise ValueError("Saved job's worker is outside the frozen endpoint pool")
         expires = self.state.get("deadline_at", time.time() + self.timeout)
         self.deadline = time.monotonic() + min(self.timeout, expires - time.time())
+        self.overall_deadline = self.deadline
         # A resumed reader starts a new bounded GET operation. Submission counts
         # survive restarts so replaying an unknown admission cannot multiply retries.
         counts = self.state.setdefault("request_attempts", {})
-        counts.pop("h3_poll", None)
-        counts.pop("h3_download", None)
+        for stage in ("h3_poll", "h3_download"):
+            if stage not in self.state.get("repair_operations", []):
+                counts.pop(stage, None)
         self.save(deadline_at=expires, generation_attempt=self.state.get("generation_attempt", 1))
         try:
             while True:
@@ -803,7 +892,13 @@ def generate_tasks(
 
 
 def worker_command(
-    run_dir: Path, poll_interval: float, timeout: float, *, max_request_attempts=3, max_generation_attempts=2
+    run_dir: Path,
+    poll_interval: float,
+    timeout: float,
+    *,
+    max_request_attempts=3,
+    max_generation_attempts=2,
+    transport_repair_seconds=0,
 ) -> list[str]:
     """Run provider threads in a process that can be stopped at a hard deadline."""
     return [
@@ -820,6 +915,8 @@ def worker_command(
         str(max_request_attempts),
         "--max-generation-attempts",
         str(max_generation_attempts),
+        "--transport-repair-seconds",
+        str(transport_repair_seconds),
     ]
 
 
@@ -831,10 +928,13 @@ def main():
     parser.add_argument("--timeout", type=float, required=True)
     parser.add_argument("--max-request-attempts", type=int, default=3)
     parser.add_argument("--max-generation-attempts", type=int, default=2)
+    parser.add_argument("--transport-repair-seconds", type=float, default=0)
     args = parser.parse_args()
     protocol = read_json(args.run_dir / "protocol.json")
     protocol.update(
-        h3_max_request_attempts=args.max_request_attempts, h3_max_generation_attempts=args.max_generation_attempts
+        h3_max_request_attempts=args.max_request_attempts,
+        h3_max_generation_attempts=args.max_generation_attempts,
+        h3_transport_repair_seconds=args.transport_repair_seconds,
     )
     tasks = read_json(args.run_dir / "generation.json")
     probe = load_external(Path(protocol["eval_repo"]) / "bestofn/normalize.py").probe

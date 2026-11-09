@@ -42,6 +42,10 @@ video_rl:
   h3_max_request_attempts: 3
   h3_max_generation_attempts: 2
 
+  # Repair accepted jobs in place before replacing a prompt group. Shared across
+  # transport phases and process restarts; zero restores the short retry budget.
+  h3_transport_repair_seconds: 300
+
   # Shared across all agent workers in each rl.py or inspection_rl.py run.
   # Waiting for this slot does not consume the H3 in-flight deadline.
   h3_max_inflight: 32
@@ -49,6 +53,13 @@ video_rl:
   # Evaluation has one rollout per prompt and can admit more groups than training.
   # null reuses the frozen protocol's groups_per_worker setting.
   eval_groups_per_worker: null
+
+  # Preserve completed comparisons and repair transient evaluation failures before
+  # publishing scores. This uses the streaming judge even when training does not.
+  eval_repair:
+    enabled: true
+    request_timeout: 180
+    pass_timeout: 900
 
   # Initial request plus two retries, sharing one budget for transient HTTP and
   # network failures, including judgments. Each pass still has a hard deadline.

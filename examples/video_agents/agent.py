@@ -297,7 +297,9 @@ class TournamentWorker(AgentLoopWorkerTQBase):
         await tq.async_kv_put(key=uid, partition_id=partition, tag={"status": "running"})
         stream = None
         try:
-            if self.protocol.get("judge_streaming", False):
+            if self.protocol.get("judge_streaming", False) or (
+                validate and protocol.get("eval_repair", {}).get("enabled", False)
+            ):
                 stream = StreamingJudge(directory, protocol, sample, validate=validate)
                 await stream.start()
 

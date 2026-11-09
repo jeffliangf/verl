@@ -226,6 +226,89 @@ def test_submission_retry_budget_survives_restart(candidate):
     assert c.state()["error_stage"] == "provider"
 
 
+def test_repair_reconciles_accepted_submission_after_three_lost_responses(candidate):
+    c = candidate
+    c.protocol["h3_transport_repair_seconds"] = 300
+    c.client.post_errors = [http_error(502), TimeoutError("lost response"), http_error(503)]
+    assert c.run()
+    assert len(c.client.posts) == 3 and len(c.client.jobs) == 1
+    assert len(c.client.downloads) == 1
+    assert c.state()["task_id"] == c.client.posts[0][2]
+    assert c.state()["transport_repair_deadline_at"] <= c.state()["deadline_at"]
+
+
+def test_repair_replays_same_key_only_after_status_lookup_reports_absent(candidate, monkeypatch):
+    c = candidate
+    c.protocol["h3_transport_repair_seconds"] = 300
+    c.client.accept_before_error = False
+    c.client.post_errors = [http_error(503)] * 3
+    original = c.client.get_json
+
+    def lookup(url, **kwargs):
+        try:
+            return original(url, **kwargs)
+        except KeyError:
+            raise http_error(404) from None
+
+    monkeypatch.setattr(c.client, "get_json", lookup)
+    assert c.run()
+    assert len(c.client.posts) == 4 and len(c.client.jobs) == 1
+    assert len({row[2] for row in c.client.posts}) == 1
+    assert len(c.client.polls) == 2  # Recovery lookup before POST, then ordinary status.
+
+
+def test_extended_repair_does_not_expand_keyless_submission_retries(candidate):
+    c = candidate
+    c.protocol["h3_transport_repair_seconds"] = 300
+    c.client.keyed, c.client.accept_before_error = False, False
+    c.client.post_errors = [http_error(503)] * 3
+    assert not c.run()
+    assert len(c.client.posts) == 3 and not c.client.jobs
+    assert "transport_repair_deadline_at" not in c.state()
+
+
+@pytest.mark.parametrize("phase", ["poll", "download"])
+def test_repair_reuses_one_render_after_exhausting_transport_attempts(candidate, phase):
+    c = candidate
+    c.protocol["h3_transport_repair_seconds"] = 300
+    failures = [TimeoutError("tunnel interrupted"), http_error(503), TimeoutError("read timeout")]
+    if phase == "poll":
+        c.client.poll_errors = failures
+    else:
+        c.client.download_results = failures
+    assert c.run()
+    assert len(c.client.posts) == len(c.client.jobs) == 1
+    assert Path(c.task["output"]).read_bytes() == VIDEO
+    assert c.state()["generation_attempt"] == 1
+    assert c.state()["transport_repair_deadline_at"] > c.clock.time()
+
+
+def test_repair_deadline_and_retry_state_survive_process_restart(candidate):
+    c = candidate
+    c.protocol["h3_transport_repair_seconds"] = 60
+    c.client.poll_errors = [TimeoutError("route down")] * 3 + [KeyboardInterrupt()]
+    with pytest.raises(KeyboardInterrupt):
+        c.run()
+    before = c.state()
+    assert "h3_poll" in before["repair_operations"]
+    c.clock.sleep(61)
+    posts, polls = len(c.client.posts), len(c.client.polls)
+    assert not c.run()
+    assert len(c.client.posts) == posts and len(c.client.polls) == polls
+    assert c.state()["transport_repair_deadline_at"] == before["transport_repair_deadline_at"]
+    assert c.state()["deadline_at"] == before["deadline_at"]
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 409, 422])
+def test_extended_repair_does_not_retry_auth_or_bad_requests(candidate, code):
+    c = candidate
+    c.protocol["h3_transport_repair_seconds"] = 300
+    c.client.post_errors = [http_error(code)]
+    assert not c.run()
+    assert len(c.client.posts) == 1
+    assert "transport_repair_deadline_at" not in c.state()
+
+
 @pytest.mark.parametrize("code", [502, 503])
 def test_exhausted_submission_is_droppable_by_training(candidate, monkeypatch, code):
     from examples.video_agents import tournament
@@ -646,6 +729,25 @@ def test_download_deadline_is_separate_and_survives_resume(phased, monkeypatch):
     assert not c.run()
     assert c.state()["download_deadline_at"] == before["download_deadline_at"]
     assert len(c.client.downloads) == len(c.client.posts) == 1
+
+
+def test_transfer_repair_retains_original_phase_deadline_and_verified_file(phased, monkeypatch):
+    c = phased
+    c.protocol["h3_transport_repair_seconds"] = 300
+    c.snapshots = [(340, {"created_at": c.epoch, "started_at": c.epoch + 300, "finished_at": c.epoch + 340})]
+    original = c.client.download
+
+    def late_transfer(*args, **kwargs):
+        c.clock.sleep(121)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(c.client, "download", late_transfer)
+    assert c.run()
+    assert len(c.client.posts) == len(c.client.downloads) == 1
+    assert c.state()["download_deadline_at"] == c.epoch + 460
+    assert c.state()["transport_repair_deadline_at"] == c.epoch + 761
+    assert c.state()["deadline_at"] == c.epoch + 1230
+    assert list(c.state()["phase_usage_by_job"].values()) == [{"queue": 300, "generation": 40}]
 
 
 def test_regeneration_accumulates_server_execution_intervals(phased):

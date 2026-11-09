@@ -129,8 +129,10 @@ groups, each update uses up to 256 videos and 1,792 judgments. Set
 `video_rl.judge_concurrency=28` to judge all pairs concurrently within each order.
 
 An invalid tool call earns -1 and forfeits its pairings against valid calls.
-Equal-reward groups have no GRPO learning signal. During training, an H3 service
-failure or timeout drops the whole prompt group. No trajectories or
+Equal-reward groups have no GRPO learning signal. During training, H3 transport
+failures are repaired inside the original tool invocation, retaining the policy
+response and successful siblings. Only an exhausted repair or terminal service
+failure drops the whole prompt group. No trajectories or
 rewards from that group enter the optimizer. Native
 `trainer.v1.sampler.sync_refill_failed_groups=true` replaces it with a fresh group
 under the same policy weights, preserving the training batch size. Sibling
@@ -144,8 +146,9 @@ Set the policy to `drop` to restore replacement of unscorable groups. Artifact
 corruption, authentication/configuration errors, and aborted or empty LLM responses
 still abort during training. Invalid policy tool calls retain their penalties.
 
-Held-out evaluation never stops training. A prompt whose video, Gemini judgments,
-or LLM turn fails for any reason, including a Gemini `prohibited_content`
+Held-out evaluation repairs transient missing judgments before scoring and native
+checkpoint selection. A prompt whose video, Gemini judgments,
+or LLM turn remains unscorable, including a Gemini `prohibited_content`
 refusal, is dropped from the denominator and keeps its `failure.json`. An invalid
 tool call is the policy's failure and still scores 0. Each evaluation writes
 `val/step_<n>/eval-summary.json` with the valid count, valid-only means overall
@@ -185,21 +188,26 @@ queue, rendering and transfer budgets:
 | H3 server queue (`h3_phase_timeouts.queue`) | — | 600 s |
 | H3 rendering (`timeouts.h3`) | — | 150 s |
 | H3 download and media checks (`h3_phase_timeouts.download`) | — | 120 s |
+| H3 transport repair (`h3_transport_repair_seconds`) | — | 300 s |
 | One H3 HTTP request (`h3_request`) | 4 s | 30 s |
-| One Gemini judgment (`judge_request`) | 20-22 s | 45 s |
+| One training Gemini judgment (`judge_request`) | 20-22 s | 45 s |
+| One evaluation Gemini judgment (`eval_repair.request_timeout`) | — | 180 s |
 | Gemini upload and file processing (`judge_file`) | 10-12 s | 60 s |
 | Gemini upload start, polling, deletion (`judge_control`) | 3 s | 15 s |
 | One presentation-order pass (`judge_pass`) | 65-132 s | 300 s |
+| Evaluation judging and repair (`eval_repair.pass_timeout`) | — | 900 s |
 | LLM turn (`llm`) | 130-187 s | 900 s |
 
 H3 rendering is measured from the gateway's worker-start and finish timestamps;
 server queueing and downloading do not consume its 150 seconds. Queue and render
 usage accumulate across backend retries. Download retries share one transfer
-deadline. A final subprocess guard is the sum of these budgets plus 60 seconds
-for control operations: **930 seconds** with the defaults. Both launcher previews
+deadline, with a separate transport repair allowance. A final subprocess guard is
+the sum of the three phase budgets, repair allowance, and 60 seconds for control
+operations: **1,230 seconds** with the defaults. Both launcher previews
 print the resolved phase budgets and process limit. Set
-`video_rl.h3_phase_timeouts=null` to reproduce the old combined `timeouts.h3`
-deadline. The inspection preset has no separate H3 timeout settings.
+`video_rl.h3_phase_timeouts=null` and `video_rl.h3_transport_repair_seconds=0`
+to reproduce the old combined `timeouts.h3` deadline. The inspection preset has
+no separate H3 timeout settings.
 
 On a gateway whose health response advertises `idempotency_key: true`, the client
 persists a caller UUID before submitting it as `Idempotency-Key`. An uncertain response is retried
@@ -213,6 +221,15 @@ and `Retry-After`. Poll and download retries keep the original job. Downloaded
 gateway artifacts must match `video_sha256` and `video_bytes` before any MP4
 remuxing; both the original and final local checksums are retained. Authentication,
 invalid inputs, conflicting IDs, and persistent artifact corruption remain fatal.
+
+After the short request retry budget is exhausted, transport repair checks the
+same gateway route and retries with a staggered backoff. Unknown submissions are
+looked up by their saved caller UUID before replaying a POST with that same UUID.
+Polling and downloads retain the accepted job; a fully downloaded file whose size
+and checksum match the gateway is reused. The first repair establishes one saved
+300-second window shared across operations and subprocess restarts. It cannot
+extend the original worker deadline or relax queue/render limits. Set
+`video_rl.h3_transport_repair_seconds=0` to disable this extended repair.
 
 `video_rl.h3_max_generation_attempts` defaults to 2. Only a confirmed terminal
 `worker_restarted`, `inference_failed`, `storage_failure`, or `worker_lost` permits
@@ -239,7 +256,7 @@ response tokens divided by ~15 tokens/s (r = 0.997 in job 2391), so
 limit would drop the policy's own long outputs, which are invalid calls that must
 be scored. To shorten the LLM tail, lower `max_response_length` instead.
 
-`video_rl.judge_max_attempts` (default 3) permits an initial Gemini judgment request
+For training, `video_rl.judge_max_attempts` (default 3) permits an initial Gemini judgment request
 plus two retries for 408/429/500/502/503/504 and network failures, including
 response read timeouts. HTTP and network failures share one judgment retry budget;
 the adapter adds no outer retry loop. The evaluator uses exponential backoff with jitter
@@ -247,6 +264,31 @@ and honors `Retry-After`, while the 300-second presentation-order deadline still
 bounds the subprocess and is not reset by retries. A timed-out interaction may
 already have completed remotely, so its retry can incur a duplicate Gemini charge.
 Retrying a judgment does not regenerate or re-upload its H3 videos.
+
+Evaluation enables `video_rl.eval_repair.enabled` by default, with a 180-second
+interaction timeout and a 900-second final judging window. It uses the streaming
+judge even when training streaming is disabled. Each comparison has a durable
+attempt count, and each runner invocation gets one attempt: the scheduler's total
+of `judge_max_attempts` is not multiplied by an inner HTTP retry loop. A failed
+comparison does not cancel the other references or presentation orders. Successful
+votes are immutable; only transient missing votes are retried using the same
+videos, source image, model, rubric, and order. Content refusals are not retried,
+and auth/configuration or identity errors remain explicit errors. Invalid policy
+calls keep their existing score.
+
+`judge/stream/repair.json` records attempts, completion, and the original deadline;
+`repair-identity.json` binds recovery to the saved inputs. Repair completes before
+native validation publishes rewards, summaries, and best-checkpoint metrics. If
+the budget expires, coverage reports still exclude unscorable prompts and apply
+the existing per-task coverage threshold; evaluation never invents neutral votes.
+
+On a Gemini Files storage-quota error, a run-shared admission gate pauses new
+uploads while existing readers finish. Each affected prompt can then release its
+own uploads and retry one capacity probe before admitting more uploads. Other
+processes' uploads are never deleted. Failed upload-cache entries are cleared for
+repair; successful uploads remain shared across timeout retries. Cleanup uses the
+existing ownership journal, including files whose processing failed. Neither this
+gate nor evaluation repair changes training judge concurrency or fallback limits.
 
 `video_rl.judge_concurrency` defaults to 100 for both `rl` and `inspection_rl`.
 Available pairs further limit concurrency within each presentation order. The adapter splits
@@ -268,8 +310,8 @@ request attempts, and neutral fallback coverage checks. No reward is published
 until every rollout and comparison settles. The `judge_pass` deadline bounds the
 remaining work after the final rollout arrives; waiting for an H3 sibling does
 not spend that deadline. Cancellation or a failed H3 sibling reaps the evaluator
-without publishing partial rewards. A killed evaluator can leave remote Gemini
-files for provider expiry, as with a timed-out nonstreaming pass.
+without publishing partial rewards. The parent reaps a killed evaluator's recorded
+uploads after it exits. Unconfirmed deletions remain in the ownership journal.
 
 Streamed pairs keep their own immutable manifests and real/fallback ledgers under
 `judge/stream/pairs/`; `judge/stream-index.json` maps the final group to those

@@ -94,6 +94,17 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         or not 0 <= fraction <= 1
     ):
         raise ValueError("video_rl.max_judge_fallback_fraction must be between 0 and 1")
+    repair = dict(settings.get("eval_repair") or {"enabled": False})
+    if type(repair.get("enabled")) is not bool:
+        raise ValueError("video_rl.eval_repair.enabled must be boolean")
+    if repair["enabled"]:
+        for name in ("request_timeout", "pass_timeout"):
+            value = repair.get(name)
+            if isinstance(value, bool) or not isinstance(value, int | float) or not isfinite(value) or value <= 0:
+                raise ValueError(f"video_rl.eval_repair.{name} must be finite and positive")
+        if repair["pass_timeout"] <= attempts * repair["request_timeout"] + timeouts["judge_file"]:
+            raise ValueError("Evaluation pass timeout must cover all interaction attempts, uploads and backoff")
+    output = settings.get("output_dir")
     return {
         **protocol,
         **h3.recovery_settings(settings),
@@ -104,6 +115,8 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         "judge_failure_policy": policy,
         "judge_streaming": streaming,
         "eval_groups_per_worker": eval_groups,
+        "eval_repair": repair,
+        **({"provider_recovery_root": str(Path(output) / "provider-recovery")} if output and output != "???" else {}),
         "max_judge_fallback_fraction": fraction,
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
     }
@@ -148,6 +161,7 @@ def generate_video(directory: Path, protocol: dict, request: dict) -> dict:
                         timeout,
                         max_request_attempts=protocol.get("h3_max_request_attempts", 3),
                         max_generation_attempts=protocol.get("h3_max_generation_attempts", 2),
+                        transport_repair_seconds=protocol.get("h3_transport_repair_seconds", 0),
                     ),
                     check=True,
                     timeout=timeout,

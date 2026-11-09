@@ -104,6 +104,8 @@ def read_pair(directory, protocol, manifest, order, *, allow_fallback, timed_out
 def read_streamed_judgments(directory, protocol, manifests, *, allow_fallback):
     """Keep original pair-ledger identities; never rewrite their manifest hashes."""
     outcome = read_json(directory / "judge/stream/outcome.json")
+    repair_path = directory / "judge/stream/repair.json"
+    repair_exhausted = repair_path.exists() and read_json(repair_path).get("exhausted", False)
     judge.freeze_manifests(directory, manifests)
     results, index = {}, {}
     for order, manifest in manifests.items():
@@ -116,7 +118,7 @@ def read_streamed_judgments(directory, protocol, manifests, *, allow_fallback):
                 pair_manifest(manifest, key),
                 order,
                 allow_fallback=allow_fallback,
-                timed_out=outcome["timed_out"],
+                timed_out=outcome["timed_out"] or repair_exhausted,
             )
             if key not in result:
                 raise RuntimeError(f"Streaming runner left {order}/{key} without a result or recorded failure")
@@ -240,6 +242,11 @@ def run_stream(directory, runner):
         image_bytes(sample["image"])
     if validate:
         verify_references([sample])
+        if protocol.get("eval_repair", {}).get("enabled", False):
+            from .eval_recovery import run_evaluation
+
+            with record_fatal(root):
+                return run_evaluation(directory, runner, protocol, sample)
     count = 1 if validate else protocol["group_size"]
     candidates = [{"status": "pending"} for _ in range(count)]
     allow_fallback = not validate and protocol.get("judge_failure_policy") == "neutral"

@@ -108,6 +108,7 @@ def test_prepare_preserves_user_goals_order_generator_and_template(prepared_insp
             {"queue": 300, "generation": 75, "download": 60},
         ),
         (["video_rl.h3_phase_timeouts=null"], None),
+        (["video_rl.h3_phase_timeouts=null", "video_rl.h3_transport_repair_seconds=0"], None),
     ],
 )
 def test_both_entry_points_share_one_h3_configuration(prepared_inspection, overrides, expected):
@@ -128,8 +129,10 @@ def test_both_entry_points_share_one_h3_configuration(prepared_inspection, overr
         config, _ = entry.training_config(args)
         runtime = runtime_protocol(load_protocol(prepared.run_dir / "protocol.json"), config.video_rl)
         assert runtime["h3_phase_timeouts"] == expected
-        assert worker_timeout(runtime, config.video_rl.timeouts.h3) == (
-            sum(expected.values()) + 60 if expected else config.video_rl.timeouts.h3
+        assert (
+            worker_timeout(runtime, config.video_rl.timeouts.h3)
+            == (sum(expected.values()) + 60 if expected else config.video_rl.timeouts.h3)
+            + config.video_rl.h3_transport_repair_seconds
         )
         if entry is inspection_rl:
             assert not {"h3_queue_timeout_seconds", "h3_download_timeout_seconds"} & set(config.inspection_rl)

@@ -254,10 +254,16 @@ def install_judge(monkeypatch, *, winner=CANDIDATE):
                 }
             )
         write_jsonl(output_path, rows)
-        assert check is True and timeout == VIDEO_RL.timeouts.judge_pass
+        request_timeout = float(command[command.index("--request-timeout") + 1])
+        expected_pass = (
+            VIDEO_RL.eval_repair.pass_timeout
+            if request_timeout == VIDEO_RL.eval_repair.request_timeout
+            else VIDEO_RL.timeouts.judge_pass
+        )
+        assert check is True and timeout == expected_pass
         assert stderr == subprocess.STDOUT and Path(stdout.name).name.startswith("runner-")
         assert int(command[command.index("--max-attempts") + 1]) == VIDEO_RL.judge_max_attempts
-        assert float(command[command.index("--request-timeout") + 1]) == VIDEO_RL.timeouts.judge_request
+        assert request_timeout in {VIDEO_RL.timeouts.judge_request, VIDEO_RL.eval_repair.request_timeout}
         assert float(command[command.index("--file-timeout") + 1]) == VIDEO_RL.timeouts.judge_file
         return SimpleNamespace(returncode=0)
 
@@ -524,7 +530,7 @@ def test_gemini_refusals_and_errors_fail_the_example_with_their_reason(
     assert not (group / "rewards.json").exists()
 
 
-@pytest.mark.parametrize("stage,limit", [("h3", 930), ("judge", 300)])
+@pytest.mark.parametrize("stage,limit", [("h3", 1230), ("judge", 300)])
 def test_hard_timeouts_raise_without_neutral_fallbacks(prepared_rl, tmp_path, monkeypatch, stage, limit):
     directory, protocol, _ = prepared_rl
     protocol = {**protocol, "judge_failure_policy": "drop"}
@@ -1002,7 +1008,7 @@ def test_launcher_preview_uses_base_model_and_never_executes(prepared_rl, monkey
     assert summary["judgments_per_training_batch"] == 192
     assert summary["execute"] is False
     assert summary["h3_phase_timeouts"] == {"queue": 600, "generation": 150, "download": 120}
-    assert summary["h3_worker_timeout_seconds"] == 930
+    assert summary["h3_worker_timeout_seconds"] == 1230
     config, _ = rl.training_config(args)
     assert config.data.train_files == str(prepared_args.data_dir / "train.jsonl")
     assert config.data.val_files == str(prepared_args.data_dir / "val.jsonl")
@@ -1400,7 +1406,9 @@ def native_worker(prepared_rl, monkeypatch):
     )
     worker.rollout_config = worker.config.actor_rollout_ref.rollout
     worker.output_dir = directory
-    worker.protocol_path, worker.protocol = directory / "protocol.json", protocol
+    # These dispatch tests replace the judge with a score stub. Real automatic
+    # evaluation repair is exercised separately with the frozen runner.
+    worker.protocol_path, worker.protocol = directory / "protocol.json", {**protocol, "eval_repair": {"enabled": False}}
     worker.samples = {split: {s["id"]: s for s in protocol["samples"][split]} for split in ("train", "val")}
     worker.group_slots = asyncio.Semaphore(2)
     worker.eval_group_slots = asyncio.Semaphore(2)
@@ -1906,7 +1914,7 @@ def test_h3_worker_receives_runtime_limit_and_frozen_protocol_identity(prepared_
     directory, protocol, _ = prepared_rl
     protocol = {**protocol, "h3_max_request_attempts": 5, "h3_max_generation_attempts": 3}
     protocol["h3_phase_timeouts"] = phases
-    expected_timeout = 930 if phases else 150
+    expected_timeout = (930 if phases else 150) + VIDEO_RL.h3_transport_repair_seconds
     calls = []
 
     def run(command, **kwargs):

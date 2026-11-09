@@ -252,10 +252,26 @@ def parallel_pairs(runner, *, keep_uploaded_files=False):
                     uploads[key] = Future()
                 future = uploads[key]
             if owner:
+                admission = getattr(runner, "_verl_upload_admission", None)
+                token = None
                 try:
-                    future.set_result((self, upload(path)))
+                    if admission is not None:
+                        try:
+                            token = admission.acquire()
+                        except TimeoutError as exc:
+                            raise runner.NetworkFailure(str(exc)) from exc
+                    result = upload(path)
+                    if admission is not None:
+                        admission.succeeded(token)
+                    future.set_result((self, result))
                 except BaseException as exc:
-                    future.set_exception(exc)
+                    try:
+                        if admission is not None:
+                            admission.failed(token, exc)
+                    except BaseException as admission_error:
+                        future.set_exception(admission_error)
+                    else:
+                        future.set_exception(exc)
             return future.result()[1]
 
         def delete_file(self, name):
@@ -267,10 +283,32 @@ def parallel_pairs(runner, *, keep_uploaded_files=False):
         return [([pair[1]["prompt_id"]], [pair]) for pair in pairs]
 
     runner.GeminiRestClient, runner.group_into_prompt_batches = SharedUploads, batches
+
+    def reset_uploads(*, failed_only=True):
+        # Caller must join ALL comparison/upload readers before using this hook.
+        with lock:
+            if any(not future.done() for future in uploads.values()):
+                raise RuntimeError("Cannot reset Gemini uploads while an upload is running")
+            discard = [key for key, future in uploads.items() if not failed_only or future.exception() is not None]
+            for key in discard:
+                future = uploads.pop(key)
+                if future.exception() is None:
+                    client, file_object = future.result()
+                    try:
+                        original_client.delete_file(client, file_object["name"])
+                    except runner.EvalError:
+                        print("Warning: Gemini file remains in the cleanup journal.", flush=True)
+            if not failed_only:
+                cleanup = getattr(runner, "_verl_cleanup_uploads", None)
+                if cleanup is not None:
+                    cleanup()
+
+    runner._verl_reset_uploads = reset_uploads
     try:
         yield
     finally:
         runner.GeminiRestClient, runner.group_into_prompt_batches = original_client, original_batches
+        del runner._verl_reset_uploads
         if not keep_uploaded_files:
             for future in uploads.values():
                 if future.done() and future.exception() is None:

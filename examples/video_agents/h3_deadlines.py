@@ -36,7 +36,8 @@ def worker_timeout(protocol, legacy_timeout):
     budgets = phase_budgets(protocol)
     # A final process guard also bounds blocked local I/O and worker startup.
     # It is separate from the generation budget and is not reset by retries.
-    return sum(budgets.values()) + 60 if budgets else legacy_timeout
+    repair = h3.recovery_settings(protocol)["h3_transport_repair_seconds"]
+    return (sum(budgets.values()) + 60 if budgets else legacy_timeout) + repair
 
 
 def timestamp(response, key, *, required=False):
@@ -84,7 +85,7 @@ class PhaseTimedGeneration(h3._Generation):
             elapsed = sum(row[phase] for row in ledger.values())
             if elapsed > self.budgets[phase]:
                 self.state["timeout_phase"] = phase
-                raise TimeoutError(f"H3 {phase} exceeded {self.budgets[phase]}s ({elapsed:.3f}s observed)")
+                raise h3.PhaseDeadlineExceeded(f"H3 {phase} exceeded {self.budgets[phase]}s ({elapsed:.3f}s observed)")
         return response
 
     def download(self, response):
@@ -92,8 +93,14 @@ class PhaseTimedGeneration(h3._Generation):
         self.state["download_deadline_at"] = expires
         self.deadline = min(self.deadline, h3.time.monotonic() + expires - h3.time.time())
         try:
-            self.remaining()
-            return super().download(response)
+            try:
+                self.remaining()
+                return super().download(response)
+            except TimeoutError:
+                if not self.limits["h3_transport_repair_seconds"]:
+                    raise
+                self.repair_remaining()
+                return super().download(response)
         except TimeoutError:
             self.state["timeout_phase"] = "download"
             raise

@@ -68,6 +68,35 @@ def test_parallel_pairs_share_uploads_and_wait_to_delete(tmp_path, fail_upload, 
     assert runner.GeminiRestClient is Client and runner.group_into_prompt_batches is original_batches
 
 
+def test_upload_admission_io_failure_settles_every_shared_reader(tmp_path):
+    class Client:
+        def upload_video(self, path):
+            raise RuntimeError("upload failed")
+
+        def delete_file(self, name):
+            pass
+
+    class Gate:
+        def acquire(self):
+            return None
+
+        def failed(self, token, error):
+            raise OSError("admission state disk failed")
+
+    runner = SimpleNamespace(
+        GeminiRestClient=Client,
+        group_into_prompt_batches=object(),
+        EvalError=RuntimeError,
+        _verl_upload_admission=Gate(),
+    )
+    with judge_worker.parallel_pairs(runner), ThreadPoolExecutor(max_workers=2) as pool:
+        client = runner.GeminiRestClient()
+        futures = [pool.submit(client.upload_video, tmp_path / "shared.mp4") for _ in range(2)]
+        for future in futures:
+            with pytest.raises(OSError, match="admission state disk failed"):
+                future.result(timeout=5)
+
+
 @pytest.mark.parametrize("first,second,expected", [(1, None, 0.75), (0, None, 0.25), (None, None, 0.5)])
 def test_neutral_order_preserves_the_observed_vote(first, second, expected):
     pair = {"model_A": CANDIDATE, "model_B": "reference", "reference": "reference", "prompt_id": "p", "source": "s"}

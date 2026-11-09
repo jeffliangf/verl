@@ -43,9 +43,17 @@ def reference_fields(protocol):
 
 def judging_protocol(protocol, *, validate):
     """Evaluation may use Argon while training retains its original judge settings."""
-    if validate and "eval_judge" in protocol:
-        return {**protocol, "judge": protocol["eval_judge"]}
-    return protocol
+    if not validate:
+        return protocol
+    result = {**protocol, "judge": protocol.get("eval_judge", protocol["judge"])}
+    repair = protocol.get("eval_repair", {})
+    if repair.get("enabled", False):
+        result["timeouts"] = {
+            **protocol["timeouts"],
+            "judge_request": repair["request_timeout"],
+            "judge_pass": repair["pass_timeout"],
+        }
+    return result
 
 
 def build_sft_messages(prompt: str) -> list[dict[str, str]]:
