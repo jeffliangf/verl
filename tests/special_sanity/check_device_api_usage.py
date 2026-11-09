@@ -25,6 +25,7 @@ from pathlib import Path
 # directory or file path must contain keyword ".cuda" or "cuda"
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl/utils/device.py",
+    "verl/utils/checkpoint/reshard_fsdp2.py",  # offline CUDA-mesh metadata, independent of the host device
     "verl/utils/torch_functional.py",  # import flash_attn only on cuda
     "verl/plugin/platform/platform_base.py",  # docstring mentions torch.cuda
     "verl/plugin/platform/platform_cuda.py",  # CUDA platform implementation
