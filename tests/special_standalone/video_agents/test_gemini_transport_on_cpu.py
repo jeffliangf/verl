@@ -251,3 +251,28 @@ def test_real_judgments_protect_training_and_evaluation(
             assert all(row["error"]["error_type"] == "NetworkFailure" for row in fallbacks)
             assert all(reward["judge_fallback_fraction"] == 1 for reward in rewards)
     assert Counter(name for name, _ in server.calls)[operation] > 0
+
+
+def test_failed_processing_uploads_remain_owned_until_all_pairs_settle(
+    local_runner, interrupted_gemini, tmp_path, monkeypatch
+):
+    from examples.video_agents.gemini_files import UploadJournal
+
+    runner, server = local_runner, interrupted_gemini
+    server.remaining = 0
+    video = tmp_path / "test.mp4"
+    video.write_bytes(b"test video")
+
+    def fail_processing(self, file_object):
+        raise runner.NetworkFailure("Processing poll failed after an upload was accepted")
+
+    monkeypatch.setattr(runner.GeminiRestClient, "wait_for_file", fail_processing)
+    journal = UploadJournal(tmp_path / "gemini-files.jsonl")
+    with judge_worker.parallel_pairs(runner):
+        client = runner.GeminiRestClient("fake-key", max_attempts=3, request_timeout=1, file_timeout=5)
+        with pytest.raises(runner.NetworkFailure):
+            client.upload_video(video)
+        assert len(journal.pending()) == 3
+        assert not any(name == "cleanup" for name, _ in server.calls)
+    assert not journal.pending()
+    assert Counter(name for name, _ in server.calls)["cleanup"] == 3

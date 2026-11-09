@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
+from .gemini_files import UploadJournal, valid_name
 from .image_assets import image_bytes
 from .observability import record_event, timed_stage
 from .storage import load_external
@@ -126,8 +127,20 @@ def gemini_address_family(address_family: str):
 def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0):
     """Measure uploads, file processing, interactions, and cleanup independently."""
     interaction = ContextVar("gemini_interaction", default=None)
+    journal = UploadJournal(timings.parent / "gemini-files.jsonl")
+    owners, owners_lock = {}, threading.Lock()
 
     class TimedClient(runner.GeminiRestClient):
+        def _upload_content_once(self, upload_url, path, mime_type):
+            file_object = super()._upload_content_once(upload_url, path, mime_type)
+            name = file_object.get("name")
+            if not valid_name(name):
+                raise runner.EvalError("Uploaded file metadata has no valid resource name")
+            journal.created(name, path)
+            with owners_lock:
+                owners[name] = self
+            return file_object
+
         def request_json(self, method, url, **kwargs):
             # Reuse the uploaded files and the upstream HTTP retry budget. Do
             # not wrap evaluate() in another loop, which would multiply retries.
@@ -194,9 +207,23 @@ def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0)
             with timed_stage(
                 timings, "gemini_file_delete", timeout_seconds=min(self.file_timeout, file_control_timeout)
             ):
-                return super().delete_file(name)
+                result = super().delete_file(name)
+                journal.deleted(name)
+                return result
+
+    def cleanup_uploads():
+        # Include uploads whose polling/retry failed before the shared Future
+        # could return a handle. Per-pair deletion still waits for all readers.
+        for name in journal.pending():
+            client = owners.get(name)
+            if client is not None:
+                try:
+                    TimedClient.delete_file(client, name)
+                except runner.EvalError:
+                    print("Warning: Gemini upload remains in the cleanup journal.", flush=True)
 
     runner.GeminiRestClient = TimedClient
+    runner._verl_cleanup_uploads = cleanup_uploads
 
 
 @contextmanager
@@ -247,6 +274,9 @@ def parallel_pairs(runner, *, keep_uploaded_files=False):
                         original_client.delete_file(client, file_object["name"])
                     except runner.EvalError:
                         print("Warning: Gemini file cleanup failed after the comparisons settled.", flush=True)
+            cleanup = getattr(runner, "_verl_cleanup_uploads", None)
+            if cleanup is not None:
+                cleanup()
 
 
 def parse_options(argv=None):
@@ -271,7 +301,11 @@ def main(argv=None):
         if args.parallel_pairs:
             with parallel_pairs(runner, keep_uploaded_files="--keep-uploaded-files" in forwarded):
                 return runner.main(forwarded)
-        return runner.main(forwarded)
+        try:
+            return runner.main(forwarded)
+        finally:
+            if "--keep-uploaded-files" not in forwarded:
+                runner._verl_cleanup_uploads()
 
 
 if __name__ == "__main__":

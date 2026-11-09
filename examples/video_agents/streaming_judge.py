@@ -28,6 +28,7 @@ from pathlib import Path
 from . import judge
 from .config import judging_protocol
 from .dataset import verify_references
+from .gemini_files import UploadJournal
 from .image_assets import image_bytes
 from .judge_worker import gemini_address_family, instrument_client, parallel_pairs, parse_options, reference_images
 from .observability import ProviderError, record_event, timed_stage
@@ -195,6 +196,34 @@ class StreamingJudge:
             await self.process.wait()
             record_event(
                 self.directory / "judge/timings.jsonl", "gemini_stream", "aborted", cleanup_status="unconfirmed"
+            )
+        # The killed child cannot execute its finally blocks. Reap only its
+        # recorded uploads after it exits; never list or delete another group's files.
+        journal = UploadJournal(self.directory / "judge/gemini-files.jsonl")
+        if journal.pending():
+            cleanup = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "examples.video_agents.gemini_files",
+                str(self.directory),
+                stdout=self.log,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                await asyncio.wait_for(cleanup.wait(), timeout=60)
+            except TimeoutError:
+                cleanup.kill()
+                await cleanup.wait()
+            except BaseException:
+                if cleanup.returncode is None:
+                    cleanup.kill()
+                    await cleanup.wait()
+                raise
+            record_event(
+                self.directory / "judge/timings.jsonl",
+                "gemini_upload_cleanup",
+                "completed" if cleanup.returncode == 0 else "unconfirmed",
+                pending=len(journal.pending()),
             )
         if self.log is not None:
             self.log.close()
