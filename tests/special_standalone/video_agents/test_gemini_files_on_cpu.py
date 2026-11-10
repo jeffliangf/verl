@@ -25,7 +25,7 @@ class HttpFailure(RuntimeError):
         self.status = status
 
 
-@pytest.mark.parametrize("state", ["present", "absent", "transient", "foreign"])
+@pytest.mark.parametrize("state", ["present", "absent", "transient", "foreign", "unserializable"])
 def test_killed_judge_upload_journal_preserves_ownership(tmp_path, state):
     path = tmp_path / "gemini-files.jsonl"
     # Kill a real process: cleanup cannot rely on its Python finally blocks.
@@ -56,7 +56,12 @@ finally:
             parsed = urlsplit(url)
             assert method == "GET" and parsed.scheme == "https" and parsed.netloc == "test.invalid"
             assert parsed.path == "/files/owned"
-            assert {"name", "displayName"} <= set(parse_qs(parsed.query)["fields"][0].split(","))
+            fields = set(parse_qs(parsed.query)["fields"][0].split(","))
+            assert {"name", "displayName"} <= fields
+            # Failed processing metadata can return HTTP 500 even with the
+            # usual status field mask. The resource identity remains readable.
+            if state == "unserializable" and fields != {"name", "displayName"}:
+                raise HttpFailure(500)
             if state == "absent":
                 raise HttpFailure(404)
             if state == "transient":
@@ -73,5 +78,5 @@ finally:
     else:
         result = reap(journal, runner, Client())
         assert result["pending_after"] == (1 if state == "transient" else 0)
-    assert deleted == (["files/owned"] if state == "present" else [])
+    assert deleted == (["files/owned"] if state in {"present", "unserializable"} else [])
     assert bool(journal.pending()) == (state in {"transient", "foreign"})

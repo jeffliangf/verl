@@ -28,15 +28,17 @@ def valid_name(name):
     return isinstance(name, str) and re.fullmatch(r"files/[A-Za-z0-9_-]{1,128}", name) is not None
 
 
-def metadata_url(api_base, name):
+def metadata_url(api_base, name, *, ownership_only=False):
     """Read required status/identity fields without optional media metadata.
 
-    Gemini can fail JSON serialization of optional file metadata. Its documented
-    response field mask still preserves processing errors and ownership checks.
+    Gemini can fail JSON serialization of file metadata. Status polling retains
+    processing errors, while cleanup requests only the ownership fields.
     """
     if not valid_name(name):
         raise ValueError("Invalid Gemini file resource name")
-    fields = "name,displayName,uri,mimeType,state,error"
+    # Extra metadata on failed uploads can still break server-side JSON
+    # serialization even when optional video metadata is already excluded.
+    fields = "name,displayName" if ownership_only else "name,displayName,uri,mimeType,state,error"
     return api_base + "/" + name + "?" + urlencode({"fields": fields})
 
 
@@ -89,7 +91,10 @@ def reap(journal, runner, client, *, limits=None):
         name, display = item
         try:
             remote, _ = client.request_json(
-                "GET", metadata_url(runner.API_BASE, name), retry_network=True, context="Verify owned upload cleanup"
+                "GET",
+                metadata_url(runner.API_BASE, name, ownership_only=True),
+                retry_network=True,
+                context="Verify owned upload cleanup",
             )
         except runner.HttpFailure as exc:
             if exc.status != 404:
