@@ -125,6 +125,7 @@ def test_neutral_order_preserves_the_observed_vote(first, second, expected):
         ("FileProcessingFailure", "video not ACTIVE", "provider_failure"),
         ("HttpFailure", "HTTP 503: unavailable", "provider_failure"),
         ("HttpFailure", 'HTTP 400: {"error":{"code":"prohibited_content"}}', "content_refusal"),
+        ("HttpFailure", 'HTTP 400: {"error":{"code":"content_blocked"}}', "content_refusal"),
         (
             "HttpFailure",
             'HTTP 400: {"error":{"message":"Request contains an invalid argument.","code":"invalid_request"}}',
@@ -133,7 +134,10 @@ def test_neutral_order_preserves_the_observed_vote(first, second, expected):
         ("EvalError", "Gemini output is not valid JSON", "invalid_judge_response"),
         ("HttpFailure", "HTTP 401: unauthorized", None),
         ("HttpFailure", "HTTP 403: permission denied", None),
+        ("HttpFailure", 'HTTP 403: {"error":{"code":"content_blocked"}}', None),
         ("HttpFailure", "HTTP 400: invalid argument", None),
+        ("HttpFailure", 'HTTP 400: {"error":{"message":"content_blocked"}}', None),
+        ("HttpFailure", 'HTTP 400: {"error":{"code":["content_blocked"]}}', None),
         ("HttpFailure", 'HTTP 400: {"error":{"code":"invalid_request","message":"Unknown field: typo"}}', None),
         ("OSError", "missing local video", None),
         ("UnknownError", "programming error", None),

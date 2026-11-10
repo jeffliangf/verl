@@ -1982,6 +1982,7 @@ def test_h3_fatal_errors_cannot_be_hidden_by_unknown_submission_status(prepared_
     [
         ("NetworkFailure", "Network request failed: The read operation timed out", "provider_failure"),
         ("HttpFailure", 'HTTP 400: {"error":{"code":"prohibited_content"}}', "content_refusal"),
+        ("HttpFailure", 'HTTP 400: {"error":{"code":"content_blocked"}}', "content_refusal"),
         (
             "HttpFailure",
             'HTTP 400: {"error":{"message":"Request contains an invalid argument.","code":"invalid_request"}}',
@@ -2132,7 +2133,7 @@ def test_fallback_fraction_limit_is_validated(prepared_rl, value):
         tournament.runtime_protocol(prepared_rl[1], settings)
 
 
-@pytest.mark.parametrize("failure", [None, "network", "auth"])
+@pytest.mark.parametrize("failure", [None, "network", "content_blocked", "auth"])
 def test_streaming_uploads_and_both_orders_start_before_last_video(prepared_rl, tmp_path, monkeypatch, failure):
     from examples.video_agents import judge_worker, streaming_judge
     from examples.video_agents.config import DEFAULT_EVAL_REPO
@@ -2167,9 +2168,17 @@ def test_streaming_uploads_and_both_orders_start_before_last_video(prepared_rl, 
             if set(paths) == {"candidate-0.mp4", "candidate-1.mp4"}:
                 both_orders.wait(timeout=10)
                 first_pair.set()
-                if paths[0] == "candidate-0.mp4" and failure:
+                failed_first = "candidate-1.mp4" if failure == "content_blocked" else "candidate-0.mp4"
+                if paths[0] == failed_first and failure:
                     if failure == "auth":
                         raise runner.HttpFailure(401, "HTTP 401: unauthorized", {})
+                    if failure == "content_blocked":
+                        raise runner.HttpFailure(
+                            400,
+                            '{"error":{"message":"Input blocked: This request was blocked by Gemini\'s filters.",'
+                            '"code":"content_blocked"}}',
+                            {},
+                        )
                     raise runner.NetworkFailure("read timed out")
             return {
                 "preferred_video": "A" if paths[0] < paths[1] else "B",
@@ -2206,10 +2215,27 @@ def test_streaming_uploads_and_both_orders_start_before_last_video(prepared_rl, 
     write_json(session.root / "outcome.json", {"timed_out": False})
     manifests = tournament.tournament_manifests(sample, clips, protocol)
     expected = votes(manifests)
-    if failure == "network":
-        expected["original"]["0_vs_1"] = {"status": "fallback", "fallback_policy": "neutral-v1", "fallback_score": 0.5}
+    if failure in {"network", "content_blocked"}:
+        order = "swapped" if failure == "content_blocked" else "original"
+        expected[order]["0_vs_1"] = {"status": "fallback", "fallback_policy": "neutral-v1", "fallback_score": 0.5}
+        pair_directory = streaming_judge.pair_directory(group, "0_vs_1")
+        fallback_path = pair_directory / "judge" / f"fallbacks-{order}.json"
+        fallback = read_json(fallback_path)
+        assert len(fallback) == 1
+        assert fallback[0]["fallback_reason"] == (
+            "content_refusal" if failure == "content_blocked" else "provider_failure"
+        )
+        # A failed prior attempt can leave just the error ledger. Reclassify it
+        # on resume without making another provider request for that pair.
+        fallback_path.unlink()
+        cached = streaming_judge.read_streamed_judgments(group, protocol, manifests, allow_fallback=True)
+        assert cached[order]["0_vs_1"]["fallback_reason"] == fallback[0]["fallback_reason"]
+        assert len(comparisons) == 42
     rewards = tournament.score_group(group, protocol, sample, clips, validate=False, streamed=True)
     assert rewards == tournament.tournament_rewards(clips, manifests, expected)
+    fallback_count = int(failure in {"network", "content_blocked"})
+    assert all(r["judge_fallback_comparisons"] == fallback_count for r in rewards)
+    assert all(r["judge_completed_comparisons"] == 42 - fallback_count for r in rewards)
     assert tournament.score_group(group, protocol, sample, clips, validate=False, streamed=True) == rewards
     # Changing the complete group's pair identity cannot reuse an early vote.
     changed = copy.deepcopy(manifests)

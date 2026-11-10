@@ -226,7 +226,7 @@ def fallback_reason(row: dict) -> str:
             if status == 400:
                 try:
                     error = json.loads(detail).get("error", {})
-                    if isinstance(error, dict) and error.get("code") == "prohibited_content":
+                    if isinstance(error, dict) and error.get("code") in ("prohibited_content", "content_blocked"):
                         return "content_refusal"
                     # Individual interactions can fail with this generic response
                     # while the other comparisons of the same videos succeed.
