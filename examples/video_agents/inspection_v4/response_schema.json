@@ -1,0 +1,127 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "inspection-evidence-v1"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "unassessable"
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Unique finding identifier within this response."
+          },
+          "dimension": {
+            "type": "string",
+            "enum": [
+              "prompt_alignment",
+              "camera",
+              "anatomy",
+              "temporal_consistency",
+              "motion",
+              "physics",
+              "aesthetics",
+              "audio"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The concrete observed problem; no comparisons or speculative causes."
+          },
+          "start_s": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Approximate start in seconds; null together with end_s when localization is unsupported."
+          },
+          "end_s": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Approximate end in seconds, at or after start_s and within the clip; otherwise null together with start_s."
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "medium",
+              "high"
+            ],
+            "description": "Strength of evidence for this observation, not severity or a calibrated probability."
+          },
+          "impact": {
+            "type": "string",
+            "minLength": 1,
+            "description": "How the problem affects this dimension or the requested result."
+          },
+          "repair_goal": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Desired corrected behavior, not a full rewrite, speculative cause or guaranteed prompt fix."
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "minor",
+              "major",
+              "critical"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "dimension",
+          "description",
+          "start_s",
+          "end_s",
+          "confidence",
+          "impact",
+          "repair_goal",
+          "severity"
+        ]
+      }
+    },
+    "assessed_dimensions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "prompt_alignment",
+          "camera",
+          "anatomy",
+          "temporal_consistency",
+          "motion",
+          "physics",
+          "aesthetics",
+          "audio"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "status",
+    "findings",
+    "assessed_dimensions"
+  ]
+}

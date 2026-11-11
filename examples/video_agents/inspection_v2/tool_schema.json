@@ -1,0 +1,17 @@
+{
+  "type": "function",
+  "function": {
+    "name": "inspect_video",
+    "description": "Inspect one generated video and its audio. Return eight categorical dimension ratings (good, fair, bad or n/a) and grounded findings with repair goals. Scoring, acceptance and regeneration decisions are downstream responsibilities.",
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "video_path": {"type": "string", "minLength": 1, "description": "Local path to the actual generated video, including its audio. Supply the intended 768p artifact; this tool does not select or resize videos."},
+        "original_request": {"type": "string", "minLength": 1, "description": "The original user video request, preserved unchanged."},
+        "generation_prompt": {"type": "string", "minLength": 1, "description": "The exact rewritten prompt actually used to generate this video."}
+      },
+      "required": ["video_path", "original_request", "generation_prompt"]
+    }
+  }
+}

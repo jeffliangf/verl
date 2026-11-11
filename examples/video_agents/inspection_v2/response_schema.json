@@ -1,0 +1,104 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["inspection-v2"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "unassessable"],
+      "description": "ok means at least one dimension was rated good, fair or bad, not that the video passes. unassessable requires all dimensions n/a and no findings. Other dimensions may be n/a in a partial assessment."
+    },
+    "dimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "good: convincing execution with no meaningful problem; fair: observed limited weakness, main requirement largely works; bad: severe clearly observable failure; n/a: no relevant requirement/content or insufficient evidence to judge. n/a is ungraded. Apply the dimension-specific anchors in the system instruction.",
+      "properties": {
+        "prompt_alignment": {
+          "type": "string",
+          "enum": ["good", "fair", "bad", "n/a"],
+          "description": "Original-request requirements: subjects, attributes, relationships, core action and outcome, required text and lines, shot order and requested style. Optional rewrite embellishments are not mandatory."
+        },
+        "camera": {
+          "type": "string",
+          "enum": ["good", "fair", "bad", "n/a"],
+          "description": "Requested shot and camera move, keeping the action in frame, and stable, purposeful framing and movement appropriate to the intended style."
+        },
+        "anatomy": {
+          "type": "string",
+          "enum": ["good", "fair", "bad", "n/a"],
+          "description": "Coherent shapes of bodies, faces, hands, animals and props at each visible moment, respecting intentional stylized proportions."
+        },
+        "temporal_consistency": {
+          "type": "string",
+          "enum": ["good", "fair", "bad", "n/a"],
+          "description": "Identity, object and scene stability over time, through occlusions and across relevant shot transitions."
+        },
+        "motion": {
+          "type": "string",
+          "enum": ["good", "fair", "bad", "n/a"],
+          "description": "Natural, fluid, coordinated and complete action with appropriate energy and pacing; unintended freezing, stiffness, jerks or loops. Respect requested stop motion and completed-action holds."
+        },
+        "physics": {
+          "type": "string",
+          "enum": ["good", "fair", "bad", "n/a"],
+          "description": "Visible contact, weight, support, collisions, gravity, fluids, cloth dynamics and causality under the intended physical rules; internally consistent stylized physics is acceptable."
+        },
+        "aesthetics": {
+          "type": "string",
+          "enum": ["good", "fair", "bad", "n/a"],
+          "description": "Lighting, exposure, materials, color, detail, rendering quality and polish within the intended style; judge both successful presentation and visible rendering flaws."
+        },
+        "audio": {
+          "type": "string",
+          "enum": ["good", "fair", "bad", "n/a"],
+          "description": "Clean sound, suitable music, clear speech, effects synchronized to events and relevant lip sync. Genuine absence of required sound is a problem; irrelevant or insufficiently assessable audio is n/a."
+        }
+      },
+      "required": [
+        "prompt_alignment",
+        "camera",
+        "anatomy",
+        "temporal_consistency",
+        "motion",
+        "physics",
+        "aesthetics",
+        "audio"
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "description": "Concise observed weaknesses. Every fair/bad dimension requires a supporting finding; bad requires high-confidence support. No findings for good or n/a dimensions.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "description": "Unique finding identifier within this response."},
+          "dimension": {
+            "type": "string",
+            "enum": [
+              "prompt_alignment",
+              "camera",
+              "anatomy",
+              "temporal_consistency",
+              "motion",
+              "physics",
+              "aesthetics",
+              "audio"
+            ]
+          },
+          "description": {"type": "string", "minLength": 1, "description": "The concrete observed problem; no comparisons or speculative causes."},
+          "start_s": {"type": ["number", "null"], "minimum": 0, "description": "Approximate start in seconds; null together with end_s when localization is unsupported."},
+          "end_s": {"type": ["number", "null"], "minimum": 0, "description": "Approximate end in seconds, at or after start_s and within the clip; otherwise null together with start_s."},
+          "confidence": {"type": "string", "enum": ["medium", "high"], "description": "Strength of evidence for this observation, not severity or a calibrated probability."},
+          "impact": {"type": "string", "minLength": 1, "description": "How the problem affects this dimension or the requested result."},
+          "repair_goal": {"type": "string", "minLength": 1, "description": "Desired corrected behavior, not a full rewrite, speculative cause or guaranteed prompt fix."}
+        },
+        "required": ["id", "dimension", "description", "start_s", "end_s", "confidence", "impact", "repair_goal"]
+      }
+    }
+  },
+  "required": ["schema_version", "status", "dimensions", "findings"]
+}
