@@ -24,6 +24,11 @@ def video_features(first_record):
         raise ValueError("Mixed video records require an images list, including [] for T2V")
     features = datasets.Features.from_arrow_schema(pa.Table.from_pylist([first_record]).schema)
     features["images"] = datasets.List({"image": datasets.Value("string"), "max_pixels": datasets.Value("int64")})
+    if "tools" in first_record:
+        # Rows with several tools (inspection RL) have different parameter schemas. An inferred
+        # Arrow struct would merge their properties and add nulls to every tool, so store each
+        # tool as JSON, as the default JSON loader does for parameters.
+        features["tools"] = datasets.List(datasets.Json())
     return features
 
 
