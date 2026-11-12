@@ -51,6 +51,17 @@ from .tournament import GROUP_SIZE, load_protocol, runtime_protocol, validate_gr
 CONFIG_DIR = Path(__file__).with_name("configs")
 DEFAULT_DATA_DIR = ROOT / "data/prompt_rewrite_rl"
 GENERATION_INSTRUCTION = Path(__file__).with_name("generation_instruction.txt").read_text().strip()
+# One complete batch of lookahead on the shared GPUs (see async_lookahead.rst).
+# The inspection launcher uses the same settings.
+LOOKAHEAD_OVERRIDES = (
+    "video_rl.async_lookahead=true",
+    "video_rl.judge_streaming=true",
+    "video_rl.judge_background_cleanup=true",
+    "trainer.v1.trainer_mode=colocate_async",
+    "trainer.v1.trainer_class=examples.video_agents.cohort_trainer.VideoCohortTrainer",
+    "algorithm.rollout_correction.rollout_is=token",
+    "algorithm.rollout_correction.bypass_mode=false",
+)
 
 
 def local_path(value) -> Path:
@@ -267,19 +278,7 @@ def training_config(args):
             if evaluation
             else []
         ),
-        *(
-            [
-                "video_rl.async_lookahead=true",
-                "video_rl.judge_streaming=true",
-                "video_rl.judge_background_cleanup=true",
-                "trainer.v1.trainer_mode=colocate_async",
-                "trainer.v1.trainer_class=examples.video_agents.cohort_trainer.VideoCohortTrainer",
-                "algorithm.rollout_correction.rollout_is=token",
-                "algorithm.rollout_correction.bypass_mode=false",
-            ]
-            if getattr(args, "async_lookahead", False)
-            else []
-        ),
+        *(LOOKAHEAD_OVERRIDES if getattr(args, "async_lookahead", False) else ()),
         *args.overrides,
     ]
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):

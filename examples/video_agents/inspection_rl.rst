@@ -105,6 +105,27 @@ settings, source datasets, and evaluation references. Three-day allocation,
 checkpoint storage, retention, monitoring, and recovery belong to the experiment's
 launch files; they are not part of the policy's tool interface.
 
+One batch of lookahead
+----------------------
+
+``inspection_rl.py train --async-lookahead`` uses the same video cohort trainer
+and settings as ``rl.py train --async-lookahead`` (see ``async_lookahead.rst``).
+The contract is unchanged: each update consumes one complete batch, and every
+episode comes from one policy version, at most one update old. An inspection
+episode calls the policy up to three times, so the next batch's first renders and
+inspections finish before the current update; only its second renders and judging
+overlap the update.
+
+Each lookahead turn is cached under ``train/groups/<group>/policy/<sibling>/turn-<k>``
+with its behavior log probabilities and version. ``policy/<sibling>/response.json``
+marks the episode's policy work complete. It is written before ``finish_video`` or
+the second ``sol_h3`` executes, or when the episode ends otherwise. Episode files
+live in ``train/groups/<group>/episodes/<sibling>``, and each inspection outcome,
+including a fallback, is saved in ``inspection/outcome.json``. After a restart the
+checkpointed batch replays its cached turns, resumes renders by idempotency key and
+reuses saved inspection outcomes, so its observations are unchanged. Missing or
+changed caches fail closed. Synchronous runs keep their existing layout.
+
 Compatibility with video-only RL
 --------------------------------
 

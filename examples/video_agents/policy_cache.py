@@ -8,7 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Durable complete policy responses, before H3 work or a learner update."""
+"""Durable complete policy responses (one turn or a whole episode), before H3 work or a learner update."""
 
 import math
 from pathlib import Path
@@ -60,3 +60,46 @@ class PolicyCache:
             write_json(path, {"request_sha256": fingerprint(identity), "output": value, "sha256": fingerprint(value)})
         validate_response(output, self.version)
         return output
+
+
+class EpisodePolicy:
+    """Durable turns of a multi-turn episode, all from one behavior version.
+
+    Each policy turn is a ``PolicyCache`` under ``turn-<k>``. ``response.json`` in
+    this directory marks the episode's policy work complete, as a single cached
+    response does for the terminal H3 loop, so the cohort trainer can drain,
+    checkpoint and replay inspection episodes under the same contract.
+    """
+
+    def __init__(self, directory, version, identity, *, required=False):
+        self.directory, self.version = Path(directory), int(version)
+        self.identity, self.required = identity, required
+        self.turns, self.completed = 0, False
+
+    async def generate(self, client, request):
+        if self.completed:
+            raise RuntimeError("A completed episode policy cannot generate another turn")
+        cache = PolicyCache(
+            self.directory / f"turn-{self.turns}",
+            self.version,
+            {**self.identity, "turn": self.turns},
+            required=self.required,
+        )
+        output = await cache.generate(client, request)
+        self.turns += 1
+        return output
+
+    def complete(self, last_action):
+        """Call once no further policy turn can follow; replays must reach the same point."""
+        if self.completed:
+            return
+        freeze_json(
+            self.directory / "response.json",
+            {
+                "policy_version": self.version,
+                "turns": self.turns,
+                "last_action": last_action,
+                "identity_sha256": fingerprint(self.identity),
+            },
+        )
+        self.completed = True

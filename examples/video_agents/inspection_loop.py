@@ -31,7 +31,8 @@ from .inspection_episode import InspectionEpisode
 from .inspection_worker import inspect_video
 from .mixed_data import original_request
 from .observability import ProviderError, timed_stage
-from .storage import read_jsonl, write_json
+from .policy_cache import EpisodePolicy
+from .storage import read_json, read_jsonl, write_json
 from .tournament import generate_video, load_protocol, runtime_protocol
 
 _PROTOCOLS = {}
@@ -69,6 +70,32 @@ def recorded_messages(messages, source_image):
     ]
 
 
+async def replayed_inspection(directory, identity, call, *, required=False):
+    """Persist a lookahead episode's inspection outcome; replays must observe the same result.
+
+    Later policy turns are cached against the exact observation, so a resumed
+    episode reuses the saved report (or failure) instead of asking Gemini again.
+    """
+    path = Path(directory) / "outcome.json"
+    if path.exists():
+        saved = read_json(path)
+        if saved["identity"] != identity:
+            raise ValueError(f"Saved inspection outcome belongs to another video or request: {path}")
+        if saved["status"] == "failed":
+            raise ProviderError("inspection", saved["error"])
+        return saved["report"]
+    if required:
+        raise RuntimeError(f"Checkpointed inspection outcome is missing: {path}")
+    try:
+        report = await call()
+    except ProviderError as exc:
+        if exc.stage == "inspection":
+            write_json(path, {"identity": identity, "status": "failed", "error": str(exc)})
+        raise
+    write_json(path, {"identity": identity, "status": "succeeded", "report": report})
+    return report
+
+
 class InspectionActionTool(BaseTool):
     """Register actual native actions; state belongs to AgentData, never a shared tool."""
 
@@ -89,10 +116,16 @@ class InspectionLoop(ToolAgentLoop):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stop_reason = None
+        self.policy = None
         client = self.server_manager
 
         async def generate(**request):
-            output = await client.generate(**request)
+            # Lookahead cohorts cache every turn from one behavior version.
+            output = (
+                await self.policy.generate(client, request)
+                if self.policy is not None
+                else await client.generate(**request)
+            )
             self.stop_reason = output.stop_reason
             if output.stop_reason not in {"completed", "length"} or not output.token_ids:
                 raise ProviderError("llm", f"LLM request did not complete: {output.stop_reason}")
@@ -142,6 +175,12 @@ class InspectionLoop(ToolAgentLoop):
         except (ValueError, TypeError, KeyError, ValidationError) as exc:
             self.episode.invalid(str(exc))
             return AgentState.TERMINATED
+        if self.policy is not None and (
+            call.name == "finish_video" or (call.name == "sol_h3" and self.episode.generation_calls == 1)
+        ):
+            # Both actions end the episode. Mark its policy work complete first so a
+            # second render and the judging can overlap the next learner update.
+            self.policy.complete(call.name)
         # Keep the native token merger and zero masks for observations. Override
         # only dispatch below so unhandled service errors propagate and JSON is not cut.
         state = await super()._handle_processing_tools_state(agent_data)
@@ -181,6 +220,24 @@ class InspectionLoop(ToolAgentLoop):
         image_kwargs = {"source_image": source_image} if source_image else {}
         output_dir = Path(self.config.video_rl.output_dir)
         directory = output_dir / "episodes" / uuid4().hex
+        if "cohort_step" in kwargs:
+            # A lookahead episode may resume after a restart. Keep its artifacts in
+            # its group's durable directory so renders and inspections are reused.
+            group = Path(kwargs["_video_timings"]).parent
+            session = int(kwargs["session_id"])
+            directory = group / "episodes" / str(session)
+            self.policy = EpisodePolicy(
+                group / "policy" / str(session),
+                kwargs["behavior_version"],
+                {
+                    "uid": kwargs["uid"],
+                    "session": session,
+                    "protocol": self.protocol["protocol_sha256"],
+                    "sample": info,
+                    "tools": schemas,
+                },
+                required=kwargs.get("require_cached_policy", False),
+            )
 
         async def generate(request, directory):
             def work():
@@ -193,8 +250,8 @@ class InspectionLoop(ToolAgentLoop):
                 self.episode.save()
 
         async def inspect(video, original_request, directory):
-            try:
-                return await asyncio.to_thread(
+            def call():
+                return asyncio.to_thread(
                     inspect_video,
                     video,
                     original_request,
@@ -204,6 +261,12 @@ class InspectionLoop(ToolAgentLoop):
                     output_dir,
                     **image_kwargs,
                 )
+
+            try:
+                if self.policy is None:
+                    return await call()
+                identity = {"video": video, "original_request": original_request}
+                return await replayed_inspection(directory, identity, call, required=self.policy.required)
             finally:
                 self.episode.save()
 
@@ -212,6 +275,9 @@ class InspectionLoop(ToolAgentLoop):
         output = await super().run(sampling_params, **kwargs)
         if self.episode.final_result is None:
             self.episode.invalid("Episode ended without a final video")
+        if self.policy is not None:
+            # Invalid actions, length stops and inspection fallbacks end here.
+            self.policy.complete(self.episode.terminal_reason)
         output.extra_fields["h3_result"] = self.episode.final_result
         summary = self.episode.summary()
         summary.update(

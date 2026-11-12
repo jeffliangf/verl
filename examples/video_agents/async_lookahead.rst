@@ -49,6 +49,9 @@ for complete lookahead responses can add latency when policy generation is
 the bottleneck. This is a bounded scheduling change, not a measured throughput
 guarantee or a separate rollout GPU pool.
 
+Multi-turn inspection episodes (``inspection_rl.py train --async-lookahead``) keep
+this contract by caching every policy turn; see ``inspection_rl.rst``.
+
 Checkpoint and crash recovery
 -----------------------------
 

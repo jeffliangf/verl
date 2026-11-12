@@ -134,16 +134,23 @@ def training_config(args):
         f"trainer.rollout_data_dir={json.dumps(str(directory / 'rollouts'))}",
         f"trainer.validation_data_dir={json.dumps(str(directory / 'validation'))}",
         *rl.sample_overrides(protocol),
+        *(rl.LOOKAHEAD_OVERRIDES if getattr(args, "async_lookahead", False) else ()),
         *args.overrides,
     ]
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
         config = compose(config_name="rl", overrides=overrides)
     rl.check_sample_settings(protocol, config)
     runtime_protocol(protocol, config.video_rl)
+    if config.video_rl.async_lookahead:
+        from .cohort_config import validate_config
+
+        # r3's contract: every episode comes from one behavior version, one update old at most.
+        validate_config(config)
+    elif config.trainer.v1.trainer_mode != "sync" or config.trainer.v1.trainer_class is not None:
+        raise ValueError("Use --async-lookahead for the video cohort trainer, or keep synchronous V1")
     rollout = config.actor_rollout_ref.rollout
     if (
         not config.trainer.use_v1
-        or config.trainer.v1.trainer_mode != "sync"
         or config.algorithm.adv_estimator != "grpo"
         or rollout.n != protocol["group_size"]
         or rollout.val_kwargs.n != 1
@@ -152,7 +159,7 @@ def training_config(args):
         or config.reward.reward_model.enable
         or config.distillation.enabled
     ):
-        raise ValueError("Keep native synchronous GRPO, the inspection loop, and original quality rewards")
+        raise ValueError("Keep native V1 GRPO, the inspection loop, and original quality rewards")
     multi = rollout.multi_turn
     if (
         not multi.enable
@@ -220,6 +227,7 @@ def train(args):
         "h3_worker_timeout_seconds": worker_timeout(config.video_rl, config.video_rl.timeouts.h3),
         "inspection_timeout_seconds": config.inspection_rl.timeout_seconds,
         "inspection_failure_policy": "finish with the inspected video",
+        "async_lookahead": bool(config.video_rl.async_lookahead),
         "reward": frozen["reward"],
         "context": {
             "prompt": config.data.max_prompt_length,
@@ -255,6 +263,9 @@ def parse_args(argv=None):
         else:
             child.add_argument("--execute", action="store_true")
             child.add_argument("--check-tokens", action="store_true")
+            child.add_argument(
+                "--async-lookahead", action="store_true", help="Prefetch one complete policy batch, as rl.py does"
+            )
             child.add_argument("overrides", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if getattr(args, "overrides", None) and args.overrides[0] == "--":
