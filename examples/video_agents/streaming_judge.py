@@ -128,6 +128,22 @@ def read_streamed_judgments(directory, protocol, manifests, *, allow_fallback):
     return results
 
 
+def kill_if_running(process):
+    """Kill a child that is still running; return False if it had already exited.
+
+    A blocked event loop can notice a child's exit only after a wait deadline has
+    fired. uvloop then raises ProcessLookupError from kill(), so check first and
+    treat that error as the same already-exited outcome.
+    """
+    if process.returncode is not None:
+        return False
+    try:
+        process.kill()
+    except ProcessLookupError:
+        return False
+    return True
+
+
 class StreamingJudge:
     """Async parent: publish arrivals, bound the final pass, and reap on cancellation."""
 
@@ -179,8 +195,8 @@ class StreamingJudge:
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=timeout)
             except TimeoutError:
-                timed_out = True
-                self.process.kill()
+                # A child that exited on its own is judged by its exit status, not as a timeout.
+                timed_out = kill_if_running(self.process)
                 await self.process.wait()
             if (self.root / "fatal.json").exists():
                 failure = read_json(self.root / "fatal.json")
@@ -229,7 +245,7 @@ class StreamingJudge:
             try:
                 await asyncio.wait_for(cleanup.wait(), timeout=60)
             except TimeoutError:
-                cleanup.kill()
+                kill_if_running(cleanup)
                 await cleanup.wait()
             except BaseException:
                 if cleanup.returncode is None:
