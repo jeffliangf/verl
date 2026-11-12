@@ -531,6 +531,21 @@ class Qwen3_5CausalLMOutputForPPO(Qwen3_5CausalLMOutputWithPast):
     entropy: Optional[torch.FloatTensor] = None
 
 
+def _full_vocab_weights(weight: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Gather a sharded ``lm_head.weight`` on the device of the hidden states.
+
+    The fused heads read the weight without calling ``lm_head``, so FSDP2 never runs
+    that module's unshard hook. Under ``CPUOffloadPolicy`` (always used for the
+    reference model) the local shard therefore stays on CPU. Copy the shard to the
+    compute device before the all-gather instead of gathering on CPU.
+    """
+    if isinstance(weight, DTensor):
+        if weight.device != device:
+            weight = weight.to(device)
+        weight = weight.full_tensor()
+    return weight
+
+
 def forward_with_normal_backend(
     self: "Qwen3_5ForConditionalGeneration",
     input_ids: torch.LongTensor = None,
@@ -584,9 +599,7 @@ def forward_with_torch_backend(
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
     fused_linear_for_ppo = FusedLinearForPPO(impl_backend=getattr(self, "_verl_fused_kernels_backend", "torch"))
-    vocab_weights = self.lm_head.weight
-    if isinstance(vocab_weights, DTensor):
-        vocab_weights = vocab_weights.full_tensor()
+    vocab_weights = _full_vocab_weights(self.lm_head.weight, hidden_states.device)
 
     ulysses_sequence_parallel_size = get_ulysses_sequence_parallel_world_size()
     if shift_labels is None and ulysses_sequence_parallel_size > 1:
@@ -644,8 +657,7 @@ def forward_with_triton_backend(
 
     vocab_weights = self.lm_head.weight
     hidden_states = hidden_states.to(vocab_weights.dtype)
-    if isinstance(vocab_weights, DTensor):
-        vocab_weights = vocab_weights.full_tensor()
+    vocab_weights = _full_vocab_weights(vocab_weights, hidden_states.device)
 
     log_probs, entropy = linear_cross_entropy(
         hidden_states,
