@@ -61,8 +61,8 @@ def register_tensorboard_run(run_dir, log_dir):
 
 
 def overall_score(metrics):
-    """Balance the two tasks for mixed runs, or the two legacy T2V datasets."""
-    keys = TASK_SCORE_METRICS.values() if any(key in metrics for key in TASK_SCORE_METRICS.values()) else SCORE_METRICS
+    """Balance the evaluated tasks (one or both) for unified runs, or the two legacy T2V datasets."""
+    keys = [key for key in TASK_SCORE_METRICS.values() if key in metrics] or SCORE_METRICS
     scores = [metrics.get(key) for key in keys]
     if any(value is None or not math.isfinite(value) for value in scores):
         return None
@@ -198,8 +198,10 @@ class VideoCheckpointCallback(CheckpointCallback):
         samples = read_json(Path(self.config.video_rl.protocol))["samples"]["val"]
         expected = Counter(sample["task"] for sample in samples)
         tasks = summary.get("by_task", {})
+        # A unified run may evaluate T2V or I2V alone; select on the tasks it evaluates.
         if (
-            set(expected) != set(TASK_SCORE_METRICS)
+            not expected
+            or not set(expected) <= set(TASK_SCORE_METRICS)
             or set(tasks) != set(expected)
             or summary.get("policy_step") != global_step
             or summary.get("prompts") != len(samples)
@@ -210,7 +212,7 @@ class VideoCheckpointCallback(CheckpointCallback):
             )
         ):
             return {}
-        return {metric: tasks[task].get("score") for task, metric in TASK_SCORE_METRICS.items()}
+        return {metric: tasks[task].get("score") for task, metric in TASK_SCORE_METRICS.items() if task in expected}
 
     def _publish_evaluation_media(self, global_step):
         """Publish qualitative samples once on the driver, without affecting selection."""
