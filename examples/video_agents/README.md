@@ -414,6 +414,59 @@ state, and `trainer.max_actor_ckpt_to_keep=null` / `max_critic_ckpt_to_keep=null
 so worker cleanup cannot delete the best. Custom callbacks replace this policy;
 the archived inspection launchers retain their historical behavior.
 
+## Evaluation videos in TensorBoard
+
+`VideoCheckpointCallback` automatically publishes qualitative examples after
+each completed evaluation when TensorBoard logging is enabled. It reuses saved
+videos and judgments, including initial and evaluation-only passes, without
+additional generation or judge calls. A fixed panel of four held-out IDs per
+task makes the same T2V and I2V examples comparable across policy steps; a
+failed example remains visible as a failure rather than being replaced by a
+different prompt. Degraded evaluation passes also publish their available
+examples independently of best-checkpoint selection.
+
+Select the run's `eval_examples` subrun in TensorBoard. The **Images** tab
+contains animated previews; **Text** contains the associated prompts,
+generation requests, scores, and artifact paths. I2V examples also show
+their conditioning image. Stable sample tags use the optimizer step so the
+step slider follows training progress. Preview animations are silent and
+reduced in size; the original MP4 artifacts retain full resolution and audio.
+The panel is saved in `tensorboard/eval_examples/selection.json`; publication
+status and errors are saved alongside it in `state.json`.
+
+The default `video_rl.eval_media` settings are `enabled: true`,
+`samples_per_task: 4`, `fps: 6`, `max_size: 384`, and `timeout: 60`. The last
+setting bounds the whole evaluation publication in seconds. Preview problems
+are reported as warnings and do not prevent training or checkpoint selection.
+Use `video_rl.eval_media.enabled=false` to opt out. The publisher needs
+TensorBoard, Pillow, and an FFmpeg executable in the driver environment; it
+can use `imageio-ffmpeg` when FFmpeg is not installed on the system. Add that
+fallback to the existing environment with `uv pip install imageio-ffmpeg`.
+
+Existing run artifacts can be published without restarting training:
+
+```bash
+uv run --no-project --python 3.12 \
+  --with tensorboard --with pillow --with imageio-ffmpeg \
+  python -m examples.video_agents.eval_media \
+  --run-dir /path/to/run --protocol /path/to/protocol.json
+```
+
+The CLI backfills saved evaluation steps; `--step 0 --step 10` limits the
+selection, `--log-dir /path/to/tensorboard` selects the TensorBoard root, and
+`--watch` keeps publishing new evaluations. Repeated invocations reuse the
+same panel and skip examples already published. TensorBoard samples image
+history by default; start its server with `--samples_per_plugin images=1000`
+when you want to browse up to 1,000 evaluation steps for each example.
+
+Future runs also register a symlink to their TensorBoard root under
+`~/.cache/verl/tensorboard/video-agents`, or `VIDEO_AGENT_TENSORBOARD_RUNS_DIR`
+when set. Include that directory in the TensorBoard server's watched log roots
+to discover new experiment runs automatically. Existing registry entries are
+preserved; colliding experiment names receive a stable suffix. Custom callbacks
+that replace `VideoCheckpointCallback` must invoke the publisher themselves or
+use the CLI watcher.
+
 ## Local inputs and services
 
 These runtime assets are supplied separately:

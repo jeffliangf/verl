@@ -10,12 +10,14 @@
 # limitations under the License.
 """Balanced evaluation scores and durable best-plus-latest checkpoint retention."""
 
+import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from examples.video_agents import checkpoints
 from examples.video_agents.checkpoints import COMPLETE_MARKER, OVERALL_SCORE, SCORE_METRICS, VideoCheckpointCallback
@@ -25,11 +27,18 @@ from verl.trainer.ppo.checkpoint_callback import build_checkpoint_callback
 
 
 @pytest.fixture
-def config(tmp_path):
+def config(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDEO_AGENT_TENSORBOARD_RUNS_DIR", str(tmp_path / "registry"))
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
         return compose(
             config_name="rl",
-            overrides=[f"trainer.default_local_dir={tmp_path / 'checkpoints'}", "trainer.n_gpus_per_node=2"],
+            overrides=[
+                f"trainer.default_local_dir={tmp_path / 'checkpoints'}",
+                "trainer.n_gpus_per_node=2",
+                "video_rl.eval_media.enabled=false",
+                f"video_rl.output_dir={tmp_path / 'run'}",
+                f"video_rl.protocol={tmp_path / 'protocol.json'}",
+            ],
         )
 
 
@@ -68,6 +77,128 @@ def test_default_callback_logs_exact_average_without_a_checkpoint(config):
     metrics = evaluate(callback, 0, 0.2, 0.8)
     assert metrics[OVERALL_SCORE] == pytest.approx(0.5)
     assert not callback.root.exists()  # Initial base-model evaluation is logging only.
+
+
+@pytest.mark.parametrize("val_only", [False, True])
+def test_evaluation_media_published_before_score_or_checkpoint_guards(config, tmp_path, monkeypatch, val_only):
+    calls = []
+
+    def publish(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"errors": []}
+
+    monkeypatch.setitem(
+        sys.modules, "examples.video_agents.eval_media", SimpleNamespace(publish_evaluation_media=publish)
+    )
+    monkeypatch.setenv("TENSORBOARD_DIR", str(tmp_path / "custom-tensorboard"))
+    config.video_rl.eval_media.enabled = True
+    config.video_rl.output_dir = str(tmp_path / "run")
+    config.video_rl.protocol = str(tmp_path / "protocol.json")
+    config.trainer.val_only = val_only
+    callback = build_checkpoint_callback(config)
+    metrics = {}
+    callback.on_validation(None, 0, metrics)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == (tmp_path / "run", 0, tmp_path / "protocol.json")
+    assert kwargs["log_dir"] == tmp_path / "custom-tensorboard"
+    assert kwargs["settings"] == {
+        "enabled": True,
+        "samples_per_task": 4,
+        "fps": 6,
+        "max_size": 384,
+        "timeout": 60,
+    }
+    assert not metrics and not callback.root.exists()
+
+
+def test_evaluation_media_remains_automatic_for_existing_configs(config, tmp_path, monkeypatch):
+    calls = []
+
+    def publish(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"errors": []}
+
+    monkeypatch.setitem(
+        sys.modules, "examples.video_agents.eval_media", SimpleNamespace(publish_evaluation_media=publish)
+    )
+    monkeypatch.delenv("TENSORBOARD_DIR", raising=False)
+    with open_dict(config.video_rl):
+        del config.video_rl["eval_media"]
+    config.video_rl.output_dir = str(tmp_path / "run")
+    config.video_rl.protocol = str(tmp_path / "protocol.json")
+    callback = build_checkpoint_callback(config)
+    evaluate(callback, 0, 0.2, 0.8)
+    assert len(calls) == 1
+    assert calls[0][1] == {"settings": {}, "log_dir": tmp_path / "run/tensorboard"}
+
+
+@pytest.mark.parametrize("disabled", ["setting", "backend"])
+def test_evaluation_media_can_be_disabled(config, monkeypatch, disabled):
+    def publish(*args, **kwargs):
+        pytest.fail("Media publisher must not run when disabled")
+
+    monkeypatch.setitem(
+        sys.modules, "examples.video_agents.eval_media", SimpleNamespace(publish_evaluation_media=publish)
+    )
+    if disabled == "backend":
+        config.video_rl.eval_media.enabled = True
+        config.trainer.logger = ["console"]
+    callback = build_checkpoint_callback(config)
+    assert evaluate(callback, 0, 0.2, 0.8)[OVERALL_SCORE] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("failure", ["exception", "report"])
+def test_evaluation_media_failure_does_not_block_checkpoint_selection(config, tmp_path, monkeypatch, caplog, failure):
+    def publish(*args, **kwargs):
+        if failure == "exception":
+            raise RuntimeError("preview encoder unavailable")
+        return {"errors": ["preview encoder unavailable"]}
+
+    monkeypatch.setitem(
+        sys.modules, "examples.video_agents.eval_media", SimpleNamespace(publish_evaluation_media=publish)
+    )
+    config.video_rl.eval_media.enabled = True
+    config.video_rl.output_dir = str(tmp_path / "run")
+    config.video_rl.protocol = str(tmp_path / "protocol.json")
+    callback = build_checkpoint_callback(config)
+    checkpoint(callback, 1)
+    assert evaluate(callback, 1, 0.2, 0.8)[OVERALL_SCORE] == pytest.approx(0.5)
+    assert read_json(callback.best_path)["step"] == 1
+    assert "preview encoder unavailable" in caplog.text
+
+
+def test_tensorboard_registry_keeps_existing_runs_and_stable_collision_names(config, tmp_path):
+    first = checkpoints.register_tensorboard_run(tmp_path / "experiment/grpo", tmp_path / "logs-first")
+    assert first == tmp_path / "registry/experiment"
+    assert first.resolve() == tmp_path / "logs-first"
+    assert checkpoints.register_tensorboard_run(tmp_path / "experiment/grpo", tmp_path / "logs-first") == first
+    second = checkpoints.register_tensorboard_run(tmp_path / "other/experiment/drgrpo", tmp_path / "logs-second")
+    assert second != first and second.name.startswith("experiment-")
+    assert second.resolve() == tmp_path / "logs-second"
+    assert first.resolve() == tmp_path / "logs-first"
+    assert (
+        checkpoints.register_tensorboard_run(tmp_path / "other/experiment/drgrpo", tmp_path / "logs-second") == second
+    )
+
+
+def test_tensorboard_registry_failure_does_not_block_media(config, tmp_path, monkeypatch, caplog):
+    calls = []
+
+    def publish(*args, **kwargs):
+        calls.append(args)
+        return {"errors": []}
+
+    monkeypatch.setitem(
+        sys.modules, "examples.video_agents.eval_media", SimpleNamespace(publish_evaluation_media=publish)
+    )
+    registry = tmp_path / "registry"
+    registry.write_text("a file, not a directory")
+    config.video_rl.eval_media.enabled = True
+    callback = build_checkpoint_callback(config)
+    assert evaluate(callback, 0, 0.2, 0.8)[OVERALL_SCORE] == pytest.approx(0.5)
+    assert len(calls) == 1
+    assert "Could not register TensorBoard run" in caplog.text
 
 
 def test_native_metrics_write_overall_scalar_to_tensorboard(config, tmp_path, monkeypatch):
@@ -123,6 +254,28 @@ def mixed_evaluation(config, step):
         None, sources, [str(i) for i in range(len(scores))], {"score": scores, "reward": scores}, []
     )
     return metrics, path
+
+
+def test_degraded_evaluation_still_publishes_media(config, monkeypatch):
+    calls = []
+
+    def publish(*args, **kwargs):
+        calls.append(args[1])
+        return {"errors": []}
+
+    monkeypatch.setitem(
+        sys.modules, "examples.video_agents.eval_media", SimpleNamespace(publish_evaluation_media=publish)
+    )
+    config.video_rl.eval_media.enabled = True
+    metrics, path = mixed_evaluation(config, 5)
+    summary = read_json(path)
+    summary["degraded"] = True
+    write_json(path, summary)
+    callback = build_checkpoint_callback(config)
+    callback.on_validation(None, 5, metrics)
+    assert calls == [5]
+    assert OVERALL_SCORE not in metrics
+    assert not callback.best_path.exists()
 
 
 def test_mixed_checkpoint_balances_tasks_and_survives_restart(config):

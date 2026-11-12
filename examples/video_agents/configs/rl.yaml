@@ -94,6 +94,15 @@ video_rl:
   # Held-out evaluation drops unscorable prompts; flag it degraded below this.
   min_valid_eval_fraction: 0.9
 
+  # Reuse a fixed held-out panel after every evaluation, including initial passes.
+  # Preview failures only warn; timeout bounds the whole publication, in seconds.
+  eval_media:
+    enabled: true
+    samples_per_task: 4
+    fps: 6
+    max_size: 384
+    timeout: 60
+
   # Keep this many recent complete saves, plus the best overall evaluation score.
   checkpoint_keep_latest: 2
 

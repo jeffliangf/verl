@@ -12,9 +12,12 @@
 
 import logging
 import math
+import os
+import re
 import shutil
 import zipfile
 from collections import Counter
+from hashlib import sha256
 from pathlib import Path
 
 from verl.trainer.ppo.checkpoint_callback import CheckpointCallback
@@ -31,6 +34,30 @@ SCORE_METRICS = (
 TASK_SCORE_METRICS = {task: f"val-core/{task}/score/mean@1" for task in ("t2v", "i2v")}
 OVERALL_SCORE = "val-core/overall/score/mean@1"
 COMPLETE_MARKER = "checkpoint_complete.json"
+
+
+def register_tensorboard_run(run_dir, log_dir):
+    """Expose future runs under a directory watched by the TensorBoard server."""
+    run_dir, log_dir = Path(run_dir).resolve(), Path(log_dir).resolve()
+    registry_root = (
+        os.environ.get("VIDEO_AGENT_TENSORBOARD_RUNS_DIR") or Path.home() / ".cache/verl/tensorboard/video-agents"
+    )
+    registry = Path(registry_root).expanduser().resolve()
+    if registry.is_relative_to(log_dir):
+        raise ValueError("TensorBoard registry must be outside the run's log directory")
+    registry.mkdir(parents=True, exist_ok=True)
+    label = run_dir.parent.name if run_dir.name in {"grpo", "drgrpo"} else run_dir.name
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip(".") or "video-agent-run"
+    suffix = sha256(str(log_dir).encode()).hexdigest()[:10]
+    for name in (label, f"{label}-{suffix}"):
+        link = registry / name
+        try:
+            link.symlink_to(log_dir, target_is_directory=True)
+        except FileExistsError:
+            if not link.is_symlink() or link.resolve() != log_dir:
+                continue
+        return link
+    raise FileExistsError(f"TensorBoard registry entries already exist for {label}")
 
 
 def overall_score(metrics):
@@ -185,7 +212,38 @@ class VideoCheckpointCallback(CheckpointCallback):
             return {}
         return {metric: tasks[task].get("score") for task, metric in TASK_SCORE_METRICS.items()}
 
+    def _publish_evaluation_media(self, global_step):
+        """Publish qualitative samples once on the driver, without affecting selection."""
+        if "tensorboard" not in self.config.trainer.logger:
+            return
+        try:
+            output_dir = Path(self.config.video_rl.output_dir)
+            log_dir = Path(os.environ.get("TENSORBOARD_DIR", str(output_dir / "tensorboard")))
+            try:
+                register_tensorboard_run(output_dir, log_dir)
+            except Exception:
+                logger.warning("Could not register TensorBoard run %s", output_dir, exc_info=True)
+            settings = dict(self.config.video_rl.get("eval_media", {}) or {})
+            if not settings.get("enabled", True):
+                return
+            from .eval_media import publish_evaluation_media
+
+            report = publish_evaluation_media(
+                output_dir,
+                global_step,
+                Path(self.config.video_rl.protocol),
+                settings=settings,
+                log_dir=log_dir,
+            )
+            if report.get("errors"):
+                logger.warning("Evaluation media at step %s: %s", global_step, "; ".join(report["errors"]))
+        except Exception:
+            # Checkpoint integrity failures still propagate from the rest of the
+            # callback. Missing preview dependencies or media must not abort it.
+            logger.warning("Could not publish evaluation media at step %s", global_step, exc_info=True)
+
     def on_validation(self, trainer, global_step, metrics, **kwargs):
+        self._publish_evaluation_media(global_step)
         selection = self._selection_metrics(global_step, metrics)
         score = overall_score(selection)
         if score is None:
