@@ -17,9 +17,12 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator, ValidationError
 
+from examples.video_agents.image_assets import image_bytes
 from examples.video_agents.storage import file_sha256, fingerprint, load_external, read_json, run_lock, write_json
 
 PROMPT_PATH = Path(__file__).with_name("inspector_prompt.txt")
+# The evaluation judge's first-frame label, worded for a single video.
+REFERENCE_IMAGE_LABEL = "Reference image (the required first frame of the video):"
 SETTINGS = {
     "model": "gemini-3.8-flash",
     "fps": 4,
@@ -133,7 +136,8 @@ def validate_feedback(value, prior_findings=(), duration=10.125):
     return value
 
 
-def build_request(video_uri, original_request, generation_prompt, prior_findings=(), settings=None):
+def build_request(video_uri, original_request, generation_prompt, prior_findings=(), settings=None, image=None):
+    """Text-to-video requests are unchanged; ``image`` adds the labeled I2V first frame before the video."""
     config = {**SETTINGS, **(settings or {})}
     task = {
         "original_request": original_request,
@@ -141,6 +145,14 @@ def build_request(video_uri, original_request, generation_prompt, prior_findings
         "prior_findings_to_recheck": list(prior_findings),
         "task": "Return observed evidence and repair feedback for this video only.",
     }
+    first_frame = (
+        []
+        if image is None
+        else [
+            {"type": "text", "text": REFERENCE_IMAGE_LABEL},
+            {"type": "image", "uri": image["uri"], "mime_type": image["mime_type"]},
+        ]
+    )
     return {
         "model": config["model"],
         "system_instruction": PROMPT_PATH.read_text(),
@@ -148,6 +160,7 @@ def build_request(video_uri, original_request, generation_prompt, prior_findings
         "background": False,
         "stream": False,
         "input": [
+            *first_frame,
             {
                 "type": "video",
                 "uri": video_uri,
@@ -162,13 +175,19 @@ def build_request(video_uri, original_request, generation_prompt, prior_findings
     }
 
 
-def inspect(video, original_request, prior_findings, directory, eval_repo):
-    """Inspect one registered artifact; durable cache includes media, policy, schema and rechecks."""
+def inspect(video, original_request, prior_findings, directory, eval_repo, source_image=None):
+    """Inspect one registered artifact; durable cache includes media, policy, schema and rechecks.
+
+    ``source_image`` is the frozen I2V first-frame asset; the inspector sees it before the video.
+    """
     path = Path(video["path"])
     if file_sha256(path) != video["sha256"]:
         raise ValueError("Registered video bytes changed")
-    template = build_request("MEDIA_URI", original_request, video["request"]["prompt"], prior_findings)
+    image = None if source_image is None else {"uri": "IMAGE_URI", "mime_type": source_image["mime_type"]}
+    template = build_request("MEDIA_URI", original_request, video["request"]["prompt"], prior_findings, image=image)
     identity = {"video_sha256": video["sha256"], "request": template}
+    if source_image is not None:
+        identity["image_sha256"] = source_image["sha256"]
     directory = Path(directory) / fingerprint(identity)
     with run_lock(directory):
         write_json(directory / "identity.json", identity)
@@ -184,10 +203,18 @@ def inspect(video, original_request, prior_findings, directory, eval_repo):
             raise RuntimeError("Configured Gemini credential is unavailable")
         client = gemini.GeminiRestClient(key, max_attempts=4, request_timeout=300, file_timeout=900)
         start = time.monotonic()
-        uploaded = None
+        uploaded = uploaded_image = None
         try:
             uploaded = client.upload_video(path)
-            request = {**template, "input": [{**template["input"][0], "uri": uploaded["uri"]}, template["input"][1]]}
+            uris = {"MEDIA_URI": uploaded["uri"]}
+            if source_image is not None:
+                image_bytes(source_image)  # The upload must be the frozen first frame.
+                uploaded_image = client.upload_image(Path(source_image["path"]))
+                uris["IMAGE_URI"] = uploaded_image["uri"]
+            request = {
+                **template,
+                "input": [{**part, "uri": uris[part["uri"]]} if "uri" in part else part for part in template["input"]],
+            }
             for attempt in range(1, 4):
                 write_json(directory / f"request-{attempt}.json", request)
                 response, _ = client.request_json(
@@ -207,7 +234,7 @@ def inspect(video, original_request, prior_findings, directory, eval_repo):
                         raise
                     request = {
                         **request,
-                        "input": request["input"][:2]
+                        "input": request["input"][: len(template["input"])]
                         + [{"type": "text", "text": "Correct the response format: " + str(error)[:800]}],
                     }
                     continue
@@ -220,3 +247,5 @@ def inspect(video, original_request, prior_findings, directory, eval_repo):
             # Let the service expire uploaded media. Avoid serial cleanup latency on the policy path.
             if uploaded:
                 write_json(directory / "uploaded.json", uploaded)
+            if uploaded_image:
+                write_json(directory / "uploaded-image.json", uploaded_image)

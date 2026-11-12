@@ -27,8 +27,11 @@ class InvalidAction(ValueError):
 class InspectionEpisode:
     """Bound tool calls and finish with the existing video if inspection fails."""
 
-    def __init__(self, original_request, schemas, directory, generate, inspect):
+    def __init__(self, original_request, schemas, directory, generate, inspect, sample=None):
         self.original_request = original_request
+        # The unified tool contract resolves the task, required controls and the
+        # I2V first frame from the bound dataset sample, as in the terminal agent.
+        self.sample = sample
         self.schemas = {schema["function"]["name"]: schema for schema in schemas}
         self.directory = Path(directory)
         self.generate, self.inspect = generate, inspect
@@ -65,7 +68,7 @@ class InspectionEpisode:
             raise InvalidAction(f"Action {name} is unavailable in this state")
         if name == "sol_h3":
             try:
-                return tool_request(parameters, self.schemas[name])
+                return tool_request(parameters, self.schemas[name], sample=self.sample)
             except ValueError as exc:
                 raise InvalidAction(str(exc)) from exc
         key = "video_id" if name == "inspect_video" else "final_video_id"

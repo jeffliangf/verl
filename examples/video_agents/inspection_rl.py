@@ -8,7 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prepare and run V1-1 inspection RL from a frozen video-only experiment."""
+"""Prepare and run V1-1 inspection RL from a frozen single-generator experiment (T2V or mixed T2V/I2V)."""
 
 import argparse
 import json
@@ -86,6 +86,11 @@ def prepare(args):
         "prompt_sha256": file_sha256(feedback.PROMPT_PATH),
         "schema_sha256": fingerprint(feedback.SCHEMA),
         "implementation_sha256": file_sha256(Path(feedback.__file__)),
+        **(
+            {"first_frame_label": feedback.REFERENCE_IMAGE_LABEL}
+            if any(sample.get("image") for samples in protocol["samples"].values() for sample in samples)
+            else {}
+        ),
         "system_extension": SYSTEM_EXTENSION,
         "max_generations": 2,
         "max_inspections": 1,
@@ -115,6 +120,7 @@ def training_config(args):
     from omegaconf import OmegaConf
 
     directory, data_dir = map(rl.local_path, (args.run_dir, args.data_dir))
+    protocol = load_protocol(directory / "protocol.json")
     overrides = [
         *list(OmegaConf.load(CONFIG_DIR / "inspection_rl.yaml")["overrides"]),
         f"hydra.searchpath=[file://{ROOT / 'verl/trainer/config'}]",
@@ -127,11 +133,12 @@ def training_config(args):
         f"trainer.default_local_dir={json.dumps(str(directory / 'checkpoints'))}",
         f"trainer.rollout_data_dir={json.dumps(str(directory / 'rollouts'))}",
         f"trainer.validation_data_dir={json.dumps(str(directory / 'validation'))}",
+        *rl.sample_overrides(protocol),
         *args.overrides,
     ]
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
         config = compose(config_name="rl", overrides=overrides)
-    protocol = load_protocol(directory / "protocol.json")
+    rl.check_sample_settings(protocol, config)
     runtime_protocol(protocol, config.video_rl)
     rollout = config.actor_rollout_ref.rollout
     if (

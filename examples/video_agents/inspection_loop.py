@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 from jsonschema import ValidationError
+from omegaconf import OmegaConf
 
 from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
 from verl.tools.base_tool import BaseTool
@@ -25,11 +26,47 @@ from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 
 from .agent import TournamentManager, TournamentWorker
 from .h3 import generation_slot
+from .image_assets import image_bytes, upright_observation
 from .inspection_episode import InspectionEpisode
 from .inspection_worker import inspect_video
+from .mixed_data import original_request
 from .observability import ProviderError, timed_stage
 from .storage import read_jsonl, write_json
 from .tournament import generate_video, load_protocol, runtime_protocol
+
+_PROTOCOLS = {}
+
+
+def episode_protocol(path, settings):
+    """Load a frozen protocol once per worker process; episodes only read it.
+
+    Mixed protocols are tens of megabytes. Loading one per episode would block the
+    event loop for about a second and retain a separate copy per concurrent episode.
+    """
+    key = (str(path), json.dumps(OmegaConf.to_container(settings, resolve=True), sort_keys=True, default=str))
+    if key not in _PROTOCOLS:
+        _PROTOCOLS[key] = runtime_protocol(load_protocol(Path(path)), settings)
+    return _PROTOCOLS[key]
+
+
+def recorded_messages(messages, source_image):
+    """Record an upright policy image, which is a PIL object, by its frozen source path."""
+    if not source_image:
+        return messages
+    return [
+        {
+            **message,
+            "content": [
+                {**part, "image": source_image["path"]}
+                if part.get("type") == "image" and not isinstance(part.get("image"), str)
+                else part
+                for part in message["content"]
+            ],
+        }
+        if isinstance(message.get("content"), list)
+        else message
+        for message in messages
+    ]
 
 
 class InspectionActionTool(BaseTool):
@@ -120,7 +157,7 @@ class InspectionLoop(ToolAgentLoop):
         return await tool.execute(agent_data.request_id, json.loads(tool_call.arguments), agent_data=agent_data)
 
     async def run(self, sampling_params, **kwargs):
-        self.protocol = runtime_protocol(load_protocol(Path(self.config.video_rl.protocol)), self.config.video_rl)
+        self.protocol = episode_protocol(self.config.video_rl.protocol, self.config.video_rl)
         schemas = kwargs["tools"]
         if [s["function"]["name"] for s in schemas] != ["sol_h3", "inspect_video", "finish_video"]:
             raise ValueError("Prepared inspection rows must supply the three native actions in order")
@@ -131,9 +168,17 @@ class InspectionLoop(ToolAgentLoop):
         self.apply_chat_template_kwargs = dict(kwargs["chat_template_kwargs"])
         self.continuous_token_builder.chat_template_kwargs = self.apply_chat_template_kwargs
         info = kwargs["extra_info"]
-        original = next(
-            sample["prompt"] for sample in self.protocol["samples"][info["split"]] if sample["id"] == info["id"]
-        )
+        sample = next(sample for sample in self.protocol["samples"][info["split"]] if sample["id"] == info["id"])
+        # As in H3TerminalLoop: the unified contract binds the row's task, controls and first frame.
+        bound = sample if self.protocol.get("tool_contract") == "urn:verl:sol-h3:3" else None
+        source_image = bound.get("image") if bound else None
+        if source_image:
+            await asyncio.to_thread(image_bytes, source_image)
+            kwargs["raw_prompt"] = await asyncio.to_thread(upright_observation, kwargs["raw_prompt"])
+        # The inspector sees the same original request as the judge.
+        original = original_request(sample)
+        # T2V calls keep the original inspector signature.
+        image_kwargs = {"source_image": source_image} if source_image else {}
         output_dir = Path(self.config.video_rl.output_dir)
         directory = output_dir / "episodes" / uuid4().hex
 
@@ -157,11 +202,12 @@ class InspectionLoop(ToolAgentLoop):
                     self.protocol,
                     dict(self.config.inspection_rl),
                     output_dir,
+                    **image_kwargs,
                 )
             finally:
                 self.episode.save()
 
-        self.episode = InspectionEpisode(original, schemas, directory, generate, inspect)
+        self.episode = InspectionEpisode(original, schemas, directory, generate, inspect, sample=bound)
         self.episode.save()
         output = await super().run(sampling_params, **kwargs)
         if self.episode.final_result is None:
@@ -179,7 +225,7 @@ class InspectionLoop(ToolAgentLoop):
             directory / "trajectory.json",
             {
                 **summary,
-                "messages": self.agent_data.messages,
+                "messages": recorded_messages(self.agent_data.messages, source_image),
                 "prompt_ids": output.prompt_ids,
                 "response_ids": output.response_ids,
                 "response_mask": output.response_mask,

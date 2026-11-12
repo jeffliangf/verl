@@ -21,25 +21,27 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .h3 import generation_slot
-from .h3_request import request_output
+from .h3_request import frame_count
 from .inspection_agent import feedback
 from .observability import ProviderError, timed_stage
 from .storage import load_external, read_json, write_json
 
 _CLEANUP = ThreadPoolExecutor(max_workers=2, thread_name_prefix="inspection-cleanup")
+# Uploaded media and their cleanup markers. Only I2V inspections upload an image.
+UPLOADS = {"video": ("uploaded.json", "cleanup.json"), "image": ("uploaded-image.json", "cleanup-image.json")}
 
 
-def inspect_generation(video, original_request, directory, eval_repo):
-    """Supply new clip lengths without changing the frozen V1 inspector or legacy runs."""
+def inspect_generation(video, original_request, directory, eval_repo, source_image=None):
+    """Supply new clip lengths and I2V first frames without changing legacy T2V requests."""
     inspector = feedback
     if "task" in video["request"]:
         # Use a separate module namespace so concurrent/legacy callers retain
-        # the original validator. The rubric and source hash stay unchanged.
+        # the original validator. The rubric is unchanged. Rollout records keep a
+        # summary without first-frame bytes, so read the length from the target.
         inspector = load_external(Path(feedback.__file__))
-        inspector.validate_feedback = partial(
-            inspector.validate_feedback, duration=request_output(video["request"])["duration_seconds"]
-        )
-    return inspector.inspect(video, original_request, [], directory, eval_repo)
+        duration = frame_count(video["request"]["target"]["duration_seconds"]) / 24
+        inspector.validate_feedback = partial(inspector.validate_feedback, duration=duration)
+    return inspector.inspect(video, original_request, [], directory, eval_repo, source_image=source_image)
 
 
 def schedule_cleanup(directory, eval_repo):
@@ -55,7 +57,7 @@ def schedule_cleanup(directory, eval_repo):
     _CLEANUP.submit(cleanup)
 
 
-def inspect_video(video, original_request, directory, protocol, settings, output_dir):
+def inspect_video(video, original_request, directory, protocol, settings, output_dir, source_image=None):
     directory = Path(directory)
     request_path = directory / "input.json"
     write_json(
@@ -65,6 +67,7 @@ def inspect_video(video, original_request, directory, protocol, settings, output
             "original_request": original_request,
             "eval_repo": protocol["eval_repo"],
             "directory": str(directory),
+            **({"source_image": source_image} if source_image else {}),
         },
     )
     timings = directory / "timings.jsonl"
@@ -133,26 +136,33 @@ def cleanup_uploads(directory, eval_repo):
     client = gemini.GeminiRestClient(key, max_attempts=1, request_timeout=15, file_timeout=15)
     for identity in Path(directory).glob("*/identity.json"):
         folder = identity.parent
-        marker = folder / "cleanup.json"
-        if marker.exists() and read_json(marker).get("status") == "deleted":
-            continue
-        uploaded = folder / "uploaded.json"
-        name = read_json(uploaded).get("name") if uploaded.exists() else None
-        if name is None and (folder / "request-1.json").exists():
-            # A timed-out child may have persisted its request but not reached
-            # V1's finally block that records uploaded.json.
-            uri = read_json(folder / "request-1.json")["input"][0]["uri"]
-            parsed = urlparse(uri)
-            if parsed.hostname == "generativelanguage.googleapis.com" and parsed.path.startswith("/v1beta/files/"):
-                name = parsed.path.removeprefix("/v1beta/")
-        if not name:
-            continue
-        try:
-            client.delete_file(name)
-            result = {"status": "deleted", "name": name}
-        except Exception as error:
-            result = {"status": "failed", "name": name, "error": gemini.safe_error_text(error, key)}
-        write_json(marker, result)
+        request = folder / "request-1.json"
+        parts = read_json(request)["input"] if request.exists() else []
+        for kind, (record, marker_name) in UPLOADS.items():
+            marker = folder / marker_name
+            if marker.exists() and read_json(marker).get("status") == "deleted":
+                continue
+            uploaded = folder / record
+            name = read_json(uploaded).get("name") if uploaded.exists() else None
+            if name is None:
+                # A timed-out child may have persisted its request but not reached
+                # V1's finally block that records the upload.
+                uris = [part["uri"] for part in parts if "uri" in part and part.get("type", "video") == kind]
+                parsed = urlparse(uris[0]) if uris else None
+                if (
+                    parsed
+                    and parsed.hostname == "generativelanguage.googleapis.com"
+                    and parsed.path.startswith("/v1beta/files/")
+                ):
+                    name = parsed.path.removeprefix("/v1beta/")
+            if not name:
+                continue
+            try:
+                client.delete_file(name)
+                result = {"status": "deleted", "name": name}
+            except Exception as error:
+                result = {"status": "failed", "name": name, "error": gemini.safe_error_text(error, key)}
+            write_json(marker, result)
 
 
 def main():
@@ -162,7 +172,9 @@ def main():
     data = read_json(args.input)
     directory = Path(data["directory"])
     try:
-        report = inspect_generation(data["video"], data["original_request"], directory, data["eval_repo"])
+        report = inspect_generation(
+            data["video"], data["original_request"], directory, data["eval_repo"], data.get("source_image")
+        )
         result = {"status": "succeeded", "report": report}
     except Exception as exc:
         result = {
