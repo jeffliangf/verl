@@ -80,7 +80,18 @@ def i2v_reference(sample, path, count, probe):
     original = generation.get("video", {})
     if original.get("sha256") != result["sha256"] or file_sha256(Path(original["path"])) != result["sha256"]:
         raise ValueError(f"I2V reference differs from the selected generation: {sample['id']}")
-    if h3.media_profile(media) != h3.media_profile(selection["video"]["media"]):
+    duration = 10
+    if keeps_own_request(sample):
+        # The reference must be a valid answer to the row's own request: allowed length and canvas.
+        rules = sample["allowed_video_gen_args"]["target"]
+        video = media.get("video") or {}
+        canvas = {"width": video.get("width"), "height": video.get("height")}
+        if video.get("frames") not in rules["duration_seconds"]["allowed_num_frames"] or (
+            canvas not in rules["aspect_ratio"]["allowed_canvases"]
+        ):
+            raise ValueError(f"I2V reference violates its row's requested controls: {sample['id']}")
+        duration = round(video["frames"] / 24)
+    if h3.media_profile(media, duration=duration) != h3.media_profile(selection["video"]["media"], duration=duration):
         raise ValueError(f"I2V reference media changed: {sample['id']}")
     result["provenance"] = provenance([selection_path, generation_path])
     result["recipe"] = {
