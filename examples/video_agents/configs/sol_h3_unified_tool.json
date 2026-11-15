@@ -16,7 +16,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 8000,
-          "description": "Describe subjects, actions over time, setting, camera, lighting, style, speech, sound, and music as useful. Preserve the original intent. Any clear descriptive format is supported; no special rewrite format is required."
+          "description": "Describe the video and audio while preserving the user's intent (1-8000 characters). Context-IR uses integrated_multimodal_description for visuals over time, overall_soundscape for sounds, and non_diegetic_music for music; use this structure when helpful."
         },
         "conditions": {
           "type": "array",

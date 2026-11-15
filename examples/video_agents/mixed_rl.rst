@@ -70,7 +70,14 @@ old frozen runs keep their original request semantics.
      - ``auto``, ``21:9``, ``16:9``, ``4:3``, ``1:1``, ``3:4``, ``9:16``
    * - Prompt format
      - Context-IR guidance
-     - General visual, motion, camera, style, speech, sound, and music description
+     - The same Context-IR guidance
+
+The ``prompt`` description repeats the original tool's sentence word for word:
+``integrated_multimodal_description`` (visuals over time), ``overall_soundscape``
+(sounds), and ``non_diegetic_music`` (music) are suggested sections inside the one
+prompt string, used when helpful; they are not separate arguments. Preparations
+made before 2026-11-15 froze the earlier free-form wording ("any clear descriptive
+format") in their rows and keep it.
 
 The intermediate flat schema already supports ``image``, ``duration``, and
 ``aspect_ratio``. The unified schema organizes these as ``task``, ``conditions``,
