@@ -454,7 +454,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 "uid": uid,
                 "sample_id": sample["id"],
                 "rewards": rewards,
-                **({"task": sample["task"]} if "task" in sample else {}),
+                **({"task": sample["task"], "source": sample["source"]} if "task" in sample else {}),
             }
         except BaseException as exc:
             # A held-out prompt that cannot be scored for any reason is excluded
@@ -470,7 +470,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                 uid=uid,
                 sample_id=sample["id"],
                 policy_step=int(prompt["global_steps"]),
-                **({"task": sample["task"]} if "task" in sample else {}),
+                **({"task": sample["task"], "source": sample["source"]} if "task" in sample else {}),
             )
             write_json(directory / "failure.json", failure)
             log(
@@ -506,6 +506,7 @@ class TournamentManager(AgentLoopManagerTQ):
         protocol = load_protocol(Path(self.config.video_rl.protocol))
         group_size = protocol["group_size"]
         self.reference_fields = reference_fields(protocol)
+        self.reference_fields_by_task = protocol.get("reference_fields_by_task")
         self.eval_judge_model = protocol.get("eval_judge", protocol["judge"])["judge_model"]
         self.reference_notes = protocol.get("reference_notes", [])
         if self.rollout_config.n != group_size or self.rollout_config.val_kwargs.n != 1:
@@ -630,6 +631,7 @@ class TournamentManager(AgentLoopManagerTQ):
             self._eval_records,
             self.config.video_rl.min_valid_eval_fraction,
             fields=getattr(self, "reference_fields", REFERENCE_FIELDS),
+            fields_by_task=getattr(self, "reference_fields_by_task", None),
         )
         if hasattr(self, "eval_judge_model"):
             summary["judge_model"] = self.eval_judge_model
@@ -682,13 +684,20 @@ def training_task_summary(records):
     return result
 
 
-def evaluation_summary(step: int, records: list[dict], min_valid_fraction: float, *, fields=REFERENCE_FIELDS) -> dict:
-    """Valid-only held-out means; invalid policy calls stay in the denominator as 0."""
+def evaluation_summary(
+    step: int, records: list[dict], min_valid_fraction: float, *, fields=REFERENCE_FIELDS, fields_by_task=None
+) -> dict:
+    """Valid-only held-out means; invalid policy calls stay in the denominator as 0.
+
+    A reference mean covers the prompts judged against that reference; a task may use fewer references.
+    Task reports also break results down by data source.
+    """
     valid = [record["rewards"][0] for record in records if not record["dropped"]]
     fraction = len(valid) / len(records) if records else 0.0
 
     def mean(key):
-        return sum(reward[key] for reward in valid) / len(valid) if valid else None
+        values = [reward[key] for reward in valid if key in reward]
+        return sum(values) / len(values) if values else None
 
     summary = {
         "policy_step": step,
@@ -720,11 +729,22 @@ def evaluation_summary(step: int, records: list[dict], min_valid_fraction: float
                 step,
                 [{k: v for k, v in r.items() if k != "task"} for r in records if r.get("task") == task],
                 min_valid_fraction,
-                fields=fields,
+                fields=tuple((fields_by_task or {}).get(task, fields)),
             )
             for task in sorted({r["task"] for r in records if "task" in r})
         }
         summary["degraded"] |= any(r["degraded"] for r in summary["by_task"].values())
         scores = [r["score"] for r in summary["by_task"].values()]
         summary["task_macro_score"] = sum(scores) / len(scores) if all(s is not None for s in scores) else None
+    elif any("source" in record for record in records):
+        # Informational only: selection and degradation use the task totals.
+        summary["by_source"] = {
+            source: evaluation_summary(
+                step,
+                [{k: v for k, v in r.items() if k != "source"} for r in records if r.get("source") == source],
+                min_valid_fraction,
+                fields=fields,
+            )
+            for source in sorted({r["source"] for r in records if "source" in r})
+        }
     return summary

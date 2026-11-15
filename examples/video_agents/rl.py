@@ -30,6 +30,7 @@ from .config import (
     JUDGE_SETTINGS,
     ROOT,
     reference_fields,
+    sample_reference_fields,
 )
 from .dataset import load_samples, reference_inventory
 from .h3_deadlines import phase_budgets, worker_timeout
@@ -456,10 +457,12 @@ def train(args) -> dict:
         if evaluation
         else protocol["group_size"] * (protocol["group_size"] - 1) * batch,
         "videos_per_evaluation": len(protocol["samples"]["val"]),
-        "judgments_per_evaluation": 2 * len(reference_fields(protocol)) * len(protocol["samples"]["val"]),
+        "judgments_per_evaluation": 2
+        * sum(len(sample_reference_fields(protocol, sample)) for sample in protocol["samples"]["val"]),
         "training_judge": protocol["judge"]["judge_model"],
         "evaluation_judge": protocol.get("eval_judge", protocol["judge"])["judge_model"],
         "reference_fields": list(reference_fields(protocol)),
+        "reference_fields_by_task": protocol.get("reference_fields_by_task"),
         "execute": args.execute,
         "command": shlex.join(command),
     }

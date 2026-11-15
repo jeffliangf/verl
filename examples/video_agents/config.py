@@ -41,6 +41,13 @@ def reference_fields(protocol):
     return tuple(protocol.get("reference_fields", REFERENCE_FIELDS))
 
 
+def sample_reference_fields(protocol, sample):
+    """A mixed run may freeze fewer references for one task; other runs use one list for every sample."""
+    fields = reference_fields(protocol)
+    by_task = protocol.get("reference_fields_by_task")
+    return tuple(f for f in fields if f in by_task[sample["task"]]) if by_task else fields
+
+
 def judging_protocol(protocol, *, validate):
     """Evaluation may use Argon while training retains its original judge settings."""
     if not validate:

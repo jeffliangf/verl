@@ -17,7 +17,7 @@ from urllib.parse import unquote, urlsplit
 
 from . import h3
 from .dataset import best_of_4_reference, best_of_16_reference
-from .mixed_data import REFERENCE_COLUMNS
+from .mixed_data import REFERENCE_COLUMNS, keeps_own_request
 from .storage import file_sha256, read_json
 
 
@@ -66,9 +66,11 @@ def i2v_reference(sample, path, count, probe):
         raise ValueError("Invalid reference winner label")
     generation_path = root / "raw" / item / f"{winner}.generation.json"
     generation = read_json(generation_path)
+    # Rows evaluated as written were generated from their natural request; benchmark rows from the bare prompt.
+    text = sample["request"] if keeps_own_request(sample) else sample["prompt"]
     if (
         generation.get("id") != sample["id"]
-        or generation.get("prompt") != sample["prompt"]
+        or generation.get("prompt") != text
         or generation.get("image_sha256") != sample["image"]["sha256"]
         or generation.get("repeat") != selection.get("selected_repeat")
     ):
@@ -143,9 +145,10 @@ def regenerated_reference(sample, path, source, probe):
 
 
 def reference_inventory(samples, rows, probe):
-    """Validate each task's four exports without requiring a shared generation profile."""
+    """Validate each row's best-of-4/16 exports and, when the row has them, their 50-step regenerations."""
     result = []
     for sample, row in zip(samples, rows, strict=True):
+        regenerated = REFERENCE_COLUMNS[2:] if any(row.get(f) is not None for f in REFERENCE_COLUMNS[2:]) else ()
         references = {}
         for count, field in zip((4, 16), REFERENCE_COLUMNS[:2], strict=True):
             if not isinstance(row.get(field), str) or not row[field].strip():
@@ -164,7 +167,7 @@ def reference_inventory(samples, rows, probe):
                     records += [root / "groups" / item / f"g{g}.json" for g in (2, 3, 4)]
                 reference.update(media=media, provenance=provenance(records), recipe={"steps": 4, "best_of": count})
             references[field] = reference
-        for field, source_field in zip(REFERENCE_COLUMNS[2:], REFERENCE_COLUMNS[:2], strict=True):
+        for field, source_field in zip(regenerated, REFERENCE_COLUMNS[: len(regenerated)], strict=True):
             if not isinstance(row.get(field), str) or not row[field].strip():
                 raise ValueError(f"Missing reference: {sample['id']}/{field}")
             references[field] = regenerated_reference(

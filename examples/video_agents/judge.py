@@ -17,7 +17,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from .config import CANDIDATE, reference_fields
+from .config import CANDIDATE, sample_reference_fields
 from .image_assets import reference_image_fields
 from .storage import file_sha256, freeze_json, item_key, read_json
 
@@ -42,7 +42,7 @@ def build_manifests(protocol: dict, candidate_videos: dict[str, dict]) -> dict[s
     for sample in protocol["samples"]:
         if sample["id"] not in candidate_videos:
             continue
-        for reference in reference_fields(protocol):
+        for reference in sample_reference_fields(protocol, sample):
             pair_id = item_key(sample["id"]) + "__vs_" + reference
             pair = {
                 "prompt_id": sample["id"],

@@ -16,7 +16,7 @@ from math import isfinite
 from pathlib import Path
 
 from . import h3, judge, scoring
-from .config import CANDIDATE, judging_protocol, reference_fields
+from .config import CANDIDATE, judging_protocol, reference_fields, sample_reference_fields
 from .dataset import verify_references
 from .h3_request import request_summary
 from .image_assets import image_bytes, reference_image_fields
@@ -48,8 +48,13 @@ def load_protocol(path: Path) -> dict:
     fields = reference_fields(protocol)
     if not fields or len(set(fields)) != len(fields):
         raise ValueError("Expected a nonempty, unique evaluation reference list")
-    if any(set(sample.get("references", {})) != set(fields) for sample in protocol["samples"]["val"]):
-        raise ValueError(f"Evaluation references changed; prepare a new run directory with: {', '.join(fields)}")
+    by_task = protocol.get("reference_fields_by_task")
+    if by_task is not None and any(not v or not set(v) <= set(fields) for v in by_task.values()):
+        raise ValueError("Each task's evaluation references must be a nonempty subset of the frozen list")
+    for sample in protocol["samples"]["val"]:
+        expected = sample_reference_fields(protocol, sample)
+        if set(sample.get("references", {})) != set(expected):
+            raise ValueError(f"Evaluation references changed; prepare a new run directory with: {', '.join(expected)}")
     check_dependencies(protocol)
     return protocol
 
@@ -420,7 +425,7 @@ def score_group(
             pairs = manifests["original"]["pairs"]
             by_reference = {pair["reference"]: key for key, pair in pairs.items()}
             result = {"valid_call": float(valid), "judge_comparisons": 2 * len(pairs)}
-            fields = reference_fields(protocol)
+            fields = sample_reference_fields(protocol, sample)
             for reference in fields:
                 key = by_reference.get(reference)
                 result[f"vs_{reference}"] = (

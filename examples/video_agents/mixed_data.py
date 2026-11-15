@@ -25,18 +25,21 @@ from .storage import atomic_text, file_sha256, load_external, read_json, read_js
 from .tournament import validate_group_size
 
 TRAIN_FILES = (
-    ROOT / "data/prompt_rewrite_i2v_rl_dedup.jsonl",
+    ROOT / "data/prompt_rewrite_i2v_diverse_v1_controls_train_2900.jsonl",
     ROOT / "data/prompt_rewrite_rl.jsonl",
     ROOT / "data/prompt_rewrite_sft.jsonl",
 )
-EVAL_FILES = (ROOT / "data/prompt_rewrite_aa_moviegen_eval_200.jsonl", ROOT / "data/aa_i2v_eval_200.jsonl")
+# I2V: 100 AA batch2 rows plus 100 rows held out of the diverse I2V training set.
+EVAL_FILES = (ROOT / "data/prompt_rewrite_aa_moviegen_eval_200.jsonl", ROOT / "data/i2v_eval_batch2_diverse_200.jsonl")
+# The four-step best-of-4/16 exports are required. The 50-step columns regenerate those winners and are used
+# only when an evaluation row has them; every sample of one task must have the same columns.
 REFERENCE_COLUMNS = (
     "best_of_4_h3_self_hosted_video",
     "best_of_16_h3_self_hosted_video",
     "best_of_4_h3_50step",
     "best_of_16_h3_50step",
 )
-DATA_DIR = ROOT / "data/prompt_rewrite_mixed_rl_v3"
+DATA_DIR = ROOT / "data/prompt_rewrite_mixed_rl_v4"
 OBSERVATION_MAX_PIXELS = 768 * 768
 EVAL_DURATION_SECONDS = 10
 EVAL_T2V_ASPECT_RATIO = "16:9"
@@ -55,6 +58,35 @@ def natural_request(prompt, *, image, evaluation=False):
         )
     instruction = "Animate this image" if image else "Make a video of the following scene"
     return f"{instruction}:\n\n{prompt}"
+
+
+def keeps_own_request(sample):
+    """An evaluation row with its own control contract is evaluated as requested, like a training row."""
+    return "allowed_video_gen_args" in sample
+
+
+def benchmark_request(sample, row):
+    """Benchmark rows ask for a nominal 10-second video (and 16:9 landscape for T2V)."""
+    return {
+        **sample,
+        "request": natural_request(row.get("request", sample["prompt"]), image=bool(sample["image"]), evaluation=True),
+        "target": {
+            **sample["target"],
+            "duration_seconds": EVAL_DURATION_SECONDS,
+            **({"aspect_ratio": EVAL_T2V_ASPECT_RATIO} if sample["task"] == "t2v" else {}),
+        },
+        "control_metadata": {
+            "duration_seconds": {
+                "source": "benchmark_request",
+                "effective_num_frames": frame_count(EVAL_DURATION_SECONDS),
+            },
+            **(
+                {"aspect_ratio": {"source": "benchmark_request", "effective_canvas": EVAL_T2V_CANVAS}}
+                if sample["task"] == "t2v"
+                else {}
+            ),
+        },
+    }
 
 
 def normalize_sources(paths):
@@ -156,7 +188,7 @@ def observation(sample):
 
 
 def prepare(args):
-    """Freeze the approved mixed experiment offline, including all four baselines."""
+    """Freeze the approved mixed experiment offline, including each evaluation sample's baseline videos."""
     from .judge_worker import supports_reference_images
     from .mixed_references import reference_inventory
     from .rl import CONFIG_DIR, local_path, save_prepared
@@ -189,30 +221,14 @@ def prepare(args):
         raise ValueError("Expected the existing v4 Gemini rubric")
     validation = reference_inventory(validation, rows, load_external(repo / "bestofn/normalize.py").probe)
     validation = [
-        {
-            **sample,
-            "request": natural_request(
-                row.get("request", sample["prompt"]), image=bool(sample["image"]), evaluation=True
-            ),
-            "target": {
-                **sample["target"],
-                "duration_seconds": EVAL_DURATION_SECONDS,
-                **({"aspect_ratio": EVAL_T2V_ASPECT_RATIO} if sample["task"] == "t2v" else {}),
-            },
-            "control_metadata": {
-                "duration_seconds": {
-                    "source": "benchmark_request",
-                    "effective_num_frames": frame_count(EVAL_DURATION_SECONDS),
-                },
-                **(
-                    {"aspect_ratio": {"source": "benchmark_request", "effective_canvas": EVAL_T2V_CANVAS}}
-                    if sample["task"] == "t2v"
-                    else {}
-                ),
-            },
-        }
+        sample if keeps_own_request(sample) else benchmark_request(sample, row)
         for sample, row in zip(validation, rows, strict=True)
     ]
+    reference_fields_by_task = {}
+    for sample in validation:
+        fields = list(sample["references"])
+        if reference_fields_by_task.setdefault(sample["task"], fields) != fields:
+            raise ValueError(f"Every {sample['task']} evaluation sample must have the same reference columns")
     reference_notes = [
         {"sample_id": sample["id"], "task": sample["task"], "reference": field, "selection": recipe}
         for sample in validation
@@ -242,7 +258,8 @@ def prepare(args):
         "group_size": validate_group_size(args.group_size),
         "samples": {"train": train, "val": validation},
         "source_files": {str(p): file_sha256(p) for p in (*train_paths, *eval_paths)},
-        "reference_fields": list(REFERENCE_COLUMNS),
+        "reference_fields": [f for f in REFERENCE_COLUMNS if any(f in v for v in reference_fields_by_task.values())],
+        "reference_fields_by_task": reference_fields_by_task,
         "reference_notes": reference_notes,
         "media_profile": profile,
         "judge": dict(JUDGE_SETTINGS),
@@ -267,15 +284,17 @@ def prepare(args):
         combined_file=str(combined),
         train_by_task=dict(Counter(s["task"] for s in train)),
         eval_by_task=dict(Counter(s["task"] for s in validation)),
+        eval_by_source=dict(Counter(f"{s['task']}/{s['source']}" for s in validation)),
+        eval_requests_as_written=sum(keeps_own_request(s) for s in validation),
         repeated_training_prompt_rows=len(train) - len({(s["task"], s["prompt"].strip()) for s in train}),
-        reference_fields=list(REFERENCE_COLUMNS),
+        reference_fields_by_task=reference_fields_by_task,
         training_judge=protocol["judge"]["judge_model"],
         evaluation_judge=protocol["eval_judge"]["judge_model"],
         evaluation_duration_seconds=EVAL_DURATION_SECONDS,
         evaluation_t2v_aspect_ratio=EVAL_T2V_ASPECT_RATIO,
         evaluation_t2v_canvas=EVAL_T2V_CANVAS,
         videos_per_evaluation=len(validation),
-        judgments_per_evaluation=len(validation) * len(REFERENCE_COLUMNS) * 2,
+        judgments_per_evaluation=2 * sum(len(s["references"]) for s in validation),
         reference_notes=reference_notes,
     )
     write_json(local_path(args.run_dir) / "preparation-summary.json", summary)
@@ -286,7 +305,7 @@ def add_parser(commands):
     parser = commands.add_parser("prepare-mixed", help="Prepare unified T2V/I2V RL and four-baseline evaluation")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
-    parser.add_argument("--combined-file", type=Path, default=ROOT / "data/prompt_rewrite_mixed_rl_v3.jsonl")
+    parser.add_argument("--combined-file", type=Path, default=ROOT / "data/prompt_rewrite_mixed_rl_v4.jsonl")
     parser.add_argument("--train-files", nargs="+", type=Path, default=TRAIN_FILES)
     parser.add_argument("--eval-datasets", nargs="+", type=Path, default=EVAL_FILES)
     parser.add_argument("--eval-repo", type=Path, default=DEFAULT_EVAL_REPO)

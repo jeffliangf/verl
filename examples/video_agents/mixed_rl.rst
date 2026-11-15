@@ -14,28 +14,29 @@ Run in the existing Python environment with the video-agent dependencies:
 .. code-block:: bash
 
    python -m examples.video_agents.rl prepare-mixed \
-     --run-dir data/prompt_rewrite_mixed_rl_v3/run \
+     --run-dir data/prompt_rewrite_mixed_rl_v4/run \
      --h3-endpoints http://127.0.0.1:28080
 
 The default inputs are:
 
-* ``data/prompt_rewrite_i2v_rl_dedup.jsonl``: 3,245 I2V samples.
+* ``data/prompt_rewrite_i2v_diverse_v1_controls_train_2900.jsonl``: 2,900 I2V
+  samples, the diverse I2V set without the 100 rows held out for evaluation.
 * ``data/prompt_rewrite_rl.jsonl``: 2,046 T2V samples.
 * ``data/prompt_rewrite_sft.jsonl``: 3,000 T2V samples. Only the original prompts
   enter RL; teacher rewrites are excluded.
 
-Preparation writes ``data/prompt_rewrite_mixed_rl_v3.jsonl`` with all 8,291 normalized
+Preparation writes ``data/prompt_rewrite_mixed_rl_v4.jsonl`` with all 7,946 normalized
 samples, plus native ``train.jsonl`` and ``val.jsonl`` inside
-``data/prompt_rewrite_mixed_rl_v3``. Each normalized sample has ``id``, ``task``
+``data/prompt_rewrite_mixed_rl_v4``. Each normalized sample has ``id``, ``task``
 (``t2v``/``i2v``), original ``prompt``, natural ``request``, ``source``, ``image``
 (null or a path/checksum/media record), ``target`` (required controls), and
 source-file provenance. Only the natural request and attached image enter the
 policy user message; task and control labels remain backend metadata.
-The natural mixture is approximately 61% T2V and 39% I2V. All requested rows are
+The natural mixture is approximately 64% T2V and 36% I2V. All requested rows are
 retained, including ten repeated T2V prompt occurrences under distinct IDs.
 
 The command validates images, checks exact train/evaluation overlap by ID,
-trimmed prompt, and image hash, and verifies the four reference exports per
+trimmed prompt, and image hash, and verifies the reference exports of every
 evaluation sample. It makes no network requests. Output directories are immutable:
 use fresh paths when changing data, tools, judge settings, or reference exports.
 Use ``--train-files``, ``--eval-datasets``, ``--data-dir``, and ``--combined-file``
@@ -107,8 +108,8 @@ See ``control_targets.rst`` for the implemented Gemini annotation pass, complete
 100-row pilot, full-corpus command, and request-bound ``allowed_video_gen_args``.
 The native executor validates these hidden constraints without adding labels to
 policy inputs. Generic requests allow every supported duration and aspect choice.
-The v3 preparation uses explicit 10-second evaluation requests and additionally
-requires the 1344x768 canvas for T2V.
+Benchmark evaluation rows use explicit 10-second requests and additionally require
+the 1344x768 canvas for T2V; held-out training-domain rows keep their own contract.
 
 The deployed worker supports 124 + 17*k frames for k=0..13 at 24 fps, approximately
 5.167 through 14.375 seconds. It rounds a requested duration to a supported frame
@@ -138,38 +139,60 @@ training fallback policy are unchanged. Evaluation requires real judgments.
 Evaluation uses ``gemini-4-argon`` for both:
 
 * T2V: ``data/prompt_rewrite_aa_moviegen_eval_200.jsonl`` (200 samples).
-* I2V: ``data/aa_i2v_eval_200.jsonl`` (200 samples).
+* I2V: ``data/i2v_eval_batch2_diverse_200.jsonl`` (200 samples): the 100 AA batch2
+  rows of ``data/aa_i2v_eval_200.jsonl`` and 100 rows held out of the diverse I2V
+  training set (source ``i2v_diverse_heldout``; 25 short and 25 long eval-format
+  rows, 50 broad rows).
 
-All 400 requests explicitly ask for a nominal 10-second video, including
-MovieGen. The wording asks to adapt any storyboard timing to this duration.
+The 200 T2V and 100 batch2 requests explicitly ask for a nominal 10-second video,
+including MovieGen. The wording asks to adapt any storyboard timing to this duration.
 The backend requires the emitted duration to resolve to 243 frames at 24 fps
 (10.125 seconds). T2V requests also explicitly require 16:9 landscape format,
 which this worker resolves to 1344x768; I2V has no additional benchmark aspect
-constraint. The quality judge receives the same natural request as the policy.
+constraint.
+
+The held-out training-domain rows keep their own natural request and control
+contract (``allowed_video_gen_args``), exactly as in training: exact durations of
+5-14 seconds, ranges, minimums, qualitative or unspecified durations, and
+requested aspect wording. A call that violates the contract is invalid and scores 0.
+In general, an evaluation row that has ``allowed_video_gen_args`` is evaluated as
+written; every other row receives the 10-second benchmark request. The quality
+judge receives the same natural request as the policy.
 
 Each candidate is compared against these exact columns:
 
 * ``best_of_4_h3_self_hosted_video``
 * ``best_of_16_h3_self_hosted_video``
-* ``best_of_4_h3_50step``
-* ``best_of_16_h3_50step``
+* ``best_of_4_h3_50step`` (T2V only)
+* ``best_of_16_h3_50step`` (T2V only)
+
+The 50-step columns are used only when an evaluation row has them, and every
+sample of one task must have the same columns; preparation records them in
+``reference_fields_by_task``. The held-out I2V rows have no 50-step regenerations,
+so both I2V halves use the two 4-step references (the batch2 50-step videos remain
+in ``data/aa_i2v_eval_200.jsonl``). Their references follow the AA I2V recipe:
+16 image-conditioned Context-IR expansions rendered by Sol-H3 at four steps and
+picked by a Gemini 3.8 Flash round robin. They start from the row's natural
+request and render at its preferred duration with ``auto`` aspect.
 
 The saved 50-step videos regenerate the selected self-hosted winners with their
 recorded prompts/seeds; they are not a new selection over N fresh 50-step clips.
 Preparation checks that each regeneration belongs to its selected source, verifies
 its own recipe and media, and preserves that distinction in provenance.
-One existing I2V best-of-16 export has 15 available candidates because repeat 16
+One batch2 best-of-16 export has 15 available candidates because repeat 16
 was explicitly cancelled. The saved video remains in the requested comparison;
 the exception is included in preparation and evaluation reports.
 
-A complete evaluation generates 400 policy clips and makes 3,200 Gemini requests
-(400 prompts x four references x two orders), excluding retries. It reuses the
+A complete evaluation generates 400 policy clips and makes 2,400 Gemini requests
+(200 T2V prompts x four references and 200 I2V prompts x two references, each in
+two orders), excluding retries. It reuses the
 saved baseline videos but obtains fresh Argon judgments.
 
 Results under ``val/step_N`` include ``eval-summary.json``,
-``eval-summary-t2v.json``, and ``eval-summary-i2v.json``. They report all eight
-task/reference win rates, invalid calls, dropped prompts, judge model, and baseline
-exceptions. ``train/step_N/task-summary.json`` reports reward and judge coverage
+``eval-summary-t2v.json``, and ``eval-summary-i2v.json``. They report each task's
+reference win rates, invalid calls, dropped prompts, judge model, and baseline
+exceptions. Task reports also break these down by source (``by_source``), such as
+``aa-i2v-batch2`` and ``i2v_diverse_heldout``. ``train/step_N/task-summary.json`` reports reward and judge coverage
 separately for each task without changing the objective.
 
 Launch preview and checks
@@ -178,16 +201,16 @@ Launch preview and checks
 .. code-block:: bash
 
    python -m examples.video_agents.rl train \
-     --run-dir data/prompt_rewrite_mixed_rl_v3/run \
-     --data-dir data/prompt_rewrite_mixed_rl_v3
+     --run-dir data/prompt_rewrite_mixed_rl_v4/run \
+     --data-dir data/prompt_rewrite_mixed_rl_v4
 
    python -m examples.video_agents.rl status \
-     --run-dir data/prompt_rewrite_mixed_rl_v3/run
+     --run-dir data/prompt_rewrite_mixed_rl_v4/run
 
    python -m examples.video_agents.rl evaluate \
-     --run-dir data/prompt_rewrite_mixed_rl_v3/run \
-     --data-dir data/prompt_rewrite_mixed_rl_v3 \
-     --output-dir data/prompt_rewrite_mixed_rl_v3/evaluation-checkpoint \
+     --run-dir data/prompt_rewrite_mixed_rl_v4/run \
+     --data-dir data/prompt_rewrite_mixed_rl_v4 \
+     --output-dir data/prompt_rewrite_mixed_rl_v4/evaluation-checkpoint \
      --model /path/to/exported-vision-policy
 
 Train/evaluate commands preview configuration and cost until ``--execute`` is
