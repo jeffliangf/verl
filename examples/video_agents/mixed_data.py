@@ -262,7 +262,7 @@ def prepare(args):
         "reference_fields_by_task": reference_fields_by_task,
         "reference_notes": reference_notes,
         "media_profile": profile,
-        "judge": dict(JUDGE_SETTINGS),
+        "judge": {**JUDGE_SETTINGS, "judge_model": args.judge_model},
         "eval_judge": {**JUDGE_SETTINGS, "judge_model": args.eval_judge_model},
         "rubric": rubric.INSTRUCTIONS,
         "eval_repo": str(repo),
@@ -309,7 +309,9 @@ def add_parser(commands):
     parser.add_argument("--train-files", nargs="+", type=Path, default=TRAIN_FILES)
     parser.add_argument("--eval-datasets", nargs="+", type=Path, default=EVAL_FILES)
     parser.add_argument("--eval-repo", type=Path, default=DEFAULT_EVAL_REPO)
-    parser.add_argument("--eval-judge-model", default="gemini-4-argon")
+    # Only the model name differs between the two judges; the other JUDGE_SETTINGS stay frozen.
+    parser.add_argument("--judge-model", default=JUDGE_SETTINGS["judge_model"], help="Training reward judge")
+    parser.add_argument("--eval-judge-model", default="gemini-4-argon", help="Held-out evaluation judge")
     h3.add_arguments(parser)
     parser.add_argument("--poll-interval", type=float, default=1)
     parser.add_argument("--group-size", type=int, default=4)

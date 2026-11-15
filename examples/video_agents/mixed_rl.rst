@@ -133,7 +133,8 @@ through the FastH3 adapter remains experimental according to Sana's API contract
 Rewards and evaluation
 ----------------------
 
-Training keeps ``gemini-3.8-flash`` and the existing v4 preference rubric. I2V
+Training uses the ``--judge-model`` reward judge (default ``gemini-3.8-flash``)
+with the existing v4 preference rubric; only the model name can change. I2V
 adds the required source image before both videos; T2V requests are unchanged.
 The evaluator uses the existing image-input helper and shares image uploads across
 concurrent comparisons. Image hashes enter manifest signatures, and the frozen
@@ -143,7 +144,8 @@ Both presentation orders are judged. Their scores are averaged and then averaged
 over sibling opponents. GRPO advantages, invalid-call penalties, and the existing
 training fallback policy are unchanged. Evaluation requires real judgments.
 
-Evaluation uses ``gemini-4-argon`` for both:
+Evaluation uses the ``--eval-judge-model`` judge (default ``gemini-4-argon``) for
+both:
 
 * T2V: ``data/prompt_rewrite_aa_moviegen_eval_200.jsonl`` (200 samples).
 * I2V: ``data/i2v_eval_batch2_diverse_200.jsonl`` (200 samples): the 100 AA batch2
@@ -193,7 +195,7 @@ the exception is included in preparation and evaluation reports.
 A complete evaluation generates 400 policy clips and makes 2,400 Gemini requests
 (200 T2V prompts x four references and 200 I2V prompts x two references, each in
 two orders), excluding retries. It reuses the
-saved baseline videos but obtains fresh Argon judgments.
+saved baseline videos but obtains fresh judgments from the evaluation judge.
 
 Results under ``val/step_N`` include ``eval-summary.json``,
 ``eval-summary-t2v.json``, and ``eval-summary-i2v.json``. They report each task's
