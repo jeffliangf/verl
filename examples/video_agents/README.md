@@ -258,6 +258,15 @@ response tokens divided by ~15 tokens/s (r = 0.997 in job 2391), so
 limit would drop the policy's own long outputs, which are invalid calls that must
 be scored. To shorten the LLM tail, lower `max_response_length` instead.
 
+Held-out evaluation can decode past the training cap. `video_rl.eval_max_response_length`
+(null: the training cap) is sent as `max_tokens` for evaluation turns only, and
+`video_rl.eval_llm_timeout` (null: `timeouts.llm`) is their stall guard; training
+requests are unchanged. vLLM stops at `rollout.max_model_len` minus the prompt
+without reporting it, so the launcher requires `max_model_len` to be at least
+`data.max_prompt_length` plus the longer cap. Training at 8,192 tokens with a
+32,768-token evaluation and 4,096-token prompts needs `max_model_len=36864` and an
+evaluation timeout of about 3,600 s.
+
 For training, `video_rl.judge_max_attempts` (default 3) permits an initial Gemini judgment request
 plus two retries for 408/429/500/502/503/504 and network failures, including
 response read timeouts. HTTP and network failures share one judgment retry budget;

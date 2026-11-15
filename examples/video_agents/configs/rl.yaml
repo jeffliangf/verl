@@ -57,6 +57,14 @@ video_rl:
   # null reuses the frozen protocol's groups_per_worker setting.
   eval_groups_per_worker: null
 
+  # Held-out evaluation may decode past the training cap; null keeps
+  # data.max_response_length. rollout.max_model_len must fit the longer cap.
+  eval_max_response_length: null
+
+  # Stall guard for one evaluation LLM turn; null reuses timeouts.llm. Size it
+  # like timeouts.llm: about eval_max_response_length / 15 tok/s plus headroom.
+  eval_llm_timeout: null
+
   # Preserve completed comparisons and repair transient evaluation failures before
   # publishing scores. This uses the streaming judge even when training does not.
   eval_repair:

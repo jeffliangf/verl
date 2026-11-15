@@ -294,6 +294,16 @@ def training_config(args):
         raise ValueError("Evaluation loads --model and requires val_only, val_before_train, and resume_mode=disable")
     check_sample_settings(protocol, config)
     runtime_protocol(protocol, config.video_rl)
+    # vLLM stops at max_model_len minus the prompt without reporting a shorter cap.
+    context = config.actor_rollout_ref.rollout.max_model_len
+    longest = max(
+        config.actor_rollout_ref.rollout.response_length, config.video_rl.get("eval_max_response_length") or 0
+    )
+    if context is not None and context < config.data.max_prompt_length + longest:
+        raise ValueError(
+            f"rollout.max_model_len ({context}) must fit data.max_prompt_length plus the longest training or "
+            f"evaluation response ({config.data.max_prompt_length} + {longest})"
+        )
     if config.video_rl.async_lookahead:
         from .cohort_config import validate_config
 
@@ -461,6 +471,15 @@ def train(args) -> dict:
         * sum(len(sample_reference_fields(protocol, sample)) for sample in protocol["samples"]["val"]),
         "training_judge": protocol["judge"]["judge_model"],
         "evaluation_judge": protocol.get("eval_judge", protocol["judge"])["judge_model"],
+        "max_response_tokens": {
+            "training": config.actor_rollout_ref.rollout.response_length,
+            "evaluation": config.video_rl.get("eval_max_response_length")
+            or config.actor_rollout_ref.rollout.response_length,
+        },
+        "llm_timeout_seconds": {
+            "training": config.video_rl.timeouts.llm,
+            "evaluation": config.video_rl.get("eval_llm_timeout") or config.video_rl.timeouts.llm,
+        },
         "reference_fields": list(reference_fields(protocol)),
         "reference_fields_by_task": protocol.get("reference_fields_by_task"),
         "execute": args.execute,

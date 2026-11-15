@@ -91,6 +91,14 @@ def runtime_protocol(protocol: dict, settings) -> dict:
     eval_groups = settings.get("eval_groups_per_worker")
     if eval_groups is not None and (type(eval_groups) is not int or eval_groups < 1):
         raise ValueError("video_rl.eval_groups_per_worker must be a positive integer or null")
+    eval_cap = settings.get("eval_max_response_length")
+    if eval_cap is not None and (type(eval_cap) is not int or eval_cap < 1):
+        raise ValueError("video_rl.eval_max_response_length must be a positive integer or null")
+    eval_llm = settings.get("eval_llm_timeout")
+    if eval_llm is not None and (
+        isinstance(eval_llm, bool) or not isinstance(eval_llm, int | float) or not isfinite(eval_llm) or eval_llm <= 0
+    ):
+        raise ValueError("video_rl.eval_llm_timeout must be positive, finite seconds or null")
     fraction = settings.get("max_judge_fallback_fraction", 0.75)
     if (
         isinstance(fraction, bool)
@@ -131,6 +139,8 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         "judge_failure_policy": policy,
         "judge_streaming": streaming,
         "eval_groups_per_worker": eval_groups,
+        "eval_max_response_length": eval_cap,
+        "eval_llm_timeout": eval_llm,
         "eval_repair": repair,
         "judge_background_cleanup": background_cleanup,
         "judge_limits": limits,

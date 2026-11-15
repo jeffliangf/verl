@@ -228,6 +228,12 @@ tokens and tool definitions. Execution always runs that check and rejects a
 text-only checkpoint for mixed data. Model overrides still use the existing
 Hydra arguments, e.g. ``-- actor_rollout_ref.model.path=/path/to/vision-policy``.
 
+Held-out evaluation can decode longer than training:
+``video_rl.eval_max_response_length=32768`` with ``video_rl.eval_llm_timeout=3600``
+keeps training at ``data.max_response_length`` and needs
+``actor_rollout_ref.rollout.max_model_len=36864`` (4,096 prompt tokens plus the
+longer cap). The preview prints both caps and both LLM limits.
+
 Mixed runs require one stable Sol-H3 gateway with the full v2 contract on every
 ready worker. For the documented localhost endpoint, maintain the SSH tunnel on
 each Ray worker host. Supply credentials through ``H3_SELF_HOSTED_TOKEN_FILE``

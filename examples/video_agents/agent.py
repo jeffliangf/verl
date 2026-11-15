@@ -118,6 +118,7 @@ class H3TerminalLoop(ToolAgentLoop):
         client = self.server_manager
         self.stop_reason = None
         self.policy_cache = None
+        self.llm_timeout = None
 
         async def generate(**request):
             output = (
@@ -146,7 +147,7 @@ class H3TerminalLoop(ToolAgentLoop):
                 slots.release()
 
     async def _generate_with_deadline(self, agent_data, sampling_params, ignore_termination=False):
-        timeout = self.tools["sol_h3"].protocol["timeouts"]["llm"]
+        timeout = self.llm_timeout or self.tools["sol_h3"].protocol["timeouts"]["llm"]
         agent_data._video_timing_path = self.timing_path
         with timed_stage(self.timing_path, "llm", **self.timing_fields, timeout_seconds=timeout) as timing:
             try:
@@ -212,6 +213,15 @@ class H3TerminalLoop(ToolAgentLoop):
         tool = copy(self.tools["sol_h3"])
         tool.output_dir = Path(self.config.video_rl.output_dir)
         tool.protocol = runtime_protocol(tool.protocol, self.config.video_rl)
+        self.llm_timeout = tool.protocol["timeouts"]["llm"]
+        if kwargs.get("_video_evaluation", False):
+            # Held-out turns may decode past the training cap. Training requests keep the
+            # server default, rollout.response_length; vLLM still clamps to max_model_len.
+            cap = tool.protocol.get("eval_max_response_length")
+            if cap is not None:
+                self.response_length = cap
+                sampling_params = {**sampling_params, "max_tokens": cap}
+            self.llm_timeout = tool.protocol.get("eval_llm_timeout") or self.llm_timeout
         if "cohort_step" in kwargs:
             from .policy_cache import PolicyCache
 
@@ -398,6 +408,7 @@ class TournamentWorker(AgentLoopWorkerTQBase):
                     trace=trace,
                     session_id=i,
                     _video_timings=str(directory / "timings.jsonl"),
+                    _video_evaluation=validate,
                     **prompt,
                 )
                 if stream is not None:
