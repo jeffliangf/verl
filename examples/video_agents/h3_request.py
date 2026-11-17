@@ -229,7 +229,11 @@ def tool_request(parameters, schema, *, sample=None):
             image=image,
             seed=42 if request["seed"] is None else request["seed"],
         )
-        if strict_controls and required:
+        # A row with a control contract is judged by the contract's allowed lists below. Its
+        # target holds one representative value of each required field, and a contract may
+        # accept more than that value (both frame roundings of a requested length, or the
+        # named ratio closest to a preserved image shape).
+        if strict_controls and required and "allowed_video_gen_args" not in sample:
             actual = request_output(result)
             expected_output = request_output({**result, "target": {**result["target"], **required}})
             fields = []

@@ -10,6 +10,7 @@
 # limitations under the License.
 """Request-bound control constraints, kept outside the model's user message."""
 
+from copy import deepcopy
 from hashlib import sha256
 
 from .h3_request import ASPECT_RATIOS, canvas_size, request_output
@@ -92,6 +93,27 @@ def validate_contract(sample, contract):
     canvases = [{"width": w, "height": h} for w, h in sorted({ratio_canvas(sample, ratio) for ratio in ratios})]
     if aspect.get("allowed_canvases") != canvases:
         raise ValueError("Allowed canvases disagree with the source image and aspect choices")
+
+
+def widen_contract(sample, contract, *, frames=(), ratios=()):
+    """Also accept more frame counts or aspect ratios for a required control; canvases follow the ratios."""
+    result = deepcopy(contract)
+    duration, aspect = result["target"]["duration_seconds"], result["target"]["aspect_ratio"]
+    if frames:
+        if not duration["required"]:
+            raise ValueError("Only a required duration can be widened")
+        duration["allowed_num_frames"] = sorted(set(duration["allowed_num_frames"]) | set(frames))
+    if ratios:
+        if not aspect["required"]:
+            raise ValueError("Only a required aspect ratio can be widened")
+        allowed = set(aspect["allowed_values"]) | set(ratios)
+        aspect["allowed_values"] = [ratio for ratio in RATIOS if ratio in allowed]
+        aspect["allowed_canvases"] = [
+            {"width": w, "height": h}
+            for w, h in sorted({ratio_canvas(sample, ratio) for ratio in aspect["allowed_values"]})
+        ]
+    validate_contract(sample, result)
+    return result
 
 
 def validate_call(sample, parameters, request):
