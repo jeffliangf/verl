@@ -301,6 +301,9 @@ def test_annotation_cache_reuses_real_response_without_another_call(tmp_path):
     value = annotation(task="i2v")
 
     class Client:
+        # Stand in for the selected transport; routing is exercised separately.
+        vertex_genai = True
+
         def __init__(self, *args, **kwargs):
             pass
 

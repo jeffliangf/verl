@@ -16,6 +16,7 @@ import pytest
 
 from examples.video_agents import judge, scoring
 from examples.video_agents.config import CANDIDATE, JUDGE_SETTINGS
+from examples.video_agents.gemini_transport import transport_identity
 from examples.video_agents.storage import file_sha256, read_jsonl, write_jsonl
 
 
@@ -52,6 +53,7 @@ def ledger(tmp_path):
                 "manifest_sha256": file_sha256(manifest_path),
                 "evaluation_signature": judge.evaluation_signature(pair, manifest["instructions_how_to_compare"]),
                 **JUDGE_SETTINGS,
+                **transport_identity(JUDGE_SETTINGS["judge_model"]),
             }
         )
     path = tmp_path / "judge/judgments-original.jsonl"

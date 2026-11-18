@@ -111,6 +111,9 @@ import socket
 import time
 import urllib.request
 from pathlib import Path
+from examples.video_agents.gemini_transport import (
+    create_vertex_client, read_api_key, transport_identity, uses_vertex, vertex_settings,
+)
 from examples.video_agents.judge_worker import gemini_address_family
 from examples.video_agents.storage import load_external, write_json
 from examples.video_agents.tournament import load_protocol
@@ -118,17 +121,21 @@ from examples.video_agents.tournament import load_protocol
 root = Path(os.environ["RL_RUN_DIR"])
 protocol = load_protocol(root / "protocol.json")
 runner = load_external(Path(protocol["eval_repo"]) / "scripts/run_gemini_pairwise_eval.py")
-key = os.environ.get("GEMINI_API_KEY") or runner.read_env_file(
-    Path(protocol["eval_repo"]) / "arena/.env"
-).get("GEMINI_API_KEY", "")
-assert key, "Gemini credential is missing"
 checks = []
 for model in sorted({protocol["judge"]["judge_model"], protocol["eval_judge"]["judge_model"]}):
-    request = urllib.request.Request(runner.API_BASE + "/models/" + model, headers={"x-goog-api-key": key})
     started = time.monotonic()
-    with gemini_address_family("ipv4"), urllib.request.urlopen(request, timeout=30) as response:
-        assert response.status == 200
-        checks.append({"model": model, "status": response.status, "seconds": time.monotonic() - started})
+    if uses_vertex(model):
+        with create_vertex_client(**vertex_settings(), timeout=30) as client:
+            client.models.get(model=model)
+        status = 200
+    else:
+        key = read_api_key(runner, model, Path(protocol["eval_repo"]) / "arena/.env")
+        request = urllib.request.Request(runner.API_BASE + "/models/" + model, headers={"x-goog-api-key": key})
+        with gemini_address_family("ipv4"), urllib.request.urlopen(request, timeout=30) as response:
+            status = response.status
+    assert status == 200
+    checks.append({"model": model, "status": status, "seconds": time.monotonic() - started,
+                   **transport_identity(model)})
 result = {"host": socket.gethostname(), "checks": checks}
 write_json(root / f"gemini-preflight-{socket.gethostname()}.json", result)
 print(json.dumps(result), flush=True)

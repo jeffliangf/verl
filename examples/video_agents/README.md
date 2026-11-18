@@ -45,6 +45,41 @@ Start with `rl.py.dataset_records`, then `H3TerminalLoop` in `agent.py`, then
 The optimizer, GRPO advantages, token masks, checkpointing, and TensorBoard
 logging come from verl's native trainer.
 
+## Default Vertex route for Argon and Hydrogen
+
+New RL runs use `gemini-4-hydrogen` as the default reward judge. Mixed-task
+evaluation defaults to `gemini-4-argon`. Existing prepared protocols keep their
+saved model selections.
+
+Selecting `gemini-4-argon` or `gemini-4-hydrogen` automatically routes judging,
+inspection, and launch preflights through `google-genai` and local Application
+Default Credentials (ADC). The default Vertex project is `utopai-labs`, in
+`global`. Install the SDK in the Python environment that runs the workers,
+then authenticate on that host:
+
+```bash
+uv pip install --python .venv/bin/python -r examples/video_agents/requirements_vertex.txt
+gcloud auth application-default login --project utopai-labs
+.venv/bin/python -m examples.video_agents.vertex_probe --model gemini-4-hydrogen "Reply with OK."
+```
+
+The probe also accepts `--model gemini-4-argon`, `--project`, `--location`, and
+`--raw`. Worker settings can be overridden with `VERTEX_PROJECT` and
+`VERTEX_LOCATION` (or `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`).
+Both models use ADC even when Gemini or OpenRouter API keys are present. Failed
+requests never switch providers or models. Other model selections retain their
+existing Gemini API route.
+
+Use `video_processing=standard` for Argon and Hydrogen judging. The adapter
+preserves the rubric, media order, schema, thinking level, seed, and output limit while
+translating Interactions requests to Vertex `generateContent`. Inspection's
+explicit static frame rate and media resolution are preserved too.
+
+Start a new output/run directory when switching an existing Argon or Hydrogen
+run to direct Vertex. Ledgers and inspection cache identities record the backend, API,
+project, and location, so results from Gemini, OpenRouter, or Vertex Interactions
+cannot silently resume as direct Vertex `generateContent` results.
+
 ## Model inputs
 
 `system_prompt.txt` is the shared video-assistant role.
@@ -499,7 +534,8 @@ These runtime assets are supplied separately:
 - `~/video-generation-eval`, containing `scripts/run_gemini_pairwise_eval.py`,
   `scripts/build_pairwise_manifest.py`, and `bestofn/normalize.py`.
   `--eval-repo` selects another checkout. Its source hashes and v4 rubric are
-  frozen during preparation. Gemini credentials use that checkout's `arena/.env`.
+  frozen during preparation. Gemini API credentials use that checkout's
+  `arena/.env`; Argon and Hydrogen use local Vertex ADC as described above.
 - A reachable Sol-H3 gateway and token file. Set `--h3-endpoints` and
   `--h3-token-file`, or `H3_SELF_HOSTED_ENDPOINTS` and `H3_SELF_HOSTED_TOKEN_FILE`.
   Workers must be able to access the same run, data, references, evaluator, and

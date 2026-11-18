@@ -17,6 +17,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator, ValidationError
 
+from examples.video_agents.gemini_transport import client_type, read_api_key, transport_identity
 from examples.video_agents.image_assets import image_bytes
 from examples.video_agents.storage import file_sha256, fingerprint, load_external, read_json, run_lock, write_json
 
@@ -185,7 +186,7 @@ def inspect(video, original_request, prior_findings, directory, eval_repo, sourc
         raise ValueError("Registered video bytes changed")
     image = None if source_image is None else {"uri": "IMAGE_URI", "mime_type": source_image["mime_type"]}
     template = build_request("MEDIA_URI", original_request, video["request"]["prompt"], prior_findings, image=image)
-    identity = {"video_sha256": video["sha256"], "request": template}
+    identity = {"video_sha256": video["sha256"], "request": template, **transport_identity(template["model"])}
     if source_image is not None:
         identity["image_sha256"] = source_image["sha256"]
     directory = Path(directory) / fingerprint(identity)
@@ -194,14 +195,8 @@ def inspect(video, original_request, prior_findings, directory, eval_repo, sourc
         if (directory / "result.json").exists():
             return validate_feedback(read_json(directory / "result.json"), prior_findings)
         gemini = load_external(Path(eval_repo) / "scripts/run_gemini_pairwise_eval.py")
-        import os
-
-        key = os.environ.get("GEMINI_API_KEY") or gemini.read_env_file(Path(eval_repo) / "arena/.env").get(
-            "GEMINI_API_KEY"
-        )
-        if not key:
-            raise RuntimeError("Configured Gemini credential is unavailable")
-        client = gemini.GeminiRestClient(key, max_attempts=4, request_timeout=300, file_timeout=900)
+        key = read_api_key(gemini, template["model"], Path(eval_repo) / "arena/.env")
+        client = client_type(gemini, template["model"])(key, max_attempts=4, request_timeout=300, file_timeout=900)
         start = time.monotonic()
         uploaded = uploaded_image = None
         try:

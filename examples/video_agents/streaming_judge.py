@@ -29,6 +29,7 @@ from . import judge
 from .config import judging_protocol
 from .dataset import verify_references
 from .gemini_files import UploadJournal
+from .gemini_transport import read_api_key, vertex_runner
 from .image_assets import image_bytes
 from .judge_worker import gemini_address_family, instrument_client, parallel_pairs, parse_options, reference_images
 from .observability import ProviderError, record_event, timed_stage
@@ -281,8 +282,7 @@ def run_stream(directory, runner):
     count = 1 if validate else protocol["group_size"]
     candidates = [{"status": "pending"} for _ in range(count)]
     allow_fallback = not validate and protocol.get("judge_failure_policy") == "neutral"
-    env = runner.read_env_file(Path(protocol["eval_repo"]) / "arena/.env")
-    api_key = os.environ.get("GEMINI_API_KEY") or env.get("GEMINI_API_KEY", "")
+    api_key = read_api_key(runner, protocol["judge"]["judge_model"], Path(protocol["eval_repo"]) / "arena/.env")
     client = runner.GeminiRestClient(
         api_key,
         max_attempts=protocol["judge_max_attempts"],
@@ -376,7 +376,8 @@ def main():
     if args.parent_pid is not None:
         guard_parent(args.parent_pid)
     root = args.directory / "judge/stream"
-    protocol = read_json(root / "context.json")["protocol"]
+    context = read_json(root / "context.json")
+    protocol = judging_protocol(context["protocol"], validate=context["validate"])
     runner = load_external(Path(protocol["eval_repo"]) / "scripts/run_gemini_pairwise_eval.py")
     from .cleanup import readers
     from .provider_limits import provider_limits
@@ -390,16 +391,17 @@ def main():
             # gate never waits while blocked; the parent owns the pass deadline.
             float("inf"),
         )
-    instrument_client(runner, args.directory / "judge/timings-stream.jsonl", protocol["timeouts"]["judge_control"])
-    deferred = protocol.get("judge_background_cleanup", False)
-    with (
-        readers(args.directory, protocol) if deferred else nullcontext(),
-        record_fatal(root),
-        gemini_address_family("ipv4"),
-        reference_images(runner),
-        parallel_pairs(runner, keep_uploaded_files=deferred),
-    ):
-        run_stream(args.directory, runner)
+    with vertex_runner(runner, protocol["judge"]["judge_model"]):
+        instrument_client(runner, args.directory / "judge/timings-stream.jsonl", protocol["timeouts"]["judge_control"])
+        deferred = protocol.get("judge_background_cleanup", False)
+        with (
+            readers(args.directory, protocol) if deferred else nullcontext(),
+            record_fatal(root),
+            gemini_address_family("ipv4"),
+            reference_images(runner),
+            parallel_pairs(runner, keep_uploaded_files=deferred),
+        ):
+            run_stream(args.directory, runner)
 
 
 if __name__ == "__main__":

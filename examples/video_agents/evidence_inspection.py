@@ -13,13 +13,13 @@
 import argparse
 import json
 import math
-import os
 import time
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
 from . import inspection
+from .gemini_transport import client_type, read_api_key, transport_identity
 from .storage import file_sha256, fingerprint, load_external, read_json, run_lock, write_json
 
 ASSET_DIR = Path(__file__).with_name("inspection_v4")
@@ -131,7 +131,12 @@ def inspect_video(
         system_prompt=policy,
     )
     digest = file_sha256(video)
-    identity = {"video_sha256": digest, "request_template": template, "duration": duration}
+    identity = {
+        "video_sha256": digest,
+        "request_template": template,
+        "duration": duration,
+        **transport_identity(template["model"]),
+    }
     directory = Path(output_dir or Path(__file__).resolve().parents[2] / "outputs/video_inspection_v4") / fingerprint(
         identity
     )
@@ -143,12 +148,10 @@ def inspect_video(
         write_json(directory / "identity.json", identity)
         repo = Path(eval_repo or Path.home() / "video-generation-eval")
         gemini = load_external(repo / "scripts/run_gemini_pairwise_eval.py")
-        key = os.environ.get("GEMINI_API_KEY") or gemini.read_env_file(repo / "arena/.env").get("GEMINI_API_KEY")
-        if not key:
-            raise RuntimeError("Configured Gemini credential is unavailable")
+        key = read_api_key(gemini, template["model"], repo / "arena/.env")
         began = time.monotonic()
         try:
-            client = gemini.GeminiRestClient(key, max_attempts=4, request_timeout=300, file_timeout=900)
+            client = client_type(gemini, template["model"])(key, max_attempts=4, request_timeout=300, file_timeout=900)
             uploaded = client.upload_video(video)
             upload_seconds = time.monotonic() - began
             if uploaded["mime_type"] != "video/mp4" or file_sha256(video) != digest:

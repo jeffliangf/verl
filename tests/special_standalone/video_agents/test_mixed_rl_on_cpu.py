@@ -413,8 +413,43 @@ def test_batch_judge_sends_same_first_frame_in_both_orders(local_runner, interru
     assert sum(op == "cleanup" for op, _ in server.calls) == 3
 
 
-def test_streaming_eval_uses_argon_and_shared_source_image(prepared_rl, local_runner, interrupted_gemini, tmp_path):
-    from examples.video_agents import streaming_judge
+def test_streaming_eval_uses_argon_and_shared_source_image(
+    prepared_rl, local_runner, interrupted_gemini, tmp_path, monkeypatch
+):
+    from google.genai import types
+
+    from examples.video_agents import gemini_transport, streaming_judge
+
+    requests = []
+
+    def generate_content(**request):
+        requests.append(request)
+        return types.GenerateContentResponse(
+            model_version="gemini-4-argon",
+            candidates=[
+                types.Candidate(
+                    finish_reason="STOP",
+                    content=types.Content(
+                        parts=[
+                            types.Part(
+                                text=json.dumps(
+                                    {"preferred_video": "A", "reason": "Visible evidence", "confidence": "high"}
+                                )
+                            )
+                        ]
+                    ),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        gemini_transport,
+        "create_vertex_client",
+        lambda **kwargs: SimpleNamespace(
+            models=SimpleNamespace(generate_content=generate_content),
+            close=lambda: None,
+        ),
+    )
 
     _, protocol, _ = prepared_rl
     interrupted_gemini.remaining = 0
@@ -431,7 +466,11 @@ def test_streaming_eval_uses_argon_and_shared_source_image(prepared_rl, local_ru
     write_json(root / "context.json", {"protocol": protocol, "sample": sample, "validate": True})
     write_json(root / "candidate-0.json", clips[0])
     write_json(root / "finished.json", True)
-    with judge_worker.reference_images(local_runner), judge_worker.parallel_pairs(local_runner):
+    with (
+        gemini_transport.vertex_runner(local_runner, "gemini-4-argon"),
+        judge_worker.reference_images(local_runner),
+        judge_worker.parallel_pairs(local_runner),
+    ):
         streaming_judge.run_stream(directory, local_runner)
     write_json(root / "outcome.json", {"timed_out": False, "returncode": 0})
     manifests = streaming_judge.ready_manifests(protocol, sample, clips[:1], True)
@@ -439,11 +478,12 @@ def test_streaming_eval_uses_argon_and_shared_source_image(prepared_rl, local_ru
         directory, judging_protocol(protocol, validate=True), manifests, allow_fallback=False
     )
     assert all(len(rows) == 4 for rows in results.values())
-    requests = [json.loads(body) for op, body in interrupted_gemini.calls if op == "interaction"]
     assert len(requests) == 8
-    assert all(r["model"] == "gemini-4-argon" and r["input"][2]["type"] == "image" for r in requests)
-    assert sum(op == "upload" for op, _ in interrupted_gemini.calls) == 6
-    assert sum(op == "cleanup" for op, _ in interrupted_gemini.calls) == 6
+    assert all(r["model"] == "gemini-4-argon" for r in requests)
+    images = [r["contents"][0].parts[2].inline_data for r in requests]
+    assert all(image.mime_type == sample["image"]["mime_type"] for image in images)
+    assert all(image.data == Path(sample["image"]["path"]).read_bytes() for image in images)
+    assert not interrupted_gemini.calls  # Vertex keeps media inline and makes no Gemini File API calls.
 
 
 def test_i2v_reference_accepts_only_documented_cancelled_lanes(tmp_path):

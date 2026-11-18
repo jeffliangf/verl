@@ -13,7 +13,6 @@
 import argparse
 import base64
 import json
-import os
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +25,7 @@ from jsonschema import Draft202012Validator, ValidationError
 
 from .config import DEFAULT_EVAL_REPO, ROOT
 from .control_constraints import FRAME_COUNTS, RATIOS, allowed_arguments, ratio_canvas
+from .gemini_transport import client_type, read_api_key, transport_identity
 from .h3_request import ASPECT_RATIOS, frame_count, tool_request
 from .image_assets import image_bytes
 from .judge_worker import gemini_address_family
@@ -151,6 +151,7 @@ def select_samples(rows, per_task, seed):
 def annotation_identity(sample, model, policy):
     return {
         "model": model,
+        **transport_identity(model),
         "policy": policy,
         "schema": ANNOTATION_SCHEMA,
         "prompt": sample["prompt"],
@@ -171,7 +172,7 @@ def annotate(sample, directory, model, policy, runner, key, *, cache_only=False)
             return validate_annotation(read_json(root / "annotation.json"), sample), root
         if cache_only:
             raise ValueError("No validated cached annotation is available")
-        client = runner.GeminiRestClient(key, max_attempts=3, request_timeout=180, file_timeout=60)
+        client = client_type(runner, model)(key, max_attempts=3, request_timeout=180, file_timeout=60)
         inputs = [{"type": "text", "text": "Original scene text:\n" + sample["prompt"]}]
         if sample["image"]:
             asset = sample["image"]
@@ -440,11 +441,7 @@ def main(argv=None):
     runner, key = None, None
     if not args.render_only:
         runner = load_external(args.eval_repo / "scripts/run_gemini_pairwise_eval.py")
-        key = os.environ.get("GEMINI_API_KEY") or runner.read_env_file(args.eval_repo / "arena/.env").get(
-            "GEMINI_API_KEY"
-        )
-        if not key:
-            raise RuntimeError("Configured Gemini credential is unavailable")
+        key = read_api_key(runner, args.model, args.eval_repo / "arena/.env")
     with run_lock(directory), gemini_address_family("ipv4"):
         freeze_json(directory / "manifest.json", config)
         previous_errors = (

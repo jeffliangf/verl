@@ -252,6 +252,8 @@ def test_real_judgments_protect_training_and_evaluation(
     runner, server = local_runner, interrupted_gemini
     server.operation = operation
     directory, protocol, _ = prepared_rl
+    # This suite exercises the Gemini Files/Interactions transport and its cleanup.
+    protocol = {**protocol, "judge": {**protocol["judge"], "judge_model": "gemini-3.8-flash"}}
     sample = protocol["samples"]["val" if validate else "train"][0]
     clips = candidates(tmp_path)[:1] if validate else candidates(tmp_path)
     group = directory / "interrupted-judgments"

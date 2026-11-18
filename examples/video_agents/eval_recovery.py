@@ -10,7 +10,6 @@
 # limitations under the License.
 """Repair individual held-out judgments without resampling policy outputs or votes."""
 
-import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +17,7 @@ from pathlib import Path
 
 from . import judge
 from .dataset import verify_references
+from .gemini_transport import read_api_key, uses_vertex
 from .observability import record_event
 from .storage import file_sha256, freeze_json, read_json, run_lock, write_json
 from .upload_admission import UploadAdmission, storage_quota
@@ -57,16 +57,17 @@ def run_evaluation(directory, runner, protocol, sample):
         )
         deadline = state["deadline_at"]
         maximum = protocol["judge_max_attempts"]
-        admission = UploadAdmission(
-            Path(protocol.get("provider_recovery_root", root)) / "gemini-upload-quota", deadline
+        admission = (
+            None
+            if uses_vertex(settings["judge_model"])
+            else UploadAdmission(Path(protocol.get("provider_recovery_root", root)) / "gemini-upload-quota", deadline)
         )
         runner._verl_upload_admission = admission
         # The outer scheduler owns retries. A runner invocation gets ONE attempt,
         # avoiding three HTTP attempts multiplied by three repair passes.
         once = {**protocol, "judge_max_attempts": 1}
-        env = runner.read_env_file(Path(protocol["eval_repo"]) / "arena/.env")
         client = runner.GeminiRestClient(
-            os.environ.get("GEMINI_API_KEY") or env.get("GEMINI_API_KEY", ""),
+            read_api_key(runner, settings["judge_model"], Path(protocol["eval_repo"]) / "arena/.env"),
             max_attempts=1,
             request_timeout=protocol["timeouts"]["judge_request"],
             file_timeout=protocol["timeouts"]["judge_file"],
@@ -118,7 +119,7 @@ def run_evaluation(directory, runner, protocol, sample):
                 verify_references([sample])
                 if candidate["status"] == "succeeded" and file_sha256(Path(candidate["path"])) != candidate["sha256"]:
                     raise ValueError("Candidate video changed during evaluation repair")
-                if admission.blocked():
+                if admission is not None and admission.blocked():
                     # No comparison readers remain here. Release only this
                     # process's files and perform one real capacity probe BEFORE
                     # spending another comparison attempt or starting a wave.
@@ -171,7 +172,7 @@ def run_evaluation(directory, runner, protocol, sample):
                 # before probing capacity. Never delete another process's files.
                 reset = getattr(runner, "_verl_reset_uploads", None)
                 if reset is not None:
-                    reset(failed_only=not (quota or admission.blocked()))
+                    reset(failed_only=not (quota or (admission is not None and admission.blocked())))
                 delay = 5 + random.uniform(0, 2)
                 time.sleep(max(0, min(delay, deadline - time.time())))
             state["complete"] = all(row["status"] == "completed" for row in state["pairs"].values())

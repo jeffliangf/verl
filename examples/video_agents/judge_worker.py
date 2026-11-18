@@ -23,6 +23,7 @@ from contextvars import ContextVar
 from pathlib import Path
 
 from .gemini_files import UploadJournal, metadata_url, valid_name
+from .gemini_transport import resolved_model, vertex_runner
 from .image_assets import image_bytes
 from .observability import record_event, timed_stage
 from .storage import load_external
@@ -222,6 +223,8 @@ def instrument_client(runner, timings: Path, file_control_timeout: float = 30.0)
                     interaction.reset(token)
 
         def delete_file(self, name):
+            if getattr(self, "vertex_genai", False):
+                return super().delete_file(name)
             with timed_stage(
                 timings, "gemini_file_delete", timeout_seconds=min(self.file_timeout, file_control_timeout)
             ):
@@ -266,7 +269,9 @@ def parallel_pairs(runner, *, keep_uploaded_files=False):
                     uploads[key] = Future()
                 future = uploads[key]
             if owner:
-                admission = getattr(runner, "_verl_upload_admission", None)
+                admission = (
+                    None if getattr(self, "vertex_genai", False) else getattr(runner, "_verl_upload_admission", None)
+                )
                 token = None
                 try:
                     if admission is not None:
@@ -353,17 +358,19 @@ def parse_options(argv=None):
 def main(argv=None):
     args, forwarded = parse_options(argv)
     runner = load_external(args.runner)
-    instrument_client(runner, args.timings, args.file_control_timeout)
-    record_event(args.timings, "gemini_network", "configured", address_family=args.address_family)
-    with gemini_address_family(args.address_family), reference_images(runner):
-        if args.parallel_pairs:
-            with parallel_pairs(runner, keep_uploaded_files="--keep-uploaded-files" in forwarded):
+    settings = runner.parse_args(forwarded)
+    with vertex_runner(runner, resolved_model(runner, settings)):
+        instrument_client(runner, args.timings, args.file_control_timeout)
+        record_event(args.timings, "gemini_network", "configured", address_family=args.address_family)
+        with gemini_address_family(args.address_family), reference_images(runner):
+            if args.parallel_pairs:
+                with parallel_pairs(runner, keep_uploaded_files="--keep-uploaded-files" in forwarded):
+                    return runner.main(forwarded)
+            try:
                 return runner.main(forwarded)
-        try:
-            return runner.main(forwarded)
-        finally:
-            if "--keep-uploaded-files" not in forwarded:
-                runner._verl_cleanup_uploads()
+            finally:
+                if "--keep-uploaded-files" not in forwarded:
+                    runner._verl_cleanup_uploads()
 
 
 if __name__ == "__main__":

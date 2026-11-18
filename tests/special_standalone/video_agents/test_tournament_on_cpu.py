@@ -24,6 +24,7 @@ from omegaconf import OmegaConf
 
 from examples.video_agents import h3, judge, rl, tournament
 from examples.video_agents.config import CANDIDATE, DEFAULT_REFERENCES, JUDGE_SETTINGS, REFERENCE_VIDEO_FIELDS
+from examples.video_agents.gemini_transport import transport_identity
 from examples.video_agents.h3_request import video_request
 from examples.video_agents.judge import EXTERNAL_FILES
 from examples.video_agents.observability import ProviderError
@@ -251,6 +252,8 @@ def install_judge(monkeypatch, *, winner=CANDIDATE):
                     "manifest_sha256": file_sha256(manifest_path),
                     "evaluation_signature": judge.evaluation_signature(pair, manifest["instructions_how_to_compare"]),
                     **JUDGE_SETTINGS,
+                    "judge_model": command[command.index("--model") + 1],
+                    **transport_identity(command[command.index("--model") + 1]),
                 }
             )
         write_jsonl(output_path, rows)
@@ -2144,6 +2147,8 @@ def test_streaming_uploads_and_both_orders_start_before_last_video(prepared_rl, 
         pytest.skip("Optional frozen evaluator integration; no downloads or provider calls")
     runner = load_external(runner_path)
     directory, protocol, _ = prepared_rl
+    # This fake exercises remote uploads and deletion on the legacy Gemini route.
+    protocol = {**protocol, "judge": {**protocol["judge"], "judge_model": "gemini-3.8-flash"}}
     protocol.update(group_size=8, judge_concurrency=4, judge_failure_policy="neutral")
     sample = protocol["samples"]["train"][0]
     clips = candidates(tmp_path, group_size=8, invalid=(7,))

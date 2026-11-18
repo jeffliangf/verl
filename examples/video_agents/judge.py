@@ -18,6 +18,7 @@ from collections import Counter
 from pathlib import Path
 
 from .config import CANDIDATE, sample_reference_fields
+from .gemini_transport import transport_identity, validate_backend
 from .image_assets import reference_image_fields
 from .storage import file_sha256, freeze_json, item_key, read_json
 
@@ -167,6 +168,7 @@ def _ledger_rows(path: Path, counts: Counter):
 
 
 def validate_identity(row: dict, manifest: dict, manifest_hash: str, settings: dict) -> dict:
+    validate_backend(row, settings["judge_model"])
     pair_id = row.get("pair_id")
     pair = manifest["pairs"].get(pair_id)
     if pair is None:
@@ -285,6 +287,7 @@ def neutral_fallback(key: str, manifest: dict, manifest_path: Path, settings: di
     pair = manifest["pairs"][key]
     return {
         **settings,
+        **transport_identity(settings["judge_model"]),
         **{name: pair[name] for name in ("prompt_id", "model_A", "model_B")},
         "pair_id": key,
         "manifest_sha256": file_sha256(manifest_path),

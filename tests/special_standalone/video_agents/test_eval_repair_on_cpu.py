@@ -31,7 +31,8 @@ from examples.video_agents.storage import file_sha256, read_json, write_json
 def evaluation(prepared_rl, external_runner, tmp_path, monkeypatch):
     directory, original, _ = prepared_rl
     protocol = copy.deepcopy(original)
-    protocol["eval_judge"] = {**protocol["judge"], "judge_model": "gemini-4-argon"}
+    # These cases exercise Gemini Files API quota repair; Vertex uses inline media.
+    protocol["eval_judge"] = {**protocol["judge"], "judge_model": "gemini-3.8-flash"}
     protocol["provider_recovery_root"] = str(directory / "provider-recovery")
     sample = copy.deepcopy(protocol["samples"]["val"][0])
     fourth = tmp_path / "fourth-reference.mp4"
@@ -65,7 +66,7 @@ def evaluation(prepared_rl, external_runner, tmp_path, monkeypatch):
 
         def evaluate(self, payload, **kwargs):
             assert self.max_attempts == 1 and self.request_timeout == 180
-            assert payload["model"] == "gemini-4-argon"
+            assert payload["model"] == protocol["eval_judge"]["judge_model"]
             identity = tuple(part["uri"] for part in payload["input"] if part["type"] == "video")
             seen[identity] += 1
             remaining = faults.get(identity, [])
@@ -272,7 +273,7 @@ def test_evaluation_timeouts_do_not_change_training_or_protocol_identity(evaluat
     validation = judging_protocol(protocol, validate=True)
     assert training["timeouts"]["judge_request"] == 45 and training["timeouts"]["judge_pass"] == 300
     assert validation["timeouts"]["judge_request"] == 180 and validation["timeouts"]["judge_pass"] == 900
-    assert validation["judge"]["judge_model"] == "gemini-4-argon"
+    assert validation["judge"]["judge_model"] == protocol["eval_judge"]["judge_model"]
     assert training["protocol_sha256"] == validation["protocol_sha256"]
     assert training["judge_concurrency"] == validation["judge_concurrency"]
     assert training["max_judge_fallback_fraction"] == validation["max_judge_fallback_fraction"]
