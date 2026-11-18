@@ -20,6 +20,7 @@ import random
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -415,18 +416,41 @@ def retry_delay(error, attempt):
     return delay
 
 
+_PROCESS_GATES = {}
+_PROCESS_GATES_LOCK = threading.Lock()
+
+
+def _process_gate(slots, limit):
+    key = (str(slots.resolve()), limit)
+    with _PROCESS_GATES_LOCK:
+        if key not in _PROCESS_GATES:
+            _PROCESS_GATES[key] = threading.BoundedSemaphore(limit)
+        return _PROCESS_GATES[key]
+
+
 @contextmanager
-def generation_slot(run_dir, limit, timings):
+def generation_slot(run_dir, limit, timings, process_limit=None):
     """Bound H3 lifecycles across processes sharing a run directory.
 
     Advisory locks release on process exit. Waiting happens before the generation
     subprocess starts, so it does not consume that candidate's in-flight budget.
+    ``process_limit`` caps how many of this process's threads hold or wait for a
+    shared slot. The others wait in memory, so a saturated pool is not polled
+    through lock files on the run directory's network file system.
     """
+    if process_limit is not None and (type(process_limit) is not int or process_limit < 1):
+        raise ValueError("process_limit must be a positive integer or None")
     slots = Path(run_dir) / ".h3-slots"
     slots.mkdir(parents=True, exist_ok=True)
+    gate = _process_gate(slots, process_limit) if process_limit else None
+    fields = {"limit": limit} if gate is None else {"limit": limit, "process_limit": process_limit}
+    gated = False
     acquired = None
     try:
-        with timed_stage(timings, "h3_global_slot_wait", limit=limit):
+        with timed_stage(timings, "h3_global_slot_wait", **fields):
+            if gate is not None:
+                gate.acquire()
+                gated = True
             while acquired is None:
                 indices = list(range(limit))
                 random.shuffle(indices)
@@ -448,6 +472,8 @@ def generation_slot(run_dir, limit, timings):
     finally:
         if acquired is not None:
             acquired.close()
+        if gated:
+            gate.release()
 
 
 class _Generation:

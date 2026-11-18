@@ -90,7 +90,12 @@ class SolH3Tool(BaseTool):
                 def generate():
                     # Keep the shared slot in the executor thread until its H3
                     # subprocess has exited, including if this coroutine is cancelled.
-                    with generation_slot(self.output_dir, self.protocol["h3_max_inflight"], timing_path):
+                    with generation_slot(
+                        self.output_dir,
+                        self.protocol["h3_max_inflight"],
+                        timing_path,
+                        process_limit=getattr(self, "process_limit", None),
+                    ):
                         return generate_video(directory, self.protocol, request)
 
                 result = await asyncio.to_thread(generate)
@@ -213,6 +218,13 @@ class H3TerminalLoop(ToolAgentLoop):
         tool = copy(self.tools["sol_h3"])
         tool.output_dir = Path(self.config.video_rl.output_dir)
         tool.protocol = runtime_protocol(tool.protocol, self.config.video_rl)
+        # The run-wide H3 slots are lock files in the run directory (NFS). Each agent
+        # worker process takes only its share of them; its other renders wait in memory.
+        limit = tool.protocol.get("h3_max_inflight")
+        rollout = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
+        workers = getattr(getattr(rollout, "agent", None), "num_workers", None)
+        if type(limit) is int and type(workers) is int and limit > 0 and workers > 0:
+            tool.process_limit = math.ceil(limit / workers)
         self.llm_timeout = tool.protocol["timeouts"]["llm"]
         if kwargs.get("_video_evaluation", False):
             # Held-out turns may decode past the training cap. Training requests keep the
