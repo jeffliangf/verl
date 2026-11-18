@@ -68,7 +68,7 @@ and music sections as optional guidance. It does not require that format or
 add a formatting reward.
 
 The generation tool is `sol_h3(prompt, duration=10, seed=42, image=..., aspect_ratio=...)`.
-Its prompt must contain 1–8,000 characters; seed is an integer from 0 through
+Its prompt must contain 1–16,000 characters; seed is an integer from 0 through
 9223372036854775807. The model's chat template and verl's native `qwen3_coder`
 parser handle tool-call syntax. Model and adapter selection remain fixed service settings.
 

@@ -760,7 +760,7 @@ def test_prepare_records_tool_schema_and_reference_provenance(prepared_rl, fresh
         schema = row["tools"][0]["function"]
         assert "Sol-H3" in schema["description"] and "10 seconds" not in schema["description"]
         assert set(schema["parameters"]["properties"]) == {"prompt", "duration", "seed", "image", "aspect_ratio"}
-        assert schema["parameters"]["properties"]["prompt"]["maxLength"] == 8000
+        assert schema["parameters"]["properties"]["prompt"]["maxLength"] == 16000
         assert "SECRET" not in json.dumps(row)
 
 

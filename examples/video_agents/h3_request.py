@@ -148,8 +148,8 @@ def request_output(request):
 
 def video_request(prompt, *, duration=10, seed=42, image=None, aspect_ratio=None):
     """Build the SGLang API body; an optional first frame selects fl2va and auto geometry."""
-    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000:
-        raise ValueError("Sol-H3 needs a nonempty prompt of at most 8000 characters")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 16000:
+        raise ValueError("Sol-H3 needs a nonempty prompt of at most 16000 characters")
     if type(seed) is not int or not 0 <= seed <= 2**63 - 1:
         raise ValueError("Sol-H3 seed must be an integer from 0 through 9223372036854775807")
     frame_count(duration)

@@ -320,8 +320,8 @@ def test_backend_configuration_preserves_reference_provenance(job):
         "endpoint": "/v1/videos",
         "endpoints": ["http://reference:18080"],
     }
-    with pytest.raises(ValueError, match="at most 8000"):
-        h3.request_body("x" * 8001, protocol["h3"])
+    with pytest.raises(ValueError, match="at most 16000"):
+        h3.request_body("x" * 16001, protocol["h3"])
     with pytest.raises(ValueError, match="origins"):
         h3.configuration("http://secret@worker:18080", protocol["media_profile"], REFERENCE_MANIFEST)
 

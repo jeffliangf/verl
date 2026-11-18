@@ -114,8 +114,8 @@ def configuration(endpoints, profile, reference_manifest, token_file=None):
 
 def request_body(prompt, settings):
     """Reconstruct legacy ten-second reference requests without changing their hashes."""
-    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000:
-        raise ValueError("Self-hosted H3 needs a nonempty prompt of at most 8000 characters")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 16000:
+        raise ValueError("Self-hosted H3 needs a nonempty prompt of at most 16000 characters")
     if settings["duration"] != 10:
         raise ValueError("Reference videos must be 10-second clips")
     return {"prompt": prompt, "duration": settings["duration"], "seed": settings["seed"]}

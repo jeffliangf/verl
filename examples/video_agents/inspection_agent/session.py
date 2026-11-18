@@ -38,7 +38,7 @@ TOOLS = [
                     "prompt": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": 8000,
+                        "maxLength": 16000,
                         "description": "Complete video/audio description preserving the original goal. "
                         "Context-IR sections "
                         "integrated_multimodal_description, overall_soundscape and non_diegetic_music may help.",
