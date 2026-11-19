@@ -129,6 +129,20 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         raise ValueError("video_rl.judge_limits requires positive comparisons, uploads, deletions, cleanup_backlog")
     if background_cleanup and (not output or output == "???"):
         raise ValueError("Background cleanup requires video_rl.output_dir")
+    secondary = settings.get("judge_secondary")
+    if secondary is not None:
+        secondary = dict(secondary)
+        if set(secondary) != {"model", "primary_attempts", "attempts", "concurrency"}:
+            raise ValueError("video_rl.judge_secondary requires model, primary_attempts, attempts and concurrency")
+        if secondary["model"] not in judge.SECONDARY_JUDGE_MODELS:
+            raise ValueError(f"Unsupported secondary judge: {secondary['model']}")
+        if secondary["model"] == protocol["judge"]["judge_model"]:
+            raise ValueError("The secondary judge must differ from the primary judge")
+        if any(type(secondary[name]) is not int or secondary[name] < 1 for name in secondary if name != "model"):
+            raise ValueError("video_rl.judge_secondary attempts and concurrency must be positive integers")
+        # Training only: it replaces neutral imputation in the streamed tournament.
+        if policy != "neutral" or not streaming:
+            raise ValueError("video_rl.judge_secondary requires judge_failure_policy=neutral and judge_streaming")
     return {
         **protocol,
         **h3.recovery_settings(settings),
@@ -146,6 +160,7 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         "judge_limits": limits,
         **({"provider_recovery_root": str(Path(output) / "provider-recovery")} if output and output != "???" else {}),
         "max_judge_fallback_fraction": fraction,
+        **({"judge_secondary": secondary} if secondary is not None else {}),
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
     }
 

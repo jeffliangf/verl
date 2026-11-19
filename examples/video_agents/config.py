@@ -49,9 +49,14 @@ def sample_reference_fields(protocol, sample):
 
 
 def judging_protocol(protocol, *, validate):
-    """Evaluation may use Argon while training retains its original judge settings."""
+    """Evaluation may use Argon while training retains its original judge settings.
+
+    With a secondary judge, training gives the primary judge its own attempt budget;
+    evaluation keeps judge_max_attempts and its repair passes.
+    """
     if not validate:
-        return protocol
+        secondary = protocol.get("judge_secondary")
+        return {**protocol, "judge_max_attempts": secondary["primary_attempts"]} if secondary else protocol
     result = {**protocol, "judge": protocol.get("eval_judge", protocol["judge"])}
     repair = protocol.get("eval_repair", {})
     if repair.get("enabled", False):

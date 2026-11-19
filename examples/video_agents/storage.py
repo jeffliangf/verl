@@ -116,9 +116,12 @@ def run_lock(run_dir: Path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def load_external(path: Path):
-    """Load a standalone helper from the user's existing video evaluation repository."""
-    name = "_video_agents_" + fingerprint(str(path.resolve()))
+def load_external(path: Path, *, namespace: str = "_video_agents_"):
+    """Load a standalone helper from the user's existing video evaluation repository.
+
+    Another namespace loads an independent instance, so its patches stay separate.
+    """
+    name = namespace + fingerprint(str(path.resolve()))
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load {path}")

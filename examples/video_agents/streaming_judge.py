@@ -20,7 +20,9 @@ import asyncio
 import os
 import subprocess
 import sys
+import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -35,6 +37,11 @@ from .judge_worker import gemini_address_family, instrument_client, parallel_pai
 from .observability import ProviderError, record_event, timed_stage
 from .storage import file_sha256, freeze_json, guard_parent, load_external, read_json, write_json
 from .tournament import check_dependencies, tournament_manifests
+
+# A training pair whose primary comparison failed is re-judged in both orders by
+# the secondary judge; this marker in its pair directory records that routing.
+SECONDARY_LEDGER = "secondary"
+SECONDARY_MARKER = "secondary.json"
 
 
 def pair_manifest(manifest, key):
@@ -77,21 +84,53 @@ def record_fatal(root):
         raise
 
 
-def read_pair(directory, protocol, manifest, order, *, allow_fallback, timed_out=False):
+def secondary_routed(directory):
+    return (directory / "judge" / SECONDARY_MARKER).exists()
+
+
+def secondary_reason(row):
+    """Any secondary failure imputes the neutral vote it replaced; it never stops training."""
+    try:
+        return judge.fallback_reason(row)
+    except RuntimeError:
+        return "nonrecoverable"
+
+
+def read_pair(directory, protocol, manifest, order, *, allow_fallback, timed_out=False, final=False):
+    """Read one order of one pair.
+
+    With a secondary judge, a recoverable primary failure is left open until the pair is
+    routed; a routed pair takes the secondary judge's verdicts in both orders. A final
+    read (scoring) imputes the neutral vote for anything still unresolved.
+    """
     manifest_path = directory / "judge" / f"manifest-{order}.json"
     freeze_json(manifest_path, manifest)
     path = directory / "judge" / f"judgments-{order}.jsonl"
     completed, _ = judge.read_judgments(path, manifest, manifest_path, protocol["judge"])
     fallback_path = directory / "judge" / f"fallbacks-{order}.json"
     fallbacks = judge.read_fallbacks(fallback_path, manifest, manifest_path, protocol["judge"])
+    errors = judge.read_failure_rows(path, manifest, manifest_path, protocol["judge"])
+    secondary = judge.secondary_settings(protocol) if allow_fallback else None
+    routed = secondary is not None and secondary_routed(directory)
+    if routed:
+        # The primary verdicts of a routed pair are kept in their ledger but not used.
+        path = directory / "judge" / f"judgments-{order}-{SECONDARY_LEDGER}.jsonl"
+        completed, _ = judge.read_judgments(path, manifest, manifest_path, secondary)
+        completed = {key: {**row, "judge_role": "secondary"} for key, row in completed.items()}
+        errors = judge.read_failure_rows(path, manifest, manifest_path, secondary)
     if set(completed) & set(fallbacks) or (fallbacks and not allow_fallback):
         raise ValueError("Conflicting or disallowed streamed fallbacks")
-    errors = judge.read_failure_rows(path, manifest, manifest_path, protocol["judge"])
     for key in set(manifest["pairs"]) - set(completed) - set(fallbacks):
-        if key not in errors and not timed_out:
+        if key not in errors and not timed_out and not (final and routed):
             continue
-        # Classify even during a timeout: auth/configuration errors stay fatal.
-        reason = judge.fallback_reason(errors[key]) if key in errors else "pass_timeout"
+        if routed:
+            missing = "pass_timeout" if timed_out else "missing"
+            reason = "secondary_" + (secondary_reason(errors[key]) if key in errors else missing)
+        else:
+            # Classify even during a timeout: auth/configuration errors stay fatal.
+            reason = judge.fallback_reason(errors[key]) if key in errors else "pass_timeout"
+            if secondary is not None and key in errors and not (timed_out or final):
+                continue
         if not allow_fallback:
             raise ProviderError("gemini", f"Streamed {order} comparison {key} failed: {reason}; see {path}")
         fallbacks[key] = judge.neutral_fallback(
@@ -120,6 +159,7 @@ def read_streamed_judgments(directory, protocol, manifests, *, allow_fallback):
                 order,
                 allow_fallback=allow_fallback,
                 timed_out=outcome["timed_out"] or repair_exhausted,
+                final=True,
             )
             if key not in result:
                 raise RuntimeError(f"Streaming runner left {order}/{key} without a result or recorded failure")
@@ -263,8 +303,13 @@ class StreamingJudge:
             self.log.close()
 
 
-def run_stream(directory, runner):
-    """Reuse the frozen runner, its retry budget, and a shared upload cache."""
+def run_stream(directory, runner, secondary_runner=None):
+    """Reuse the frozen runner, its retry budget, and a shared upload cache.
+
+    In training with a secondary judge, a pair whose primary comparison failed in either
+    order is re-judged by the secondary judge in both orders, once both primary attempts
+    have settled; a secondary failure leaves that order's neutral vote.
+    """
     root = directory / "judge/stream"
     context = read_json(root / "context.json")
     protocol, sample, validate = context["protocol"], context["sample"], context["validate"]
@@ -282,6 +327,9 @@ def run_stream(directory, runner):
     count = 1 if validate else protocol["group_size"]
     candidates = [{"status": "pending"} for _ in range(count)]
     allow_fallback = not validate and protocol.get("judge_failure_policy") == "neutral"
+    secondary = judge.secondary_settings(protocol) if allow_fallback else None
+    if secondary is not None and secondary_runner is None:
+        raise RuntimeError("The secondary judge requires its own evaluator instance")
     api_key = read_api_key(runner, protocol["judge"]["judge_model"], Path(protocol["eval_repo"]) / "arena/.env")
     client = runner.GeminiRestClient(
         api_key,
@@ -289,7 +337,9 @@ def run_stream(directory, runner):
         request_timeout=protocol["timeouts"]["judge_request"],
         file_timeout=protocol["timeouts"]["judge_file"],
     )
-    uploads, submitted = {}, {}
+    uploads, submitted, settling = {}, {}, []
+    settled, settled_lock = defaultdict(set), threading.Lock()
+    secondary_slots = threading.BoundedSemaphore(protocol["judge_secondary"]["concurrency"]) if secondary else None
 
     def upload(path):
         try:
@@ -299,14 +349,102 @@ def run_stream(directory, runner):
             # each affected pair's ledger with its usual error classification.
             pass
 
+    def ledger_state(pair_dir, manifest, order, settings, ledger=""):
+        """(completed row, error row) of one order's ledger for its only pair."""
+        key = next(iter(manifest["pairs"]))
+        manifest_path = pair_dir / "judge" / f"manifest-{order}.json"
+        path = pair_dir / "judge" / f"judgments-{order}{'-' + ledger if ledger else ''}.jsonl"
+        completed, _ = judge.read_judgments(path, manifest, manifest_path, settings)
+        errors = judge.read_failure_rows(path, manifest, manifest_path, settings)
+        return completed.get(key), errors.get(key)
+
     def compare(pair_dir, manifest, order):
         key = next(iter(manifest["pairs"]))
         _, forwarded = parse_options(judge.command(pair_dir, protocol, order, [key], allow_fallback=allow_fallback)[3:])
         with timed_stage(directory / "judge/timings.jsonl", "gemini_stream_pair", pair_id=key, order=order):
             code = runner.main(forwarded)
             result = read_pair(pair_dir, protocol, manifest, order, allow_fallback=allow_fallback)
-            if key not in result:
+            # A failure kept open for the secondary judge is still a recorded result.
+            if key not in result and not (secondary and ledger_state(pair_dir, manifest, order, protocol["judge"])[1]):
                 raise RuntimeError(f"Streaming runner exited {code} without recording {order}/{key}")
+
+    def judge_secondary(pair_dir, manifest, order):
+        key = next(iter(manifest["pairs"]))
+        if any(ledger_state(pair_dir, manifest, order, secondary, SECONDARY_LEDGER)):
+            return
+        command = judge.command(
+            pair_dir,
+            protocol,
+            order,
+            [key],
+            allow_fallback=True,
+            settings=secondary,
+            ledger=SECONDARY_LEDGER,
+            max_attempts=protocol["judge_secondary"]["attempts"],
+        )
+        _, forwarded = parse_options(command[3:])
+        timings = directory / "judge/timings.jsonl"
+        with (
+            secondary_slots,
+            timed_stage(timings, "gemini_secondary_pair", pair_id=key, order=order, model=secondary["judge_model"]),
+        ):
+            try:
+                secondary_runner.main(forwarded)
+            except Exception as exc:
+                # The secondary judge may only replace a neutral vote, never stop training.
+                manifest_path = pair_dir / "judge" / f"manifest-{order}.json"
+                fallback_path = pair_dir / "judge" / f"fallbacks-{order}.json"
+                rows = judge.read_fallbacks(fallback_path, manifest, manifest_path, protocol["judge"])
+                error = {"error_type": type(exc).__name__, "error": str(exc)[:500]}
+                rows[key] = judge.neutral_fallback(
+                    key, manifest, manifest_path, protocol["judge"], "secondary_exception", error
+                )
+                write_json(fallback_path, [rows[name] for name in sorted(rows)])
+                record_event(timings, "gemini_secondary", "exception", pair_id=key, order=order, **error)
+        if key not in read_pair(pair_dir, protocol, manifest, order, allow_fallback=True):
+            raise RuntimeError(f"Secondary judge did not record {order}/{key}")
+
+    def settle(pair_dir, manifests, key):
+        """Route the pair once both primary orders have a result; nonrecoverable errors stay fatal."""
+        if not secondary_routed(pair_dir):
+            failures = {}
+            for order, manifest in manifests.items():
+                manifest_path = pair_dir / "judge" / f"manifest-{order}.json"
+                fallback_path = pair_dir / "judge" / f"fallbacks-{order}.json"
+                if key in judge.read_fallbacks(fallback_path, manifest, manifest_path, protocol["judge"]):
+                    return  # A neutral vote recorded before this judge configuration stays.
+                completed, error = ledger_state(pair_dir, manifest, order, protocol["judge"])
+                if completed is None and error is not None:
+                    failures[order] = judge.fallback_reason(error)
+            if not failures:
+                return
+            write_json(pair_dir / "judge" / SECONDARY_MARKER, {"model": secondary["judge_model"], "failures": failures})
+            record_event(
+                directory / "judge/timings.jsonl",
+                "gemini_secondary",
+                "routed",
+                pair_id=key,
+                model=secondary["judge_model"],
+                failures=failures,
+            )
+        with ThreadPoolExecutor(max_workers=len(manifests)) as orders:
+            futures = [
+                orders.submit(judge_secondary, pair_dir, manifest, order) for order, manifest in manifests.items()
+            ]
+            for future in futures:
+                future.result()
+
+    def task(pair_dir, manifests, order):
+        key = next(iter(manifests[order]["pairs"]))
+        if not (secondary and secondary_routed(pair_dir)):
+            compare(pair_dir, manifests[order], order)
+        if secondary is None:
+            return
+        with settled_lock:
+            settled[key].add(order)
+            last = settled[key] == set(manifests)
+        if last:
+            settle(pair_dir, manifests, key)
 
     # Uploads have their own pool, so comparisons cannot starve an upload they need.
     with (
@@ -349,19 +487,27 @@ def run_stream(directory, runner):
                         continue
                     for path in paths:
                         uploads[path].result()  # Do not mask unexpected upload bugs.
-                    single, pair_dir = pair_manifest(manifest, key), pair_directory(directory, key)
+                    singles = {name: pair_manifest(value, key) for name, value in manifests.items()}
+                    single, pair_dir = singles[order], pair_directory(directory, key)
                     completed = read_pair(pair_dir, protocol, single, order, allow_fallback=allow_fallback)
-                    submitted[order, key] = (
-                        None if key in completed else pair_pool.submit(compare, pair_dir, single, order)
-                    )
-            for future in submitted.values():
+                    if key in completed:
+                        submitted[order, key] = None
+                        with settled_lock:
+                            settled[key].add(order)
+                            last = settled[key] == set(singles)
+                        if last and secondary is not None:
+                            # The other order's task finished first; settle the pair here.
+                            settling.append(pair_pool.submit(settle, pair_dir, singles, key))
+                    else:
+                        submitted[order, key] = pair_pool.submit(task, pair_dir, singles, order)
+            for future in [*submitted.values(), *settling]:
                 if future is not None and future.done():
                     future.result()
             finished = (root / "finished.json").exists() and all(c["status"] != "pending" for c in candidates)
             if finished and len(submitted) == 2 * len(manifests["original"]["pairs"]):
                 break
             time.sleep(0.1)
-        for future in submitted.values():
+        for future in [*submitted.values(), *settling]:
             if future is not None:
                 future.result()
         for future in uploads.values():
@@ -378,7 +524,16 @@ def main():
     root = args.directory / "judge/stream"
     context = read_json(root / "context.json")
     protocol = judging_protocol(context["protocol"], validate=context["validate"])
-    runner = load_external(Path(protocol["eval_repo"]) / "scripts/run_gemini_pairwise_eval.py")
+    runner_path = Path(protocol["eval_repo"]) / "scripts/run_gemini_pairwise_eval.py"
+    runner = load_external(runner_path)
+    # The primary instance is routed to Vertex; the secondary judge uses the Gemini API
+    # through its own instance, without the run's Vertex comparison slots.
+    use_secondary = (
+        not context["validate"]
+        and protocol.get("judge_failure_policy") == "neutral"
+        and judge.secondary_settings(protocol) is not None
+    )
+    secondary_runner = load_external(runner_path, namespace="_video_agents_secondary_") if use_secondary else None
     from .cleanup import readers
     from .provider_limits import provider_limits
     from .upload_admission import UploadAdmission
@@ -393,6 +548,13 @@ def main():
         )
     with vertex_runner(runner, protocol["judge"]["judge_model"]):
         instrument_client(runner, args.directory / "judge/timings-stream.jsonl", protocol["timeouts"]["judge_control"])
+        if secondary_runner is not None:
+            # Same upload journal as the group's, so a killed pass leaves its files for cleanup.
+            instrument_client(
+                secondary_runner,
+                args.directory / "judge/timings-secondary.jsonl",
+                protocol["timeouts"]["judge_control"],
+            )
         deferred = protocol.get("judge_background_cleanup", False)
         with (
             readers(args.directory, protocol) if deferred else nullcontext(),
@@ -400,8 +562,13 @@ def main():
             gemini_address_family("ipv4"),
             reference_images(runner),
             parallel_pairs(runner, keep_uploaded_files=deferred),
+            reference_images(secondary_runner) if secondary_runner is not None else nullcontext(),
+            # Delete the secondary judge's uploads as soon as its pass ends.
+            parallel_pairs(secondary_runner, keep_uploaded_files=False)
+            if secondary_runner is not None
+            else nullcontext(),
         ):
-            run_stream(args.directory, runner)
+            run_stream(args.directory, runner, secondary_runner)
 
 
 if __name__ == "__main__":

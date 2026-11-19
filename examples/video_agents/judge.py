@@ -23,6 +23,9 @@ from .image_assets import reference_image_fields
 from .storage import file_sha256, freeze_json, item_key, read_json
 
 ORDERS = ("original", "swapped")
+# Training may re-judge a pair whose primary comparison failed with this model,
+# through the Gemini API, before imputing a neutral half vote.
+SECONDARY_JUDGE_MODELS = frozenset({"gemini-3.8-flash"})
 EXTERNAL_FILES = (
     "scripts/run_gemini_pairwise_eval.py",
     "scripts/build_pairwise_manifest.py",
@@ -85,11 +88,31 @@ def freeze_manifests(run_dir: Path, manifests: dict[str, dict]):
         freeze_json(run_dir / "judge" / f"manifest-{order}.json", manifest)
 
 
-def command(run_dir: Path, protocol: dict, order: str, pair_ids, *, allow_fallback: bool = False) -> list[str]:
-    """Explicitly override the runner defaults to match the established comparison runs."""
+def secondary_settings(protocol: dict) -> dict | None:
+    """Judge settings of the training-only secondary judge: the primary's, with its model."""
+    secondary = protocol.get("judge_secondary")
+    return {**protocol["judge"], "judge_model": secondary["model"]} if secondary else None
+
+
+def command(
+    run_dir: Path,
+    protocol: dict,
+    order: str,
+    pair_ids,
+    *,
+    allow_fallback: bool = False,
+    settings: dict | None = None,
+    ledger: str = "",
+    max_attempts: int | None = None,
+) -> list[str]:
+    """Explicitly override the runner defaults to match the established comparison runs.
+
+    A secondary judge passes its own settings, a ledger suffix and its attempt budget.
+    """
     if order not in ORDERS:
         raise ValueError("Unknown presentation order")
-    settings, timeouts = protocol["judge"], protocol["timeouts"]
+    settings, timeouts = settings or protocol["judge"], protocol["timeouts"]
+    suffix = f"-{ledger}" if ledger else ""
     repo = Path(protocol["eval_repo"])
     args = [
         sys.executable,
@@ -98,11 +121,11 @@ def command(run_dir: Path, protocol: dict, order: str, pair_ids, *, allow_fallba
         "--runner",
         str(repo / "scripts/run_gemini_pairwise_eval.py"),
         "--timings",
-        str(run_dir / "judge" / f"timings-{order}.jsonl"),
+        str(run_dir / "judge" / f"timings-{order}{suffix}.jsonl"),
         "--manifest",
         str(run_dir / "judge" / f"manifest-{order}.json"),
         "--output",
-        str(run_dir / "judge" / f"judgments-{order}.jsonl"),
+        str(run_dir / "judge" / f"judgments-{order}{suffix}.jsonl"),
         "--env-file",
         str(repo / "arena/.env"),
         "--model",
@@ -122,7 +145,7 @@ def command(run_dir: Path, protocol: dict, order: str, pair_ids, *, allow_fallba
         "--file-control-timeout",
         str(timeouts["judge_control"]),
         "--max-attempts",
-        str(protocol["judge_max_attempts"]),
+        str(max_attempts or protocol["judge_max_attempts"]),
         # Training can keep judging other pairs after an exhausted comparison.
         "--max-errors",
         str(max(1, len(pair_ids)) if allow_fallback else 1),
