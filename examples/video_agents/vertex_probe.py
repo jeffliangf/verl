@@ -8,7 +8,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Small direct Vertex/ADC connectivity check, independent of the eval checkout."""
+"""Small direct Vertex connectivity check (service-account key or gcloud ADC), independent of the eval checkout."""
 
 import argparse
 import json

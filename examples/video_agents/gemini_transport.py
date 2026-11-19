@@ -8,11 +8,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Route Argon and Hydrogen directly to Vertex with ADC and google-genai.
+"""Route Argon and Hydrogen directly to Vertex with google-genai.
 
 The frozen evaluator builds Interactions requests. This adapter translates them
 to generateContent while retaining its result validation and bounded retries.
 It never falls back to an API key, another provider, or another model.
+
+Credentials come from google.auth.default(): the service-account key named by
+GOOGLE_APPLICATION_CREDENTIALS when set (it does not expire, so long runs should
+use it), otherwise the gcloud application-default login, which the organization
+ends after 16 hours.
 """
 
 import base64
@@ -54,7 +59,7 @@ def transport_identity(model):
 
 def read_api_key(runner, model, env_file):
     if uses_vertex(model):
-        return None  # Vertex uses ADC; do not read either provider's API key.
+        return None  # Vertex uses Google credentials; do not read either provider's API key.
     key = os.environ.get("GEMINI_API_KEY") or runner.read_env_file(Path(env_file)).get("GEMINI_API_KEY")
     if not key:
         raise RuntimeError(f"GEMINI_API_KEY is required in the environment or {env_file}")
@@ -80,7 +85,8 @@ def create_vertex_client(*, project, location, timeout=600):
         credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
     except DefaultCredentialsError:
         raise RuntimeError(
-            f"Vertex ADC is unavailable. Run: gcloud auth application-default login --project {project}"
+            "Vertex credentials are unavailable. Set GOOGLE_APPLICATION_CREDENTIALS to a service-account key "
+            f"file, or run: gcloud auth application-default login --project {project}"
         ) from None
     # Explicit credentials ensure GEMINI_API_KEY cannot select API-key auth.
     # Only the evaluator owns retries, so its configured budget is not multiplied.
@@ -235,7 +241,8 @@ def client_type(runner, model):
                 raise runner.HttpFailure(int(exc.code), str(exc.message)[:4000]) from None
             except RefreshError:
                 raise RuntimeError(
-                    "Vertex ADC refresh failed; run gcloud auth application-default login again"
+                    "Vertex credential refresh failed; check the GOOGLE_APPLICATION_CREDENTIALS service-account "
+                    "key, or run gcloud auth application-default login again"
                 ) from None
             except (TransportError, *_network_errors()):
                 raise runner.NetworkFailure("Vertex network request failed") from None

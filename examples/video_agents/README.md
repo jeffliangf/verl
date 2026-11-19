@@ -52,23 +52,32 @@ evaluation defaults to `gemini-4-argon`. Existing prepared protocols keep their
 saved model selections.
 
 Selecting `gemini-4-argon` or `gemini-4-hydrogen` automatically routes judging,
-inspection, and launch preflights through `google-genai` and local Application
-Default Credentials (ADC). The default Vertex project is `utopai-labs`, in
-`global`. Install the SDK in the Python environment that runs the workers,
-then authenticate on that host:
+inspection, and launch preflights through `google-genai` with the Google
+credentials that `google.auth.default()` finds. The default Vertex project is
+`utopai-labs`, in `global`. Install the SDK in the Python environment that runs
+the workers, then give them credentials.
+
+For training runs, use a service-account key. The organization ends gcloud user
+logins after 16 hours, and an expired login stops a run: credential errors are
+never retried or sent to the secondary judge. Export the key in the environment
+script that the job and every Ray node source, so all workers use it:
 
 ```bash
 uv pip install --python .venv/bin/python -r examples/video_agents/requirements_vertex.txt
-gcloud auth application-default login --project utopai-labs
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json  # chmod 600; keep it out of git
 .venv/bin/python -m examples.video_agents.vertex_probe --model gemini-4-hydrogen "Reply with OK."
 ```
+
+Without the variable, workers fall back to the gcloud application-default login
+(`gcloud auth application-default login --project utopai-labs`), which is
+enough for short interactive checks.
 
 The probe also accepts `--model gemini-4-argon`, `--project`, `--location`, and
 `--raw`. Worker settings can be overridden with `VERTEX_PROJECT` and
 `VERTEX_LOCATION` (or `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`).
-Both models use ADC even when Gemini or OpenRouter API keys are present. Failed
-requests never switch providers or models. Other model selections retain their
-existing Gemini API route.
+Both models use these Google credentials even when Gemini or OpenRouter API
+keys are present. Failed requests never switch providers or models. Other model
+selections retain their existing Gemini API route.
 
 Use `video_processing=standard` for Argon and Hydrogen judging. The adapter
 preserves the rubric, media order, schema, thinking level, seed, and output limit while
@@ -535,7 +544,7 @@ These runtime assets are supplied separately:
   `scripts/build_pairwise_manifest.py`, and `bestofn/normalize.py`.
   `--eval-repo` selects another checkout. Its source hashes and v4 rubric are
   frozen during preparation. Gemini API credentials use that checkout's
-  `arena/.env`; Argon and Hydrogen use local Vertex ADC as described above.
+  `arena/.env`; Argon and Hydrogen use Vertex credentials as described above.
 - A reachable Sol-H3 gateway and token file. Set `--h3-endpoints` and
   `--h3-token-file`, or `H3_SELF_HOSTED_ENDPOINTS` and `H3_SELF_HOSTED_TOKEN_FILE`.
   Workers must be able to access the same run, data, references, evaluator, and
