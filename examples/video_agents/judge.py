@@ -246,7 +246,9 @@ def fallback_reason(row: dict) -> str:
         match = re.match(r"HTTP (\d{3}):\s*(.*)", message, re.DOTALL)
         if match:
             status, detail = int(match[1]), match[2]
-            if status in {408, 429, 500, 502, 503, 504}:
+            # Vertex reports a server-side CANCELLED operation as HTTP 499 ("The operation was cancelled"); one
+            # such comparison stopped job 1183 at step 183, while the same videos' other comparisons succeeded.
+            if status in {408, 429, 499, 500, 502, 503, 504}:
                 return "provider_failure"
             if status == 400:
                 try:
