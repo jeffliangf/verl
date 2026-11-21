@@ -47,9 +47,12 @@ RECOVERY_DEFAULTS = {"h3_max_request_attempts": 3, "h3_max_generation_attempts":
 SETTINGS = {
     "model": "MiniMax-H3-Base-FL2VA",
     "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
-    "adapter": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA/dense-datafree",
-    "adapter_revision": "f509e629374cac104e7f62daecce6d1488a3041d",
-    "steps": 4,
+    # Since 2026-11-21 the gateway's workers serve SMD-H3 E: one LoRA on the same MiniMax-H3 weights, 8 transformer
+    # forwards with a half-size final step, flow shifts 12/3, and no numerical gate (Sol attention for every shape).
+    # Until then: FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA/dense-datafree at f509e629, 4 steps.
+    "adapter": "SMD-H3-E/smd_h3_div16f_ck3",
+    "adapter_revision": "4011a9ef10c21810e58ed2144d909c1e24137a9ab54938659bb2f7da18277739",
+    "steps": 8,
     "duration": 10,
     "seed": 42,
     "width": 1344,

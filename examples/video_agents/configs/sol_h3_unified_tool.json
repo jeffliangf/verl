@@ -2,7 +2,7 @@
   "type": "function",
   "function": {
     "name": "sol_h3",
-    "description": "Generate a video with synchronized audio using Sol-H3. Use t2va for text-to-video or fl2va to animate the supplied first-frame image. Preserve the user's subjects, actions, style, and requested output settings. Supports one first frame; the FastH3 first-frame path is experimental. The worker fixes sampling to four steps, 24 fps, and its 768 short-edge/area-capped resolution policy.",
+    "description": "Generate a video with synchronized audio using Sol-H3. Use t2va for text-to-video or fl2va to animate the supplied first-frame image. Preserve the user's subjects, actions, style, and requested output settings. Supports one first frame; the first-frame path is experimental. The worker fixes sampling to eight steps, 24 fps, and its 768 short-edge/area-capped resolution policy.",
     "parameters": {
       "$id": "urn:verl:sol-h3:3",
       "type": "object",

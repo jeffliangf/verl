@@ -39,6 +39,10 @@ REFERENCE_COLUMNS = (
     "best_of_4_h3_50step",
     "best_of_16_h3_50step",
 )
+# Opt-in Context-IR references (--reference-columns): one 50-step render of a Context-IR expansion and the judged
+# best of four such renders. Each row's CONTEXT_IR_PROVENANCE record names every video's path, checksum and media.
+CONTEXT_IR_COLUMNS = ("h3_50step_context_ir", "best_of_4_h3_50step_context_ir")
+CONTEXT_IR_PROVENANCE = "h3_50step_context_ir_provenance"
 DATA_DIR = ROOT / "data/prompt_rewrite_mixed_rl_v4"
 OBSERVATION_MAX_PIXELS = 768 * 768
 EVAL_DURATION_SECONDS = 10
@@ -219,7 +223,8 @@ def prepare(args):
     rubric = load_external(repo / "scripts/build_pairwise_manifest.py")
     if rubric.INSTRUCTIONS_VERSION != JUDGE_SETTINGS["instructions_version"]:
         raise ValueError("Expected the existing v4 Gemini rubric")
-    validation = reference_inventory(validation, rows, load_external(repo / "bestofn/normalize.py").probe)
+    probe = load_external(repo / "bestofn/normalize.py").probe
+    validation = reference_inventory(validation, rows, probe, columns=getattr(args, "reference_columns", None))
     validation = [
         sample if keeps_own_request(sample) else benchmark_request(sample, row)
         for sample, row in zip(validation, rows, strict=True)
@@ -258,7 +263,11 @@ def prepare(args):
         "group_size": validate_group_size(args.group_size),
         "samples": {"train": train, "val": validation},
         "source_files": {str(p): file_sha256(p) for p in (*train_paths, *eval_paths)},
-        "reference_fields": [f for f in REFERENCE_COLUMNS if any(f in v for v in reference_fields_by_task.values())],
+        "reference_fields": [
+            f
+            for f in (*REFERENCE_COLUMNS, *CONTEXT_IR_COLUMNS)
+            if any(f in v for v in reference_fields_by_task.values())
+        ],
         "reference_fields_by_task": reference_fields_by_task,
         "reference_notes": reference_notes,
         "media_profile": profile,
@@ -308,6 +317,12 @@ def add_parser(commands):
     parser.add_argument("--combined-file", type=Path, default=ROOT / "data/prompt_rewrite_mixed_rl_v4.jsonl")
     parser.add_argument("--train-files", nargs="+", type=Path, default=TRAIN_FILES)
     parser.add_argument("--eval-datasets", nargs="+", type=Path, default=EVAL_FILES)
+    parser.add_argument(
+        "--reference-columns",
+        nargs="+",
+        choices=CONTEXT_IR_COLUMNS,
+        help="Evaluate every task against only these Context-IR references instead of the best-of-N exports",
+    )
     parser.add_argument("--eval-repo", type=Path, default=DEFAULT_EVAL_REPO)
     # Only the model name differs between the two judges; the other JUDGE_SETTINGS stay frozen.
     parser.add_argument("--judge-model", default=JUDGE_SETTINGS["judge_model"], help="Training reward judge")
