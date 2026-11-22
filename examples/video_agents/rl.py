@@ -294,6 +294,8 @@ def training_config(args):
         raise ValueError("Evaluation loads --model and requires val_only, val_before_train, and resume_mode=disable")
     check_sample_settings(protocol, config)
     runtime_protocol(protocol, config.video_rl)
+    if not evaluation and config.video_rl.get("no_call", "forfeit") == "drop" and not config.video_rl.async_lookahead:
+        raise ValueError("video_rl.no_call=drop needs --async-lookahead: the video cohort trainer masks those turns")
     # vLLM stops at max_model_len minus the prompt without reporting a shorter cap.
     context = config.actor_rollout_ref.rollout.max_model_len
     longest = max(

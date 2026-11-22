@@ -25,6 +25,13 @@ from .storage import file_sha256, fingerprint, freeze_json, read_json, run_lock,
 
 GROUP_SIZE = 4
 INVALID_REWARD = -1.0
+# Training rewards for turns without a video (video_rl.no_call, video_rl.invalid_call). "forfeit" scores the
+# turn INVALID_REWARD and gives each sibling a win. A turn without a tool call can instead be dropped: it is
+# not a player, and the cohort trainer keeps it out of the GRPO statistics and the loss. A rule-breaking
+# call can instead "lose": it plays and loses every game, scoring 0 as in held-out evaluation.
+NO_CALL_POLICIES = ("forfeit", "drop")
+INVALID_CALL_POLICIES = ("forfeit", "lose")
+NO_CALL_REASON = "no tool call"
 TIMEOUT_STAGES = ("llm", "h3", "h3_request", "judge_request", "judge_file", "judge_control", "judge_pass")
 
 
@@ -129,6 +136,12 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         raise ValueError("video_rl.judge_limits requires positive comparisons, uploads, deletions, cleanup_backlog")
     if background_cleanup and (not output or output == "???"):
         raise ValueError("Background cleanup requires video_rl.output_dir")
+    no_call = settings.get("no_call", "forfeit")
+    if no_call not in NO_CALL_POLICIES:
+        raise ValueError(f"video_rl.no_call must be one of: {', '.join(NO_CALL_POLICIES)}")
+    invalid_call = settings.get("invalid_call", "forfeit")
+    if invalid_call not in INVALID_CALL_POLICIES:
+        raise ValueError(f"video_rl.invalid_call must be one of: {', '.join(INVALID_CALL_POLICIES)}")
     secondary = settings.get("judge_secondary")
     if secondary is not None:
         secondary = dict(secondary)
@@ -160,6 +173,8 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         "judge_limits": limits,
         **({"provider_recovery_root": str(Path(output) / "provider-recovery")} if output and output != "???" else {}),
         "max_judge_fallback_fraction": fraction,
+        "no_call": no_call,
+        "invalid_call": invalid_call,
         **({"judge_secondary": secondary} if secondary is not None else {}),
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
     }
@@ -381,11 +396,33 @@ def judgment_failure(path: Path, pair_ids: set, log_path: Path) -> str:
     return f"{listed}; see {path} and {log_path}"
 
 
-def tournament_rewards(candidates: list[dict], manifests: dict, judgments: dict) -> list[dict]:
-    """Average pair wins, with explicit forfeits for invalid policy calls."""
+def is_no_call(candidate: dict) -> bool:
+    """The turn ended without a parsable tool call, so it never reached the tool."""
+    return candidate["status"] == "invalid_call" and str(candidate.get("reason", "")).startswith(NO_CALL_REASON)
+
+
+def tournament_rewards(
+    candidates: list[dict],
+    manifests: dict,
+    judgments: dict,
+    *,
+    no_call: str = "forfeit",
+    invalid_call: str = "forfeit",
+) -> list[dict]:
+    """Average pair wins, with explicit forfeits for invalid policy calls.
+
+    A valid candidate wins every game against an invalid player. With no_call="drop" a turn without a tool
+    call is not a player: it gives no wins and is marked "no_call_dropped" for the trainer, which leaves it
+    out of the GRPO statistics and the loss. With invalid_call="lose" a rule-breaking call scores 0 (it lost
+    every game) instead of INVALID_REWARD.
+    """
+    if no_call not in NO_CALL_POLICIES or invalid_call not in INVALID_CALL_POLICIES:
+        raise ValueError(f"Unknown invalid-turn policies: no_call={no_call!r}, invalid_call={invalid_call!r}")
     group_size = validate_group_size(len(candidates))
     valid = [c["status"] == "succeeded" for c in candidates]
-    invalid_count = group_size - sum(valid)
+    dropped = [no_call == "drop" and is_no_call(c) for c in candidates]
+    players = group_size - sum(dropped)
+    invalid_count = players - sum(valid)
     points = [float(invalid_count) if ok else 0.0 for ok in valid]
     pairs = manifests["original"]["pairs"]
     split_count = real_pairs = fallback_count = 0
@@ -400,19 +437,30 @@ def tournament_rewards(candidates: list[dict], manifests: dict, judgments: dict)
         if not result["fallback_count"]:
             real_pairs += 1
             split_count += result["outcome"] == "split"
-    rewards = [point / (group_size - 1) if ok else INVALID_REWARD for point, ok in zip(points, valid, strict=True)]
+    invalid_reward = INVALID_REWARD if invalid_call == "forfeit" else 0.0
+
+    def reward_for(point, ok, drop):
+        if drop:
+            return 0.0  # Never trained: the cohort trainer masks dropped turns.
+        if not ok:
+            return invalid_reward
+        return point / (players - 1) if players > 1 else 0.5  # A lone player has no games.
+
+    rewards = [reward_for(*values) for values in zip(points, valid, dropped, strict=True)]
+    kept = [reward for reward, drop in zip(rewards, dropped, strict=True) if not drop]
     return [
         {
             "score": reward,
             "valid_call": float(ok),
-            "zero_variance_group": float(len(set(rewards)) == 1),
+            **({"no_call_dropped": float(drop)} if no_call == "drop" else {}),
+            "zero_variance_group": float(len(set(kept)) <= 1),
             "order_disagreement": split_count / real_pairs if real_pairs else 0.0,
             "judge_comparisons": 2 * len(pairs),
             "judge_completed_comparisons": 2 * len(pairs) - fallback_count,
             "judge_fallback_comparisons": fallback_count,
             "judge_fallback_fraction": fallback_count / (2 * len(pairs)) if pairs else 0.0,
         }
-        for reward, ok in zip(rewards, valid, strict=True)
+        for reward, ok, drop in zip(rewards, valid, dropped, strict=True)
     ]
 
 
@@ -468,6 +516,8 @@ def score_group(
                 candidates,
                 manifests,
                 judgments_for(manifests, allow_fallback=protocol.get("judge_failure_policy") == "neutral"),
+                no_call=protocol.get("no_call", "forfeit"),
+                invalid_call=protocol.get("invalid_call", "forfeit"),
             )
         write_json(directory / "rewards.json", rewards)
         return rewards

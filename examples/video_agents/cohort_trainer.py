@@ -11,10 +11,12 @@
 """One fixed batch of lookahead, with complete responses and bounded policy lag."""
 
 import time
+from collections import defaultdict
 from pathlib import Path
 
+import torch
 import transfer_queue as tq
-from tensordict import NonTensorData
+from tensordict import NonTensorData, TensorDict
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
@@ -24,6 +26,30 @@ from verl.utils.debug import marked_timer
 from .cohort_config import validate_config
 from .observability import record_event
 from .storage import item_key, read_json, write_json
+
+
+def advantages_without_dropped(uids, scores, dropped, *, norm_adv_by_std_in_grpo=True, epsilon=1e-6):
+    """GRPO outcome advantages computed over each group's kept responses only.
+
+    Matches verl's compute_grpo_outcome_advantage on the kept responses. Dropped responses get 0, and so does a
+    group with fewer than two kept responses: it has nothing to compare (verl would use the raw score).
+    """
+    advantages = torch.zeros(len(uids), dtype=torch.float32)
+    groups = defaultdict(list)
+    for i, (uid, drop) in enumerate(zip(uids, dropped, strict=True)):
+        if not drop:
+            groups[uid].append(i)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        group = scores[members].float()
+        centered = group - torch.mean(group)
+        advantages[members] = centered / (torch.std(group) + epsilon) if norm_adv_by_std_in_grpo else centered
+    return advantages
+
+
+def _as_list(value):
+    return value.tolist() if hasattr(value, "tolist") else list(value)
 
 
 class CohortReplayBuffer(ReplayBuffer):
@@ -226,6 +252,61 @@ class VideoCohortTrainer(PPOTrainerSync):
             "training/cohort/replaced_groups": current["dropped"],
             "training/cohort/prefetched_groups": len(self._all_uids()),
         }
+
+    def _compute_advantage(self, batch, metrics):
+        batch = super()._compute_advantage(batch, metrics)
+        if self.config.video_rl.get("no_call", "forfeit") == "drop":
+            batch = self._drop_no_call_turns(batch, metrics)
+        return batch
+
+    def _drop_no_call_turns(self, batch, metrics):
+        """Give turns without a tool call no gradient and keep them out of their group's GRPO statistics.
+
+        The tournament marks them "no_call_dropped" and gives their siblings no wins over them. Groups without a
+        dropped turn keep verl's advantages unchanged; in the others the kept responses are re-normalized among
+        themselves, and the dropped turns get zero advantage and an empty loss mask (no policy, KL or entropy
+        term, and no share of the token-mean denominator).
+        """
+        if any(tag.get("is_padding", False) for tag in batch.tags):
+            raise RuntimeError("Dropping turns without a tool call expects complete cohorts without padding")
+        names = ("response_mask", "loss_mask", "advantages", "returns")
+        data = tq.kv_batch_get(
+            keys=batch.keys, partition_id=batch.partition_id, select_fields=["uid", "rm_scores", "extra_fields", *names]
+        )
+        extra = [value if isinstance(value, dict) else {} for value in _as_list(data["extra_fields"])]
+        dropped = [bool((value.get("reward_extra_info") or {}).get("no_call_dropped")) for value in extra]
+        uids = [str(uid) for uid in _as_list(data["uid"])]
+        affected = {uid for uid, drop in zip(uids, dropped, strict=True) if drop}
+        kept = defaultdict(int)
+        for uid, drop in zip(uids, dropped, strict=True):
+            kept[uid] += not drop
+        metrics["training/no_call/dropped_fraction"] = sum(dropped) / len(dropped)
+        metrics["training/no_call/groups_with_drops"] = len(affected)
+        metrics["training/no_call/groups_without_signal"] = sum(kept[uid] < 2 for uid in affected)
+        if not affected:
+            return batch
+        scores = torch.stack([row.sum() for row in data["rm_scores"].unbind()])
+        advantages = advantages_without_dropped(
+            uids,
+            scores,
+            dropped,
+            norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+        )
+        rows = {name: list(data[name].unbind()) for name in names}
+        for i, uid in enumerate(uids):
+            if uid not in affected:
+                continue
+            if dropped[i]:
+                rows["response_mask"][i] = torch.zeros_like(rows["response_mask"][i])
+                rows["loss_mask"][i] = torch.zeros_like(rows["loss_mask"][i])
+            mask = rows["response_mask"][i].to(rows["advantages"][i].dtype)
+            rows["advantages"][i] = advantages[i].to(mask.dtype) * mask
+            rows["returns"][i] = rows["advantages"][i].clone()
+        output = TensorDict(
+            {name: torch.nested.as_nested_tensor(values, layout=torch.jagged) for name, values in rows.items()},
+            batch_size=len(batch.keys),
+        )
+        return tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
 
     def on_sample_end(self):
         self._drain(self._all_uids())

@@ -35,7 +35,7 @@ from .image_assets import image_bytes, upright_observation
 from .observability import ProviderError, failure_record, record_event, timed_stage
 from .storage import item_key, run_lock, write_json
 from .streaming_judge import StreamingJudge
-from .tournament import generate_video, load_protocol, runtime_protocol, score_group
+from .tournament import NO_CALL_REASON, generate_video, load_protocol, runtime_protocol, score_group
 
 # Decoded tokens kept with an invalid call, so the policy's actual output can be read.
 RESPONSE_TAIL_TOKENS = 512
@@ -268,7 +268,7 @@ class H3TerminalLoop(ToolAgentLoop):
         output = await super().run(sampling_params, **kwargs)
         if not output.response_ids:
             raise RuntimeError("The LLM server returned no tokens")
-        reason = "no tool call" + (" before the length limit" if self.stop_reason == "length" else "")
+        reason = NO_CALL_REASON + (" before the length limit" if self.stop_reason == "length" else "")
         result = output.extra_fields.setdefault("h3_result", {"status": "invalid_call", "reason": reason})
         if result["status"] == "invalid_call":
             result["response_tail"] = self.tokenizer.decode(output.response_ids[-RESPONSE_TAIL_TOKENS:])

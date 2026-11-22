@@ -44,3 +44,7 @@ def validate_config(config):
         raise ValueError("Cleanup backlog limit must exceed the two-cohort window so live readers can drain")
     if not config.trainer.v1.sampler.sync_refill_failed_groups:
         raise ValueError("Video cohorts require bounded replacement of failed groups")
+    if config.video_rl.get("no_call", "forfeit") == "drop" and (
+        config.algorithm.adv_estimator != "grpo" or config.algorithm.use_kl_in_reward
+    ):
+        raise ValueError("Dropping turns without a tool call recomputes GRPO advantages from the judge scores alone")
