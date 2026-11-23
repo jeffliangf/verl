@@ -537,7 +537,9 @@ class TournamentManager(AgentLoopManagerTQ):
         group_size = protocol["group_size"]
         self.reference_fields = reference_fields(protocol)
         self.reference_fields_by_task = protocol.get("reference_fields_by_task")
-        self.eval_judge_model = evaluation_judge(protocol, self.config.video_rl)["judge_model"]
+        eval_judge = evaluation_judge(protocol, self.config.video_rl)
+        self.eval_judge_model = eval_judge["judge_model"]
+        self.eval_judge_video_resolution = eval_judge.get("video_resolution")
         self.reference_notes = protocol.get("reference_notes", [])
         if self.rollout_config.n != group_size or self.rollout_config.val_kwargs.n != 1:
             raise ValueError(f"Use rollout.n={group_size} and rollout.val_kwargs.n=1")
@@ -665,6 +667,8 @@ class TournamentManager(AgentLoopManagerTQ):
         )
         if hasattr(self, "eval_judge_model"):
             summary["judge_model"] = self.eval_judge_model
+        if getattr(self, "eval_judge_video_resolution", None):
+            summary["judge_video_resolution"] = self.eval_judge_video_resolution
         if getattr(self, "reference_notes", None):
             summary["reference_notes"] = self.reference_notes
         write_json(path, summary)

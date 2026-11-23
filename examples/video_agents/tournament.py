@@ -74,20 +74,41 @@ def validate_group_size(value) -> int:
 
 
 def evaluation_judge(protocol: dict, settings) -> dict:
-    """Held-out judge: the frozen eval_judge, or video_rl.eval_judge_model for this launch.
+    """Held-out judge: the frozen eval_judge with this launch's eval_judge_model and eval_judge_video_resolution.
 
-    Only the model changes (same instructions, thinking and video settings), and only direct Vertex judges are
+    Only those fields change (same instructions, thinking and video processing), and only direct Vertex judges are
     accepted. The frozen protocol and its hash stay as prepared, so cached policy turns still resume.
     """
-    frozen = protocol.get("eval_judge", protocol["judge"])
-    model = settings.get("eval_judge_model")
-    if model is None:
-        return frozen
-    from .gemini_transport import VERTEX_MODELS
+    from .gemini_transport import VERTEX_MODELS, check_video_resolution
 
-    if model not in VERTEX_MODELS:
-        raise ValueError(f"video_rl.eval_judge_model must be a direct Vertex judge: {', '.join(sorted(VERTEX_MODELS))}")
-    return {**frozen, "judge_model": model}
+    # Without a frozen eval_judge, evaluation uses the training judge, including its launch-time video resolution.
+    judge = dict(protocol["eval_judge"]) if "eval_judge" in protocol else training_judge(protocol, settings)
+    model = settings.get("eval_judge_model")
+    if model is not None:
+        if model not in VERTEX_MODELS:
+            raise ValueError(
+                f"video_rl.eval_judge_model must be a direct Vertex judge: {', '.join(sorted(VERTEX_MODELS))}"
+            )
+        judge["judge_model"] = model
+    resolution = settings.get("eval_judge_video_resolution")
+    if resolution is not None:
+        judge["video_resolution"] = check_video_resolution(
+            judge["judge_model"], resolution, "video_rl.eval_judge_video_resolution"
+        )
+    return judge
+
+
+def training_judge(protocol: dict, settings) -> dict:
+    """Training judge: the frozen judge, with this launch's video_rl.judge_video_resolution (Vertex only)."""
+    from .gemini_transport import check_video_resolution
+
+    judge = dict(protocol["judge"])
+    resolution = settings.get("judge_video_resolution")
+    if resolution is not None:
+        judge["video_resolution"] = check_video_resolution(
+            judge["judge_model"], resolution, "video_rl.judge_video_resolution"
+        )
+    return judge
 
 
 def runtime_protocol(protocol: dict, settings) -> dict:
@@ -160,6 +181,8 @@ def runtime_protocol(protocol: dict, settings) -> dict:
     if invalid_call not in INVALID_CALL_POLICIES:
         raise ValueError(f"video_rl.invalid_call must be one of: {', '.join(INVALID_CALL_POLICIES)}")
     eval_judge = evaluation_judge(protocol, settings)
+    eval_override = any(settings.get(key) is not None for key in ("eval_judge_model", "eval_judge_video_resolution"))
+    reward_judge = training_judge(protocol, settings)
     secondary = settings.get("judge_secondary")
     if secondary is not None:
         secondary = dict(secondary)
@@ -194,7 +217,9 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         "no_call": no_call,
         "invalid_call": invalid_call,
         **({"judge_secondary": secondary} if secondary is not None else {}),
-        **({"eval_judge": eval_judge} if settings.get("eval_judge_model") is not None else {}),
+        # Applying the launch settings twice gives the same protocol: the second pass reads these resolved judges.
+        "judge": reward_judge,
+        **({"eval_judge": eval_judge} if "eval_judge" in protocol or eval_override else {}),
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
     }
 

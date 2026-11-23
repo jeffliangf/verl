@@ -546,7 +546,7 @@ def main():
             # gate never waits while blocked; the parent owns the pass deadline.
             float("inf"),
         )
-    with vertex_runner(runner, protocol["judge"]["judge_model"]):
+    with vertex_runner(runner, protocol["judge"]["judge_model"], protocol["judge"].get("video_resolution")):
         instrument_client(runner, args.directory / "judge/timings-stream.jsonl", protocol["timeouts"]["judge_control"])
         if secondary_runner is not None:
             # Same upload journal as the group's, so a killed pass leaves its files for cleanup.

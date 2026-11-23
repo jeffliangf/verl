@@ -27,6 +27,10 @@ video_rl:
   # Held-out evaluation judge for this launch (null = the protocol's frozen eval_judge). Only the model
   # changes, only direct Vertex judges are accepted, and the frozen protocol hash is kept.
   eval_judge_model: null
+  # Gemini media resolution of judge video parts (low/medium/high; null = model default, ~70 tokens per
+  # frame). Vertex judges only; every judgment row records it and ledgers at another resolution are refused.
+  judge_video_resolution: null
+  eval_judge_video_resolution: null
 
   # Shared provider limits for rl.py and inspection_rl.py, in seconds.
   # Launch settings replace any limits recorded in a frozen protocol.

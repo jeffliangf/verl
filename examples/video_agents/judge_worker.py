@@ -23,7 +23,7 @@ from contextvars import ContextVar
 from pathlib import Path
 
 from .gemini_files import UploadJournal, metadata_url, valid_name
-from .gemini_transport import resolved_model, vertex_runner
+from .gemini_transport import VIDEO_RESOLUTIONS, resolved_model, vertex_runner
 from .image_assets import image_bytes
 from .observability import record_event, timed_stage
 from .storage import load_external
@@ -349,6 +349,7 @@ def parse_options(argv=None):
     parser.add_argument("--file-control-timeout", type=float, default=30.0)
     parser.add_argument("--address-family", choices=("ipv4", "auto"), default="ipv4")
     parser.add_argument("--parallel-pairs", action="store_true")
+    parser.add_argument("--video-resolution", choices=VIDEO_RESOLUTIONS, help="Vertex media resolution of video parts")
     args, forwarded = parser.parse_known_args(argv)
     if not math.isfinite(args.file_control_timeout) or args.file_control_timeout <= 0:
         parser.error("--file-control-timeout must be finite and positive")
@@ -359,7 +360,7 @@ def main(argv=None):
     args, forwarded = parse_options(argv)
     runner = load_external(args.runner)
     settings = runner.parse_args(forwarded)
-    with vertex_runner(runner, resolved_model(runner, settings)):
+    with vertex_runner(runner, resolved_model(runner, settings), args.video_resolution):
         instrument_client(runner, args.timings, args.file_control_timeout)
         record_event(args.timings, "gemini_network", "configured", address_family=args.address_family)
         with gemini_address_family(args.address_family), reference_images(runner):

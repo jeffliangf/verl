@@ -89,9 +89,15 @@ def freeze_manifests(run_dir: Path, manifests: dict[str, dict]):
 
 
 def secondary_settings(protocol: dict) -> dict | None:
-    """Judge settings of the training-only secondary judge: the primary's, with its model."""
+    """Judge settings of the training-only secondary judge: the primary's, with its model.
+
+    It runs on the Gemini API at the model's default media resolution; a primary video_resolution stays Vertex-only.
+    """
     secondary = protocol.get("judge_secondary")
-    return {**protocol["judge"], "judge_model": secondary["model"]} if secondary else None
+    if not secondary:
+        return None
+    primary = {key: value for key, value in protocol["judge"].items() if key != "video_resolution"}
+    return {**primary, "judge_model": secondary["model"]}
 
 
 def command(
@@ -156,6 +162,8 @@ def command(
         args.append("--parallel-pairs")
     if settings["max_output_tokens"] is not None:
         args.extend(["--max-output-tokens", str(settings["max_output_tokens"])])
+    if settings.get("video_resolution") is not None:
+        args.extend(["--video-resolution", settings["video_resolution"]])
     for pair_id in sorted(pair_ids):
         args.extend(["--pair-id", pair_id])
     return args
@@ -202,6 +210,8 @@ def validate_identity(row: dict, manifest: dict, manifest_hash: str, settings: d
         raise ValueError(f"Judgment does not match the frozen manifest: {pair_id}")
     if any(key not in row or row[key] != value for key, value in settings.items()):
         raise ValueError(f"Judgment uses different Gemini settings: {pair_id}")
+    if row.get("video_resolution") != settings.get("video_resolution"):
+        raise ValueError(f"Judgment uses a different video resolution: {pair_id}")
     if (row.get("model_A"), row.get("model_B")) != (pair["model_A"], pair["model_B"]):
         raise ValueError(f"Judgment has different A/B identities: {pair_id}")
     if row.get("prompt_id") != pair["prompt_id"]:

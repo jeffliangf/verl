@@ -32,10 +32,23 @@ DEFAULT_PROJECT = "utopai-labs"
 DEFAULT_LOCATION = "global"
 BACKEND = "vertex"
 API = "generateContent"
+# Gemini per-part media resolution for judge videos; ULTRA_HIGH is rejected for video parts (HTTP 400).
+VIDEO_RESOLUTIONS = ("low", "medium", "high")
 
 
 def uses_vertex(model):
     return model in VERTEX_MODELS
+
+
+def check_video_resolution(model, resolution, setting="video resolution"):
+    """Per-part video resolution is only sent by the direct Vertex transport (None keeps the model default)."""
+    if resolution is None:
+        return None
+    if resolution not in VIDEO_RESOLUTIONS:
+        raise ValueError(f"{setting} must be one of: {', '.join(VIDEO_RESOLUTIONS)}")
+    if not uses_vertex(model):
+        raise ValueError(f"{setting} needs a direct Vertex judge, not {model}")
+    return resolution
 
 
 def vertex_settings():
@@ -298,15 +311,26 @@ def validate_backend(row, model):
 
 
 @contextmanager
-def vertex_runner(runner, model):
-    """Use the evaluator's Vertex factory hook without requiring a Gemini key."""
+def vertex_runner(runner, model, video_resolution=None):
+    """Use the evaluator's Vertex factory hook without requiring a Gemini key.
+
+    With video_resolution, every video part is sent at that Gemini media resolution (the reference image keeps the
+    model default) and every row records it. A ledger written at another resolution is never resumed.
+    """
+    check_video_resolution(model, video_resolution)
     if not uses_vertex(model):
         yield
         return
     if not hasattr(runner, "VertexRestClient"):
         raise RuntimeError("Vertex routing requires an evaluator with the Vertex client hook")
     names = ("GeminiRestClient", "VertexRestClient", "parse_args", "append_jsonl", "load_completed_keys")
+    if video_resolution is not None:
+        if not callable(getattr(runner, "media_part", None)):
+            raise RuntimeError("Video resolution requires an evaluator with a module-level media_part")
+        # build_interaction_request resolves media_part at call time, including the I2V rebuild in reference_images.
+        names += ("media_part",)
     saved = {name: getattr(runner, name) for name in names}
+    resolution = {"video_resolution": video_resolution} if video_resolution is not None else {}
     clients = []
     base = client_type(runner, model)
 
@@ -329,8 +353,14 @@ def vertex_runner(runner, model):
 
     def append_jsonl(path, row):
         if uses_vertex(row.get("judge_model")):
-            row = {**row, **transport_identity(model)}
+            row = {**row, **transport_identity(model), **resolution}
         return saved["append_jsonl"](path, row)
+
+    def media_part(kind, handle):
+        part = saved["media_part"](kind, handle)
+        if kind == "video":
+            part["resolution"] = video_resolution
+        return part
 
     def load_completed_keys(path):
         if Path(path).exists():
@@ -341,11 +371,15 @@ def vertex_runner(runner, model):
                     continue
                 if isinstance(row, dict) and row.get("status") == "completed" and uses_vertex(row.get("judge_model")):
                     validate_backend(row, model)
+                    if row.get("video_resolution") != video_resolution:
+                        raise ValueError(f"{model} judgment used a different video resolution; use a new ledger")
         return saved["load_completed_keys"](path)
 
     runner.GeminiRestClient = ManagedClient
     runner.VertexRestClient = vertex_client
     runner.parse_args, runner.append_jsonl, runner.load_completed_keys = parse_args, append_jsonl, load_completed_keys
+    if video_resolution is not None:
+        runner.media_part = media_part
     try:
         yield
     finally:
