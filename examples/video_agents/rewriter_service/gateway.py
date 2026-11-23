@@ -12,12 +12,15 @@
 
 Context-IR protocol (what bestofn's adapters.py speaks; only the host and API key change):
   POST /v2/h3_context_ir  {"content": [{"type": "text", "text": PROMPT}], "seed": 42}   -> {"task_id": ...}
+       Image to video: add one first-frame item, as bestofn's I2V lanes send it:
+       {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}, "role": "first_frame"}
   GET  /v2/query/video_generation/{task_id}
        -> {"task": {"status": "queued|running|succeeded|failed", "content": {"prompt": REWRITE}, "error": ...}}
   "model", "duration" and "ratio" are accepted and ignored. Optional extras: "seed" (sampling seed; pass the lane's
   render seed so the four lanes differ and a rerun reproduces), "max_tokens", "attempts".
 Blocking convenience call:
   POST /v1/rewrite  {"prompt": PROMPT, "n": 4, "seed": 42}  -> {"rewrites": [one per lane, seeds 42..45]}
+       with an optional "image": DATA_URL for image to video.
 Also GET /health (no auth) and GET /v1/stats.
 
 Each task samples the policy's exact training input (policy.py) with the training sampling settings. An output
@@ -27,8 +30,15 @@ valid rewrite whose text (whitespace and case folded) was already returned for t
 base seed is resampled too (at most twice), so lanes of one job never receive the same text. Submitting the same
 (prompt, seed, max_tokens, attempts) again returns the existing task instead of sampling again.
 
+Image to video (image_input.py): s300 was trained on text to video only, so it gets exactly its text-to-video input
+with the first frame placed at the start of the user turn, answers with the same sol_h3 call, and the gateway returns
+that call's prompt behind the Sol-H3 first-frame line (image_input.FL2VA_START). Text-to-video requests are unchanged.
+The image is part of the task's identity: reuse and the cross-seed duplicate check are per (prompt, image).
+
 Generations go to the least-loaded healthy vLLM backend, at most SLOTS per backend at a time; the rest wait in
-arrival order. Backend transport errors and 5xx are retried on another backend.
+arrival order. Backend transport errors and 5xx are retried on another backend. Text-to-video work goes to
+REWRITER_BACKENDS and image-to-video work to REWRITER_I2V_BACKENDS (default: the same servers). serve.sh runs a
+separate image-enabled server for I2V so that text to video keeps the exact text-only engine it always had.
 """
 
 import asyncio
@@ -44,6 +54,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+import image_input
 import policy
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -52,6 +63,9 @@ from fastapi.responses import JSONResponse
 os.umask(0o022)
 ENV = os.environ
 BACKENDS = [u.rstrip("/") for u in ENV["REWRITER_BACKENDS"].split(",") if u.strip()]
+I2V_BACKENDS = [
+    u.rstrip("/") for u in ENV.get("REWRITER_I2V_BACKENDS", ENV["REWRITER_BACKENDS"]).split(",") if u.strip()
+]
 TOKEN = Path(ENV["REWRITER_TOKEN_FILE"]).read_text().strip()
 LOG_DIR = Path(ENV.get("REWRITER_LOG_DIR", str(policy.HERE / "logs")))
 MODEL_NAME = ENV.get("REWRITER_MODEL_NAME", "rewriter-s300")
@@ -127,9 +141,15 @@ class Pool:
 
 
 class Task:
-    def __init__(self, prompt, seed, seed_given, max_tokens, attempts, client):
+    def __init__(self, prompt, seed, seed_given, max_tokens, attempts, client, image=None):
         self.id = secrets.token_hex(12)
         self.prompt, self.prompt_sha = prompt, sha256(prompt)
+        # image: None for text to video, else {"sha256", "observation" (PIL), "url" (PNG data URL of the
+        # observation), "source_size"}; the pixels are dropped once the task finishes.
+        self.kind = "t2v" if image is None else "i2v"
+        self.image = image
+        self.image_sha = image["sha256"] if image else None
+        self.image_meta = None
         self.seed, self.seed_given = seed, seed_given
         self.max_tokens, self.attempts_allowed = max_tokens, attempts
         self.client = client
@@ -158,6 +178,8 @@ class Task:
             "duplicate_resamples": sum(1 for a in self.attempts if a.get("duplicate_of_seed") is not None),
             "model": MODEL_NAME,
             "checkpoint": CHECKPOINT,
+            "task": self.kind,
+            **({"image_sha256": self.image_sha, "image": self.image_meta} if self.kind == "i2v" else {}),
         }
 
     def view(self):
@@ -175,14 +197,27 @@ class Task:
         return {"task": task, "base_resp": {"status_code": 0, "status_msg": "success"}}
 
 
-POOL = Pool(BACKENDS, SLOTS)
+POOL = Pool(BACKENDS, SLOTS)  # text to video
+I2V_POOL = POOL if I2V_BACKENDS == BACKENDS else Pool(I2V_BACKENDS, SLOTS)  # image to video
+POOLS = [POOL] if I2V_POOL is POOL else [POOL, I2V_POOL]
 TASKS = {}  # task_id -> Task
-BY_KEY = {}  # (prompt_sha, seed, max_tokens, attempts) -> task_id, for tasks with a caller-given seed
-SEEN = {}  # prompt_sha -> {text_key: (base_seed, time)}
+BY_KEY = {}  # task_key(...) -> task_id, for tasks with a caller-given seed
+SEEN = {}  # dedupe_key(...) -> {text_key: (base_seed, time)}
 RECENT = collections.deque(maxlen=2000)
 STATS = collections.Counter()
 STARTED = time.time()
 CLIENT = None
+
+
+def task_key(prompt_sha, image_sha, seed, max_tokens, attempts):
+    """Text-to-video keys keep their original form, so restored tasks keep matching."""
+    if image_sha is None:
+        return (prompt_sha, seed, max_tokens, attempts)
+    return ("i2v", prompt_sha, image_sha, seed, max_tokens, attempts)
+
+
+def dedupe_key(prompt_sha, image_sha):
+    return prompt_sha if image_sha is None else f"i2v:{prompt_sha}:{image_sha}"
 
 
 def log_task(task, attempt_texts):
@@ -194,6 +229,8 @@ def log_task(task, attempt_texts):
         "started_at": task.started_at,
         "finished_at": task.finished_at,
         "client": task.client,
+        "task": task.kind,
+        "image_sha256": task.image_sha,
         "prompt": task.prompt,
         "prompt_sha256": task.prompt_sha,
         "rewrite": task.rewrite,
@@ -207,41 +244,65 @@ def log_task(task, attempt_texts):
 
 
 async def generate(ids, seed, max_tokens, task):
-    body = {
-        "model": MODEL_NAME,
-        "prompt": ids,
-        "max_tokens": max_tokens,
-        "seed": seed,
-        "skip_special_tokens": False,
-        "spaces_between_special_tokens": False,
-        **policy.SAMPLING,
-    }
+    if task.kind == "i2v":
+        # vLLM's tokens-in endpoint takes our ids (image placeholder already expanded) plus the image itself.
+        path = "/inference/v1/generate"
+        body = {
+            "model": MODEL_NAME,
+            "token_ids": ids,
+            "content_parts": [{"type": "image_url", "url": task.image["url"]}],
+            "sampling_params": {
+                "max_tokens": max_tokens,
+                "seed": seed,
+                "skip_special_tokens": False,
+                "spaces_between_special_tokens": False,
+                **policy.SAMPLING,
+            },
+        }
+    else:
+        path = "/v1/completions"
+        body = {
+            "model": MODEL_NAME,
+            "prompt": ids,
+            "max_tokens": max_tokens,
+            "seed": seed,
+            "skip_special_tokens": False,
+            "spaces_between_special_tokens": False,
+            **policy.SAMPLING,
+        }
+    pool = I2V_POOL if task.kind == "i2v" else POOL
     last = None
     for net_try in range(6):
-        url = await POOL.acquire()
+        url = await pool.acquire()
         if task.started_at is None:
             task.started_at, task.status = time.time(), "running"
         t0 = time.time()
         try:
-            r = await CLIENT.post(url + "/v1/completions", json=body)
+            r = await CLIENT.post(url + path, json=body)
             if r.status_code >= 500:
                 raise httpx.HTTPStatusError(f"HTTP {r.status_code}", request=r.request, response=r)
             if r.status_code != 200:
                 raise BackendRejected(f"HTTP {r.status_code}: {r.text[:300]}")
             resp = r.json()
             choice = resp["choices"][0]
-            return choice["text"], {
+            if task.kind == "i2v":
+                out_ids = choice.get("token_ids") or []
+                text = await asyncio.to_thread(policy.tokenizer().decode, out_ids, skip_special_tokens=False)
+                tokens = (resp.get("usage") or {}).get("completion_tokens") or len(out_ids)
+            else:
+                text, tokens = choice["text"], (resp.get("usage") or {}).get("completion_tokens")
+            return text, {
                 "finish_reason": choice.get("finish_reason"),
-                "completion_tokens": (resp.get("usage") or {}).get("completion_tokens"),
+                "completion_tokens": tokens,
                 "elapsed_s": round(time.time() - t0, 2),
                 "backend": url,
             }
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
             last = exc
             STATS["backend_errors"] += 1
-            await POOL.set_health(url, False)  # the health monitor re-enables it once /health answers
+            await pool.set_health(url, False)  # the health monitor re-enables it once /health answers
         finally:
-            await POOL.release(url)
+            await pool.release(url)
         await asyncio.sleep(min(60, 5 * 2**net_try))
     raise RuntimeError(f"no backend finished the generation: {last!r}")
 
@@ -249,7 +310,16 @@ async def generate(ids, seed, max_tokens, task):
 async def run_task(task):
     texts = []
     try:
-        ids = await asyncio.to_thread(policy.prompt_ids, task.prompt)
+        if task.kind == "i2v":
+            ids, image_tokens = await asyncio.to_thread(image_input.prompt_ids, task.prompt, task.image["observation"])
+            task.image_meta = {
+                "source_size": list(task.image["source_size"]),
+                "observation_size": list(task.image["observation"].size),
+                "image_tokens": image_tokens,
+                "prompt_tokens": len(ids),
+            }
+        else:
+            ids = await asyncio.to_thread(policy.prompt_ids, task.prompt)
         max_tokens = min(task.max_tokens, MAX_MODEL_LEN - len(ids))
         if max_tokens < 1024:
             raise BackendRejected(f"prompt too long ({len(ids)} tokens)")
@@ -277,7 +347,7 @@ async def run_task(task):
                 }
                 break
             key, now = text_key(request["prompt"]), time.time()
-            seen = SEEN.setdefault(task.prompt_sha, {})
+            seen = SEEN.setdefault(dedupe_key(task.prompt_sha, task.image_sha), {})
             prior = seen.get(key)
             if prior is not None and prior[0] != task.seed:
                 task.attempts[-1]["duplicate_of_seed"] = prior[0]
@@ -293,16 +363,22 @@ async def run_task(task):
     except Exception as exc:  # noqa: BLE001 - every failure becomes a failed task the caller can see
         code = "rewriter_rejected" if isinstance(exc, BackendRejected) else "rewriter_unavailable"
         task.error = {"code": code, "message": str(exc)[:500]}
+    if task.kind == "i2v":
+        task.image = None  # free the pixels; the sha256 stays
+        if task.rewrite is not None:
+            task.rewrite, added = image_input.render_ready(task.rewrite)
+            task.image_meta["first_frame_line_added"] = added
     task.status = "succeeded" if task.rewrite is not None else "failed"
     task.finished_at = time.time()
     STATS[task.status] += 1
+    STATS[f"{task.kind}_{task.status}"] += 1
     RECENT.append(task.summary() | {"status": task.status})
     try:
         log_task(task, texts)
     except Exception as exc:  # noqa: BLE001
         print(f"log write failed for {task.id}: {exc!r}", flush=True)
     print(
-        f"[{time.strftime('%H:%M:%S')}] {task.id} {task.status} seed={task.seed} "
+        f"[{time.strftime('%H:%M:%S')}] {task.id} {task.kind} {task.status} seed={task.seed} "
         f"attempts={len(task.attempts)} tokens={task.summary()['total_completion_tokens']} "
         f"elapsed={task.summary()['elapsed_s']}s",
         flush=True,
@@ -310,8 +386,9 @@ async def run_task(task):
     task.done.set()
 
 
-def submit(prompt, seed, max_tokens, attempts, client):
-    """Create (or reuse) a task; returns (task, None) or (None, error response)."""
+def submit(prompt, seed, max_tokens, attempts, client, image=None):
+    """Create (or reuse) a task; returns (task, None) or (None, error response). `image` is image_input.prepare's
+    result as a dict, or None for text to video."""
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MAX_PROMPT_CHARS:
         return None, err(400, f"prompt must be 1-{MAX_PROMPT_CHARS} characters", 2013)
     seed_given = seed is not None
@@ -323,8 +400,9 @@ def submit(prompt, seed, max_tokens, attempts, client):
     attempts = DEFAULT_ATTEMPTS if attempts is None else attempts
     if not isinstance(attempts, int) or not 1 <= attempts <= 5:
         return None, err(400, "attempts must be in [1, 5]", 2013)
+    image_sha = image["sha256"] if image else None
     if seed_given:
-        existing = TASKS.get(BY_KEY.get((sha256(prompt), seed, max_tokens, attempts)))
+        existing = TASKS.get(BY_KEY.get(task_key(sha256(prompt), image_sha, seed, max_tokens, attempts)))
         if existing and not (existing.status == "failed" and existing.error["code"] == "rewriter_unavailable"):
             STATS["reused"] += 1
             return existing, None
@@ -333,14 +411,25 @@ def submit(prompt, seed, max_tokens, attempts, client):
         STATS["rejected_queue_full"] += 1
         return None, err(429, "rewriter queue is full, retry later", 1002)
     task = Task(
-        prompt, seed if seed_given else secrets.randbelow(MAX_SEED + 1), seed_given, max_tokens, attempts, client
+        prompt, seed if seed_given else secrets.randbelow(MAX_SEED + 1), seed_given, max_tokens, attempts, client, image
     )
     TASKS[task.id] = task
     if seed_given:
-        BY_KEY[(task.prompt_sha, seed, max_tokens, attempts)] = task.id
+        BY_KEY[task_key(task.prompt_sha, image_sha, seed, max_tokens, attempts)] = task.id
     STATS["submitted"] += 1
+    STATS[f"{task.kind}_submitted"] += 1
     asyncio.get_running_loop().create_task(run_task(task))
     return task, None
+
+
+async def prepare_image(url):
+    """(image dict, None) or (None, 400 response)."""
+    try:
+        sha, obs, png_url, source_size = await asyncio.to_thread(image_input.prepare, url)
+    except image_input.ImageRejected as exc:
+        STATS["rejected_image"] += 1
+        return None, err(400, str(exc), 2013)
+    return {"sha256": sha, "observation": obs, "url": png_url, "source_size": source_size}, None
 
 
 def authorized(request):
@@ -350,12 +439,13 @@ def authorized(request):
 
 async def health_monitor():
     while True:
-        for url in BACKENDS:
-            try:
-                ok = (await CLIENT.get(url + "/health", timeout=5)).status_code == 200
-            except httpx.HTTPError:
-                ok = False
-            await POOL.set_health(url, ok)
+        for pool in POOLS:
+            for url in pool.urls:
+                try:
+                    ok = (await CLIENT.get(url + "/health", timeout=5)).status_code == 200
+                except httpx.HTTPError:
+                    ok = False
+                await pool.set_health(url, ok)
         await asyncio.sleep(5)
 
 
@@ -388,6 +478,8 @@ def restore_tasks():
                 continue
             s = rec["summary"]
             task = Task(rec["prompt"], s["seed"], s["seed_given"], s["max_tokens"], 0, rec.get("client"))
+            if rec.get("task", "t2v") == "i2v":
+                task.kind, task.image_sha, task.image_meta = "i2v", rec["image_sha256"], s.get("image")
             task.id, task.status, task.rewrite, task.error = rec["task_id"], rec["status"], rec["rewrite"], rec["error"]
             task.submitted_at, task.started_at, task.finished_at = (
                 rec["submitted_at"],
@@ -400,27 +492,36 @@ def restore_tasks():
             task.done.set()
             TASKS[task.id] = task
             if task.seed_given and task.status == "succeeded":
-                BY_KEY[(task.prompt_sha, task.seed, task.max_tokens, task.attempts_allowed)] = task.id
+                BY_KEY[task_key(task.prompt_sha, task.image_sha, task.seed, task.max_tokens, task.attempts_allowed)] = (
+                    task.id
+                )
             if task.rewrite is not None:
-                SEEN.setdefault(task.prompt_sha, {}).setdefault(text_key(task.rewrite), (task.seed, task.finished_at))
+                # The duplicate check compares the policy's own prompt text (without the first-frame line).
+                text = task.rewrite
+                if task.kind == "i2v" and text.startswith(image_input.FL2VA_START):
+                    text = text[len(image_input.FL2VA_START) :]
+                SEEN.setdefault(dedupe_key(task.prompt_sha, task.image_sha), {}).setdefault(
+                    text_key(text), (task.seed, task.finished_at)
+                )
             STATS["restored"] += 1
 
 
 @asynccontextmanager
 async def lifespan(app):
     global CLIENT
+    n_urls = sum(len(pool.urls) for pool in POOLS)
     CLIENT = httpx.AsyncClient(
         timeout=httpx.Timeout(3600, connect=10),
-        limits=httpx.Limits(
-            max_connections=len(BACKENDS) * SLOTS + 32, max_keepalive_connections=len(BACKENDS) * SLOTS + 32
-        ),
+        limits=httpx.Limits(max_connections=n_urls * SLOTS + 32, max_keepalive_connections=n_urls * SLOTS + 32),
     )
     await asyncio.to_thread(policy.tokenizer)
+    await asyncio.to_thread(image_input.processor)
     restore_tasks()
     loop = asyncio.get_running_loop()
     background = [loop.create_task(health_monitor()), loop.create_task(janitor())]
     print(
-        f"gateway up: backends={BACKENDS} slots/backend={SLOTS} max_tokens={DEFAULT_MAX_TOKENS} "
+        f"gateway up (t2v + i2v): backends={BACKENDS} i2v_backends={I2V_BACKENDS} slots/backend={SLOTS} "
+        f"max_tokens={DEFAULT_MAX_TOKENS} "
         f"max_model_len={MAX_MODEL_LEN} restored={STATS['restored']}",
         flush=True,
     )
@@ -437,7 +538,15 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 async def health():
     healthy = sum(POOL.healthy.values())
     return JSONResponse(
-        {"ok": healthy > 0, "backends_healthy": healthy, "backends": len(BACKENDS)}, status_code=200 if healthy else 503
+        {
+            "ok": healthy > 0,
+            "backends_healthy": healthy,
+            "backends": len(BACKENDS),
+            "tasks": ["t2v", "i2v"],
+            "i2v_backends_healthy": sum(I2V_POOL.healthy.values()),
+            "i2v_backends": len(I2V_BACKENDS),
+        },
+        status_code=200 if healthy else 503,
     )
 
 
@@ -450,15 +559,38 @@ async def context_ir_submit(request: Request):
     except Exception:  # noqa: BLE001
         return err(400, "body must be JSON", 2013)
     content = body.get("content") if isinstance(body, dict) else None
-    texts = [c.get("text") for c in content or [] if isinstance(c, dict) and c.get("type") == "text"]
-    if not isinstance(content, list) or len(texts) != 1 or len(content) != 1:
-        return err(400, "content must be exactly one text item (text-to-video only)", 2013)
+    items = [c for c in content or [] if isinstance(c, dict)]
+    texts = [c.get("text") for c in items if c.get("type") == "text"]
+    images = [c for c in items if c.get("type") == "image_url"]
+    if (
+        not isinstance(content, list)
+        or len(items) != len(content)
+        or len(texts) != 1
+        or len(texts) + len(images) != len(content)
+        or len(images) > 1
+    ):
+        return err(
+            400,
+            "content must be one text item, optionally with one first-frame image_url item (text or image to video)",
+            2013,
+        )
+    image = None
+    if images:
+        item = images[0]
+        if item.get("role", "first_frame") != "first_frame":
+            return err(400, "only a first_frame image is supported", 2013)
+        url = item.get("image_url")
+        url = url.get("url") if isinstance(url, dict) else url
+        image, error = await prepare_image(url)
+        if error:
+            return error
     task, error = submit(
         texts[0],
         body.get("seed"),
         body.get("max_tokens"),
         body.get("attempts"),
         request.client.host if request.client else None,
+        image,
     )
     if error:
         return error
@@ -478,7 +610,8 @@ async def context_ir_query(task_id: str, request: Request):
 @app.post("/v1/rewrite")
 async def rewrite(request: Request):
     """Blocking: {"prompt", "n" (1-8, default 1), "seed" (lane k samples with seed + k; default random),
-    "max_tokens", "attempts"} -> one entry per lane once all lanes finish."""
+    "max_tokens", "attempts", "image" (optional data URL: image to video)} -> one entry per lane once all lanes
+    finish."""
     if not authorized(request):
         return err(401, "invalid api key", 1004)
     try:
@@ -492,6 +625,11 @@ async def rewrite(request: Request):
         return err(400, "n must be in [1, 8]", 2013)
     if seed is not None and (not isinstance(seed, int) or not 0 <= seed <= MAX_SEED - 8):
         return err(400, f"seed must be an integer in [0, {MAX_SEED - 8}]", 2013)
+    image = None
+    if body.get("image") is not None:
+        image, error = await prepare_image(body["image"])
+        if error:
+            return error
     tasks = []
     for lane in range(n):
         task, error = submit(
@@ -500,6 +638,7 @@ async def rewrite(request: Request):
             body.get("max_tokens"),
             body.get("attempts"),
             request.client.host if request.client else None,
+            image,
         )
         if error:
             return error
@@ -534,10 +673,17 @@ async def stats(request: Request):
         "busy": POOL.busy,
         "healthy": POOL.healthy,
         "slots_per_backend": SLOTS,
+        **(
+            {"i2v_waiting_for_slot": I2V_POOL.waiting, "i2v_busy": I2V_POOL.busy, "i2v_healthy": I2V_POOL.healthy}
+            if I2V_POOL is not POOL
+            else {}
+        ),
         "config": {
             "model": MODEL_NAME,
             "checkpoint": CHECKPOINT,
             "max_tokens": DEFAULT_MAX_TOKENS,
+            "tasks": ["t2v", "i2v"],
+            "i2v_observation_max_pixels": image_input.OBSERVATION_MAX_PIXELS,
             "max_model_len": MAX_MODEL_LEN,
             "attempts": DEFAULT_ATTEMPTS,
             "sampling": policy.SAMPLING,

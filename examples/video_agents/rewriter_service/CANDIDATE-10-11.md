@@ -2,7 +2,7 @@
 
 > **Repository copy.** The service runs from `/home/jeff/rl-benchmarks/rl-rewriter-s300-service` on the cluster; relative paths below refer to that directory. The public endpoint address is redacted as `<login-node-ip>`, and `secrets/` (API token) and `logs/` (task records) are not in the repository.
 
-As of 2026-11-13. Owner: `jeff` on utopai-m1. Shared copy: https://claude.ai/artifact/DCSXC44FodYaRoMrrPoKju. This file
+As of 2026-11-13; image to video added 2026-11-23. Owner: `jeff` on utopai-m1. Shared copy: https://claude.ai/artifact/DCSXC44FodYaRoMrrPoKju. This file
 is the canonical version; every path below is on utopai-m1 and readable by the `utopai` group.
 
 Candidate-10 and candidate-11 are candidate-8 with one change: the RL step-300 Qwen rewriter replaces H3 Context-IR.
@@ -71,8 +71,15 @@ AA request: raw prompt, seed s (42)
   - `rewriter_no_valid_call`: 3 samples without a valid call.
   - `rewriter_unavailable`: the backends are down.
   - `rewriter_rejected`: the prompt is too long.
-  - HTTP errors: 401 is a bad token, 400 is a bad body (text-to-video only), and 429 means the queue holds more than
-    5,000 tasks.
+  - HTTP errors: 401 is a bad token, 400 is a bad body, and 429 means the queue holds more than 5,000 tasks.
+- **Image to video (since 2026-11-23).** I2V lanes need no change. `h3_selfhost._context_ir_task` already sends the
+  first frame as `{"type": "image_url", "image_url": {"url": <data URL>}, "role": "first_frame"}`, and the service
+  now answers it instead of returning 400 (which bestofn turned into a raw-prompt lane).
+  - The model sees its text-to-video input plus the image and writes a text-to-video prompt. The service prefixes
+    that prompt with the Sol-H3 first-frame line (`For the target video, at 0.00 seconds into the target video,
+    <Picture 1> (from [Shot 1]) is fully referenced.`), so the text is ready for an fl2va render.
+  - s300 never saw images in training, so its I2V quality is unmeasured. Text-to-video output is unchanged: it runs
+    on the same text-only engine as before and was verified bit-identical. Details: README.md, "Image to video".
 - **What it does with a prompt.**
   - It wraps the prompt in the exact RL training input: the RL system prompt, the `sol_h3` tool schema,
     "Generate a video of about 10 seconds of: {prompt}", and thinking at `xhigh`.
@@ -194,7 +201,7 @@ The load test used real AA prompts through the Context-IR protocol: 428 tasks, w
 
 | What | Where / how |
 |---|---|
-| Serving job | Slurm job 1151 on gmicloud-loki-gpu-005: one vLLM server (TP 4, 4 of the node's 8 GPUs) plus the gateway. Started 2026-11-19 01:45Z, **no time limit**. It replaced job 965 (gmicloud-loki-gpu-004, 2 servers, 7-day limit). |
+| Serving job | Slurm job 1347 on gmicloud-loki-gpu-005: the gateway plus two vLLM servers on the same 4 of the node's 8 GPUs, a text-only one for text to video and an image one for image to video. Started 2026-11-23 19:29Z, **no time limit**. It replaced job 1151 (same node, text to video only), which had replaced job 965 (gmicloud-loki-gpu-004). |
 | Public relay | `relay.sh` on utopai-m1 (socat), outside Slurm; it stops if utopai-m1 reboots. |
 | Health, load | `GET /health`; `GET /v1/stats` with the token. |
 | Logs | `/home/jeff/rl-benchmarks/rl-rewriter-s300-service/logs/`. `tasks-YYYYMMDD.jsonl` holds every task with the model's full output; also `gateway-*.log`, `vllm-*.log`, `serve-*.out`. |

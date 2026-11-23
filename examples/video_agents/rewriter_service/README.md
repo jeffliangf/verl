@@ -15,6 +15,10 @@ the host and the API key.
 In the offline comparison (`../rl-rewriter-vs-context-ir-candidate8-20261112/RESULTS.md`), this rewriter beat
 Context-IR 59.4% in both setups (Gemini 4 Argon, both orders, 1,000 AA prompts).
 
+**Since 2026-11-23 it also takes image-to-video requests** (one first frame), on the same endpoint and protocol. See
+"Image to video" below. Text-to-video requests are served exactly as before. Their engine is the same text-only vLLM
+server, and its outputs were checked to be bit-identical to the old server's.
+
 ## Endpoint
 
 - `http://<login-node-ip>:18400` (the login node utopai-m1). `relay.sh` forwards it to the gateway on the serving node.
@@ -37,8 +41,12 @@ text = cloud.context_ir(prompt, duration=10, ratio="16:9", timeout_s=450)
 ```
 
 - `POST /v2/h3_context_ir` with `{"content": [{"type": "text", "text": PROMPT}], "seed": LANE_SEED}` returns
-  `{"task_id"}`. `model`, `duration` and `ratio` are accepted and ignored. The content must be a single text item
-  (text-to-video only).
+  `{"task_id"}`. `model`, `duration` and `ratio` are accepted and ignored. The content is one text item, plus
+  optionally one first-frame image for image to video, exactly as bestofn's I2V lanes already send it
+  (`h3_selfhost._context_ir_task`):
+  `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}, "role": "first_frame"}`.
+  Only base64 `data:` URLs are accepted (PNG, JPEG or WebP, at most 20 MiB); remote URLs, other roles, a second image
+  and `video_url` items get HTTP 400.
 - `GET /v2/query/video_generation/{task_id}` returns `task.status`: `queued`, `running`, `succeeded` (with
   `task.content.prompt`) or `failed` (with `task.error.code`). `task.rewriter` reports the seed, attempts, tokens and
   timings.
@@ -53,7 +61,7 @@ text = cloud.context_ir(prompt, duration=10, ratio="16:9", timeout_s=450)
   for any exception from `context_ir`.
 
 **Blocking call.** `POST /v1/rewrite` with `{"prompt": PROMPT, "n": 4, "seed": 42}` returns four rewrites (sampling
-seeds 42–45) once all are done.
+seeds 42–45) once all are done. Add `"image": DATA_URL` for image to video.
 
 See `client_example.py` for a standard-library client. It runs four lanes in parallel through submit + poll.
 
@@ -73,6 +81,48 @@ See `client_example.py` for a standard-library client. It runs four lanes in par
    is retried (up to 6 times) once a backend is healthy again, on another backend when there are several.
 5. **Logging.** Every finished task is appended to `logs/tasks-YYYYMMDD.jsonl`, with all attempts including the
    thinking text. Finished tasks are reloaded after a gateway restart, so polls keep working.
+
+## Image to video (2026-11-23)
+
+- **Input.** s300 was trained on text to video only. An I2V request therefore gets exactly the text-to-video input
+  above: same system prompt, same `sol_h3` tool, same "Generate a video of about 10 seconds of: …" wording. The only
+  addition is the first frame at the start of the user turn.
+  - `image_input.prompt_ids` checks this on every request: the token ids minus the image block must equal the
+    text-to-video ids. Otherwise the task fails.
+  - The model sees the frame as the joint T2V/I2V RL runs show it to their policy: EXIF-upright, at most 768 × 768
+    pixels in 32-pixel tiles. A 1920 × 1080 frame becomes 1024 × 576, which is 576 image tokens.
+- **Output.** The model answers with the same text-to-video `sol_h3` call. The gateway returns its `prompt` behind the
+  Sol-H3 first-frame line, `For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1])
+  is fully referenced.` and a blank line. This is the line Context-IR's I2V expansions open with, and the one
+  bestofn's raw I2V fallback (`I2V_RAW_PREFIX`) adds.
+  - Task reuse and the duplicate check key on (prompt, image).
+  - `task.rewriter` adds `task: "i2v"`, `image_sha256` and the image sizes.
+- **Engines.** Two vLLM servers share the job's 4 GPUs (44% of memory each).
+  - **Text-only server (port 18201, image limit 0).** Serves all text to video. It is the old server's exact
+    configuration except for the memory share. An image-enabled vLLM compiles a different graph (embeddings in
+    instead of token ids), and that changes text-to-video log-probabilities at bf16 rounding level. That is why
+    text never goes to the image server.
+  - **Image server (port 18301, one image per prompt).** Serves image to video only. It starts once the text server
+    is healthy, so their memory profiling never overlaps. It has its own compile cache: vLLM 0.29's AOT cache key
+    ignores the image limit, and with a shared cache the image server loaded the text server's compiled forward and
+    crashed.
+  - KV capacity is about 1.2 M tokens per server, or ~29 concurrent requests at the full 40,960 tokens.
+- **Checks (2026-11-23).**
+  - **Text to video is unchanged**, measured with `tests/t2v_backend_equivalence.py` against the old server (job
+    1151, scored before it stopped). The test covers 19 logged rewrites teacher-forced (35,090 tokens) plus 8 greedy
+    continuations of 384 tokens. Every log-probability and every greedy token is identical.
+  - For comparison, a single image-enabled server (job 1340) differed from the old server by mean |Δ log-prob| 0.0086,
+    with the top-1 token differing at 0.57% of positions. Batching alone on one server gives 0.0018 and 0.13%
+    (`tests/t2v_batch_noise.py`).
+  - **Image to video works** (`tests/i2v_live_check.py`, results in `tests/i2v-live-check.json`).
+    - bestofn's own `context_ir` client with a first-frame item returned a rewrite in 40 s.
+    - 25 AA batch-2 I2V items × 4 lanes, all submitted at once: 100/100 valid on the first sample, 4 distinct
+      rewrites per item, and all of them carry the first-frame line.
+    - Median 63 s per task with 100 in flight (max 147 s); median 3,682 tokens; median rewrite 3,781 characters.
+    - 99/100 reasoning traces work from the image (e.g. "looking at the image, the egg is behind the glass, and the
+      water line is at about the middle of the egg").
+  - **Not measured:** I2V quality. s300 never saw an image in training, so it is a zero-shot first-frame rewriter;
+    no renders or judgments have been run.
 
 ## Measurements (2026-11-13, job 965, node 004 = 2 × TP4 H100)
 
@@ -156,14 +206,19 @@ At candidate-8's load, about 110 tokens/s per request:
 
 ## Operations
 
-- **Serving job.** `umask 022; sbatch -w <node> serve.sbatch` runs one vLLM server (TP 4) on localhost plus the
-  gateway on 0.0.0.0:18400. It takes half a node (4 GPUs, 64 CPUs, 320 GB) and shares the node with other jobs.
-  `serve.sh` gives each server its own TP-sized group of the job's Slurm GPUs.
+- **Serving job.** `umask 022; sbatch -w <node> serve.sbatch` runs the gateway on 0.0.0.0:18400 and two vLLM
+  servers (TP 4) on localhost: the text-only server on 18201 and the image server on 18301. It takes half a node
+  (4 GPUs, 64 CPUs, 320 GB) and shares the node with other jobs. `serve.sh` gives each group of servers its own
+  TP-sized group of the job's Slurm GPUs.
+  - `I2V_ENGINE=0` runs a single image-enabled server for both tasks instead (memory share 0.88). Use it only for
+    a checkpoint whose text-to-video numerics need not match a text-only server.
   - No time limit (`-t UNLIMITED`; partition `all` allows it). The job runs until it is cancelled or the node fails.
     vLLM servers that exit are restarted, and the gateway queues work until a backend is healthy.
-  - Startup takes about 3.5 min on a node that has not loaded the model before.
-  - Current job: **1151 on gmicloud-loki-gpu-005** (started 2026-11-19 01:45Z; the relay has pointed to it since
-    01:50Z).
+  - Startup: the text-only server is ready in about 2 min, the image server about 3 min after that.
+  - Current job: **1347 on gmicloud-loki-gpu-005** (started 2026-11-23 19:29Z; text to video plus image to video).
+  - Before that, job 1151 on the same node served text to video only (2026-11-19 01:45Z to 2026-11-23 19:11Z).
+    Its files are in `legacy-t2v-20261123/`. Jobs 1340 and 1346 (2026-11-23) were short-lived steps toward the
+    current layout.
   - Before that, job 965 ran 2 servers on all of gmicloud-loki-gpu-004 with a 7-day limit (2026-11-13 21:56Z to
     2026-11-19 01:50Z). `serve.sbatch` shows how to start that setup again.
 - **Relay.** On utopai-m1, run `./relay.sh start|stop|status`. If the job moves to another node, run
@@ -201,7 +256,19 @@ At candidate-8's load, about 110 tokens/s per request:
     text to the eval's.
 - **Tests.**
   - `tests/test_gateway_mock.py`: protocol, auth, retries, duplicates, idempotency, backend loss and restart,
-    against fake backends and through bestofn's own Context-IR client.
+    against fake backends and through bestofn's own Context-IR client. Since 2026-11-23 it also covers image to
+    video:
+    - bestofn's first-frame body;
+    - routing to the image backend;
+    - per-image task identity;
+    - rejected images;
+    - restart.
+
+    Run it as `TEST_TMP=$(mktemp -d) python tests/test_gateway_mock.py`; `I2V_SHARED=1` tests the single-server
+    layout.
+  - `tests/t2v_backend_equivalence.py`, `tests/t2v_batch_noise.py`: text-to-video numerics of a backend against a
+    stored baseline (`tests/t2v-equivalence-*.json`).
+  - `tests/i2v_live_check.py`: image to video through the live gateway.
   - `tests/loadtest.py`: latency under concurrency.
   - `tests/cap_test.py`: the eval's 135 capped attempts rerun with a 32k cap.
   - `tests/summarize.py`: writes `tests/summary.json`.
