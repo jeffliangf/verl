@@ -43,6 +43,9 @@ DEFAULT_CONCURRENCY = 8
 TERMINAL_FAILURES = {"failed", "cancelled", "expired", "rejected", "submit_unknown", "submitting"}
 RECOVERABLE_FAILURES = {"worker_restarted", "inference_failed", "storage_failure", "worker_lost"}
 RETRYABLE_HTTP = {408, 429, 500, 502, 503, 504, 507}
+# The gateway can report a job completed shortly before its video route serves it: job 1261's download got HTTP 404
+# two seconds after completion (2026-11-23), and the same download later matched the archived checksum.
+MISSING_ARTIFACT_RETRY_SECONDS = 5
 RECOVERY_DEFAULTS = {"h3_max_request_attempts": 3, "h3_max_generation_attempts": 2, "h3_max_inflight": 2}
 SETTINGS = {
     "model": "MiniMax-H3-Base-FL2VA",
@@ -401,6 +404,11 @@ def retryable(error):
     }
 
 
+def missing_artifact(stage, error):
+    """A completed job's video not found yet is a provider delay, not a broken artifact."""
+    return stage == "h3_download" and isinstance(error, urllib.error.HTTPError) and error.code == 404
+
+
 def retry_delay(error, attempt):
     """Honor either Retry-After format, with exponential backoff and jitter."""
     delay = 2 ** (attempt - 1) + random.uniform(0, 0.25)
@@ -596,13 +604,16 @@ class _Generation:
                         timing["response_job_id"] = response.get("id")
                 self.remaining()
             except Exception as error:
+                # Retried within this stage's attempt budget; if it persists, the failure stays a provider failure
+                # (the trainer replaces the group) instead of a fatal artifact error.
+                missing = missing_artifact(stage, error)
                 if isinstance(error, urllib.error.HTTPError) and error.code in {400, 401, 403, 409, 422}:
                     self.error_stage = "configuration"
                 elif isinstance(error, DownloadIntegrityError):
                     self.error_stage = "artifact"
                 elif not isinstance(error, OSError | http.client.HTTPException):
                     self.error_stage = "protocol"
-                elif not retryable(error):
+                elif not retryable(error) and not missing:
                     self.error_stage = "artifact" if stage == "h3_download" else "provider"
                 else:
                     self.error_stage = "provider"
@@ -611,7 +622,7 @@ class _Generation:
                     or self.state.get("idempotency_key")
                     or (isinstance(error, urllib.error.HTTPError) and error.code in {429, 503, 507})
                 )
-                if not safe or not retryable(error):
+                if not safe or not (retryable(error) or missing):
                     raise
                 if attempt >= self.limits["h3_max_request_attempts"]:
                     # Integrity errors retain their existing short retry budget;
@@ -626,6 +637,8 @@ class _Generation:
                     self.save(repair_operations=sorted(set(self.state.get("repair_operations", [])) | {stage}))
                     self.repair_remaining()
                 delay = retry_delay(error, min(attempt, 6))
+                if missing:
+                    delay = max(MISSING_ARTIFACT_RETRY_SECONDS, delay)
                 if repairing:
                     delay = max(5, delay) + random.uniform(0, 2)
                     if delay >= self.state["transport_repair_deadline_at"] - time.time():
