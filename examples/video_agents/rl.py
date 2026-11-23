@@ -47,7 +47,7 @@ from .storage import (
     run_lock,
     write_json,
 )
-from .tournament import GROUP_SIZE, load_protocol, runtime_protocol, validate_group_size
+from .tournament import GROUP_SIZE, evaluation_judge, load_protocol, runtime_protocol, validate_group_size
 
 CONFIG_DIR = Path(__file__).with_name("configs")
 DEFAULT_DATA_DIR = ROOT / "data/prompt_rewrite_rl"
@@ -472,7 +472,7 @@ def train(args) -> dict:
         "judgments_per_evaluation": 2
         * sum(len(sample_reference_fields(protocol, sample)) for sample in protocol["samples"]["val"]),
         "training_judge": protocol["judge"]["judge_model"],
-        "evaluation_judge": protocol.get("eval_judge", protocol["judge"])["judge_model"],
+        "evaluation_judge": evaluation_judge(protocol, config.video_rl)["judge_model"],
         "max_response_tokens": {
             "training": config.actor_rollout_ref.rollout.response_length,
             "evaluation": config.video_rl.get("eval_max_response_length")

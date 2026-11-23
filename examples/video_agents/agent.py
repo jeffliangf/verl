@@ -35,7 +35,14 @@ from .image_assets import image_bytes, upright_observation
 from .observability import ProviderError, failure_record, record_event, timed_stage
 from .storage import item_key, run_lock, write_json
 from .streaming_judge import StreamingJudge
-from .tournament import NO_CALL_REASON, generate_video, load_protocol, runtime_protocol, score_group
+from .tournament import (
+    NO_CALL_REASON,
+    evaluation_judge,
+    generate_video,
+    load_protocol,
+    runtime_protocol,
+    score_group,
+)
 
 # Decoded tokens kept with an invalid call, so the policy's actual output can be read.
 RESPONSE_TAIL_TOKENS = 512
@@ -530,7 +537,7 @@ class TournamentManager(AgentLoopManagerTQ):
         group_size = protocol["group_size"]
         self.reference_fields = reference_fields(protocol)
         self.reference_fields_by_task = protocol.get("reference_fields_by_task")
-        self.eval_judge_model = protocol.get("eval_judge", protocol["judge"])["judge_model"]
+        self.eval_judge_model = evaluation_judge(protocol, self.config.video_rl)["judge_model"]
         self.reference_notes = protocol.get("reference_notes", [])
         if self.rollout_config.n != group_size or self.rollout_config.val_kwargs.n != 1:
             raise ValueError(f"Use rollout.n={group_size} and rollout.val_kwargs.n=1")

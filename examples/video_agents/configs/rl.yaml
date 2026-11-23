@@ -24,6 +24,9 @@ video_rl:
   # --async-lookahead). invalid_call=lose: a rule-breaking call plays and loses every game (0).
   no_call: forfeit
   invalid_call: forfeit
+  # Held-out evaluation judge for this launch (null = the protocol's frozen eval_judge). Only the model
+  # changes, only direct Vertex judges are accepted, and the frozen protocol hash is kept.
+  eval_judge_model: null
 
   # Shared provider limits for rl.py and inspection_rl.py, in seconds.
   # Launch settings replace any limits recorded in a frozen protocol.

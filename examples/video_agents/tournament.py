@@ -73,6 +73,23 @@ def validate_group_size(value) -> int:
     return value
 
 
+def evaluation_judge(protocol: dict, settings) -> dict:
+    """Held-out judge: the frozen eval_judge, or video_rl.eval_judge_model for this launch.
+
+    Only the model changes (same instructions, thinking and video settings), and only direct Vertex judges are
+    accepted. The frozen protocol and its hash stay as prepared, so cached policy turns still resume.
+    """
+    frozen = protocol.get("eval_judge", protocol["judge"])
+    model = settings.get("eval_judge_model")
+    if model is None:
+        return frozen
+    from .gemini_transport import VERTEX_MODELS
+
+    if model not in VERTEX_MODELS:
+        raise ValueError(f"video_rl.eval_judge_model must be a direct Vertex judge: {', '.join(sorted(VERTEX_MODELS))}")
+    return {**frozen, "judge_model": model}
+
+
 def runtime_protocol(protocol: dict, settings) -> dict:
     """Attach the launch-time provider limits from video_rl; the frozen identity is kept."""
     from .h3_deadlines import phase_budgets
@@ -142,6 +159,7 @@ def runtime_protocol(protocol: dict, settings) -> dict:
     invalid_call = settings.get("invalid_call", "forfeit")
     if invalid_call not in INVALID_CALL_POLICIES:
         raise ValueError(f"video_rl.invalid_call must be one of: {', '.join(INVALID_CALL_POLICIES)}")
+    eval_judge = evaluation_judge(protocol, settings)
     secondary = settings.get("judge_secondary")
     if secondary is not None:
         secondary = dict(secondary)
@@ -176,6 +194,7 @@ def runtime_protocol(protocol: dict, settings) -> dict:
         "no_call": no_call,
         "invalid_call": invalid_call,
         **({"judge_secondary": secondary} if secondary is not None else {}),
+        **({"eval_judge": eval_judge} if settings.get("eval_judge_model") is not None else {}),
         "protocol_sha256": protocol.get("protocol_sha256", fingerprint(protocol)),
     }
 
