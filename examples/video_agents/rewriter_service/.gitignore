@@ -1,0 +1,8 @@
+# Deployment state: the API token, task logs and caches never belong in the repository.
+secrets/
+logs/
+__pycache__/
+# Test outputs and inputs (benchmark prompts, model outputs, AA images).
+tests/*.json
+tests/*.jsonl
+tests/data/
