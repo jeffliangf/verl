@@ -186,14 +186,26 @@ def runtime_protocol(protocol: dict, settings) -> dict:
     secondary = settings.get("judge_secondary")
     if secondary is not None:
         secondary = dict(secondary)
-        if set(secondary) != {"model", "primary_attempts", "attempts", "concurrency"}:
-            raise ValueError("video_rl.judge_secondary requires model, primary_attempts, attempts and concurrency")
+        counts = ("primary_attempts", "attempts", "concurrency")
+        if not {"model", *counts} <= set(secondary) <= {"model", *counts, "video_resolution"}:
+            raise ValueError(
+                "video_rl.judge_secondary requires model, primary_attempts, attempts and concurrency "
+                "(and accepts video_resolution)"
+            )
         if secondary["model"] not in judge.SECONDARY_JUDGE_MODELS:
             raise ValueError(f"Unsupported secondary judge: {secondary['model']}")
         if secondary["model"] == protocol["judge"]["judge_model"]:
             raise ValueError("The secondary judge must differ from the primary judge")
-        if any(type(secondary[name]) is not int or secondary[name] < 1 for name in secondary if name != "model"):
+        if any(type(secondary[name]) is not int or secondary[name] < 1 for name in counts):
             raise ValueError("video_rl.judge_secondary attempts and concurrency must be positive integers")
+        # Its own media resolution for video parts on the Gemini API; null keeps the protocol as before.
+        from .gemini_transport import check_video_resolution
+
+        resolution = secondary.pop("video_resolution", None)
+        if resolution is not None:
+            secondary["video_resolution"] = check_video_resolution(
+                secondary["model"], resolution, "video_rl.judge_secondary.video_resolution", gemini_api=True
+            )
         # Training only: it replaces neutral imputation in the streamed tournament.
         if policy != "neutral" or not streaming:
             raise ValueError("video_rl.judge_secondary requires judge_failure_policy=neutral and judge_streaming")

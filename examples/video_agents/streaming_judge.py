@@ -31,7 +31,7 @@ from . import judge
 from .config import judging_protocol
 from .dataset import verify_references
 from .gemini_files import UploadJournal
-from .gemini_transport import read_api_key, vertex_runner
+from .gemini_transport import api_video_resolution, read_api_key, vertex_runner
 from .image_assets import image_bytes
 from .judge_worker import gemini_address_family, instrument_client, parallel_pairs, parse_options, reference_images
 from .observability import ProviderError, record_event, timed_stage
@@ -534,6 +534,7 @@ def main():
         and judge.secondary_settings(protocol) is not None
     )
     secondary_runner = load_external(runner_path, namespace="_video_agents_secondary_") if use_secondary else None
+    secondary = judge.secondary_settings(protocol) if use_secondary else None
     from .cleanup import readers
     from .provider_limits import provider_limits
     from .upload_admission import UploadAdmission
@@ -565,6 +566,10 @@ def main():
             reference_images(secondary_runner) if secondary_runner is not None else nullcontext(),
             # Delete the secondary judge's uploads as soon as its pass ends.
             parallel_pairs(secondary_runner, keep_uploaded_files=False)
+            if secondary_runner is not None
+            else nullcontext(),
+            # The secondary evaluator runs in-process, so judge_worker's --video-resolution never reaches it.
+            api_video_resolution(secondary_runner, secondary["judge_model"], secondary.get("video_resolution"))
             if secondary_runner is not None
             else nullcontext(),
         ):

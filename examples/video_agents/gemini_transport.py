@@ -34,21 +34,48 @@ BACKEND = "vertex"
 API = "generateContent"
 # Gemini per-part media resolution for judge videos; ULTRA_HIGH is rejected for video parts (HTTP 400).
 VIDEO_RESOLUTIONS = ("low", "medium", "high")
+# Gemini-API judges whose Interactions requests take a video part's "resolution" as is (gemini-3.8-flash, checked
+# 2026-11-24: 1,814 -> 5,774 video tokens per 10-s pair at "high", same latency). Only the training secondary judge
+# uses this path; direct Vertex judges get their resolution through vertex_runner.
+API_VIDEO_RESOLUTION_MODELS = frozenset({"gemini-3.8-flash"})
 
 
 def uses_vertex(model):
     return model in VERTEX_MODELS
 
 
-def check_video_resolution(model, resolution, setting="video resolution"):
-    """Per-part video resolution is only sent by the direct Vertex transport (None keeps the model default)."""
+def check_video_resolution(model, resolution, setting="video resolution", *, gemini_api=False):
+    """Validate a per-part video resolution (None keeps the model default).
+
+    Direct Vertex judges send it through their transport. With gemini_api, a checked Gemini-API model sends it as is.
+    """
     if resolution is None:
         return None
     if resolution not in VIDEO_RESOLUTIONS:
         raise ValueError(f"{setting} must be one of: {', '.join(VIDEO_RESOLUTIONS)}")
-    if not uses_vertex(model):
+    if gemini_api:
+        if model not in API_VIDEO_RESOLUTION_MODELS:
+            supported = ", ".join(sorted(API_VIDEO_RESOLUTION_MODELS))
+            raise ValueError(f"{setting} on the Gemini API is only supported for {supported}, not {model}")
+    elif not uses_vertex(model):
         raise ValueError(f"{setting} needs a direct Vertex judge, not {model}")
     return resolution
+
+
+def video_media_part(media_part, resolution):
+    """Wrap an evaluator's media_part so that every video part asks for this Gemini media resolution.
+
+    The reference image keeps the model default. build_interaction_request resolves media_part at call time, so a
+    module-level patch also covers the I2V rebuild in reference_images.
+    """
+
+    def patched(kind, handle):
+        part = media_part(kind, handle)
+        if kind == "video":
+            part["resolution"] = resolution
+        return part
+
+    return patched
 
 
 def vertex_settings():
@@ -356,12 +383,6 @@ def vertex_runner(runner, model, video_resolution=None):
             row = {**row, **transport_identity(model), **resolution}
         return saved["append_jsonl"](path, row)
 
-    def media_part(kind, handle):
-        part = saved["media_part"](kind, handle)
-        if kind == "video":
-            part["resolution"] = video_resolution
-        return part
-
     def load_completed_keys(path):
         if Path(path).exists():
             for line in Path(path).read_text().splitlines():
@@ -379,7 +400,7 @@ def vertex_runner(runner, model, video_resolution=None):
     runner.VertexRestClient = vertex_client
     runner.parse_args, runner.append_jsonl, runner.load_completed_keys = parse_args, append_jsonl, load_completed_keys
     if video_resolution is not None:
-        runner.media_part = media_part
+        runner.media_part = video_media_part(saved["media_part"], video_resolution)
     try:
         yield
     finally:
@@ -387,3 +408,48 @@ def vertex_runner(runner, model, video_resolution=None):
             setattr(runner, name, value)
         for client in clients:
             client.sdk.close()
+
+
+@contextmanager
+def api_video_resolution(runner, model, video_resolution):
+    """Send every video part of a Gemini-API evaluator at this media resolution; None changes nothing.
+
+    This is for the training secondary judge, whose evaluator instance runs in-process, so judge_worker's
+    --video-resolution never reaches it. The Interactions API takes the part's "resolution" as is. Every row of the
+    model records video_resolution, and a ledger whose completed rows used another resolution is never resumed.
+    """
+    check_video_resolution(model, video_resolution, gemini_api=True)
+    if video_resolution is None:
+        yield
+        return
+    if not callable(getattr(runner, "media_part", None)):
+        raise RuntimeError("Video resolution requires an evaluator with a module-level media_part")
+    saved = {name: getattr(runner, name) for name in ("media_part", "append_jsonl", "load_completed_keys")}
+
+    def append_jsonl(path, row):
+        if row.get("judge_model") == model:
+            row = {**row, "video_resolution": video_resolution}
+        return saved["append_jsonl"](path, row)
+
+    def load_completed_keys(path):
+        if Path(path).exists():
+            for line in Path(path).read_text().splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if (
+                    isinstance(row, dict)
+                    and row.get("status") == "completed"
+                    and row.get("video_resolution") != video_resolution
+                ):
+                    raise ValueError(f"{model} judgment used a different video resolution; use a new ledger")
+        return saved["load_completed_keys"](path)
+
+    runner.media_part = video_media_part(saved["media_part"], video_resolution)
+    runner.append_jsonl, runner.load_completed_keys = append_jsonl, load_completed_keys
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(runner, name, value)

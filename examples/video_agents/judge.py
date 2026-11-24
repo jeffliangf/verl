@@ -89,15 +89,21 @@ def freeze_manifests(run_dir: Path, manifests: dict[str, dict]):
 
 
 def secondary_settings(protocol: dict) -> dict | None:
-    """Judge settings of the training-only secondary judge: the primary's, with its model.
+    """Judge settings of the training-only secondary judge: the primary's, with its model and video resolution.
 
-    It runs on the Gemini API at the model's default media resolution; a primary video_resolution stays Vertex-only.
+    It runs on the Gemini API. The primary's video_resolution stays with the primary; judge_secondary.video_resolution
+    sets the secondary's own, and without it the secondary sees videos at the model's default media resolution.
     """
     secondary = protocol.get("judge_secondary")
     if not secondary:
         return None
     primary = {key: value for key, value in protocol["judge"].items() if key != "video_resolution"}
-    return {**primary, "judge_model": secondary["model"]}
+    resolution = secondary.get("video_resolution")
+    return {
+        **primary,
+        "judge_model": secondary["model"],
+        **({"video_resolution": resolution} if resolution is not None else {}),
+    }
 
 
 def command(
