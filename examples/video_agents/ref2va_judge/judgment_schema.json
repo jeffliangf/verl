@@ -1,0 +1,28 @@
+{
+ "type": "object",
+ "properties": {
+  "preferred_video": {
+   "type": "string",
+   "enum": [
+    "A",
+    "B"
+   ]
+  },
+  "reason": {
+   "type": "string"
+  },
+  "confidence": {
+   "type": "string",
+   "enum": [
+    "low",
+    "medium",
+    "high"
+   ]
+  }
+ },
+ "required": [
+  "preferred_video",
+  "reason",
+  "confidence"
+ ]
+}
