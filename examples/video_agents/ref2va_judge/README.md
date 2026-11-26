@@ -9,6 +9,7 @@ made with this judge are in `~/verl/data/pai_r2v_eval200_smd_h3_raw_vs_cir/besto
 | File | What it is |
 |---|---|
 | `instructions_r1.txt` | The rubric, byte-exact as validated (484 words). The sha256 of the text without its trailing newline is `57de1b0ad540d419a0b6e98b8cd08b70742a05e14038ea66652e5ed16181179b`. |
+| `instructions_r1_1.txt` | R1.1: R1 with an explicit edit role for video-editing requests, byte-exact as tested on 2026-11-26 (552 words); see section 5. The sha256 of the text without its trailing newline is `32ddace1fa0d2860326de54564061e38b8f96ec166e8640fbceee72a00b4d450`. |
 | `judgment_schema.json` | The response JSON schema: `preferred_video` (A/B), `reason`, `confidence` (low/medium/high). It has the same three keys as the T2V/I2V v4 judge, so the runner's `validate_judgment` needs no change. |
 | `golden_requests.json` | Three complete example requests (image-only, image+audio, image+video+audio). Text parts are verbatim, except the user prompt: it is given as its eval200 row id plus the sha256 of the full `Original generation prompt:` part, so user content is not published. Media parts give kind, mime, sha256 of the bytes sent, source file and media resolution. Use it as a golden test when wiring. |
 
@@ -156,3 +157,38 @@ Do these in order. All file references are under `examples/video_agents/`.
   only 57–64% in absolute terms.
 - When a storyboard contradicts a character sheet, the right answer is ambiguous for any judge.
 - Hydrogen and Argon have been swapped server-side before (11-14, 11-17). Keep a determinism canary in the run.
+
+## 5. R1.1: R1 with an explicit edit role (2026-11-26)
+
+`instructions_r1_1.txt` is R1 with two changes, both in its reference-fidelity paragraph. Every other byte is R1.
+- The role list `a video to continue or match` becomes `a video to continue, match or edit`.
+- The sentence "A reference video must be continued or matched as the prompt asks, keeping its scene, characters and
+  look." becomes: "A reference video must be continued, matched or edited as the prompt asks. Continuing or matching it
+  keeps its scene, characters and look. Editing it must make every requested change to its picture or sound, for the
+  whole clip unless the prompt names a moment, and keep everything else (people, objects, setting, action and timing,
+  framing, on-screen text and soundtrack) apart from what the change itself implies. An unchanged or partly changed
+  copy, or a different clip in its place, is not faithful to it."
+
+**Why.** Video editing is Ref2VA with the source clip as a video reference. Under R1, an unedited copy of the source is
+the most faithful use of that reference. R1.1 defines fidelity to a video to edit as the source plus exactly the
+requested change.
+
+**Request as tested.** The section-1 layout, with the edit instruction as the original request text and the source
+clip as the only reference, `[Video1]`. Two settings differ from section 1: the source clip was sent at media
+resolution HIGH, and every video, candidates included, was re-encoded to H.264 + AAC at most 1280 px.
+
+**Evidence** (gemini-4-hydrogen on Vertex, both orders). Data: a video-editing arena export with human votes (1,025
+pairs, 3,414 single votes, 11 models). Study: `~/rl-benchmarks/v2v-edit-judge-study-20261126/README.md`.
+- R1.1 agrees with 65.6% of single votes [63.7, 67.7], κ 0.29. On the 878 pairs with at least two votes, R1.1 agrees
+  65.3%, another voter 61.0% and the majority of the other voters 63.1%.
+- On the 266 pairs with a clear human majority (at least 4 votes, at least 75% one way), R1.1 sides with it 79.1% of
+  the time.
+- Paired with R1 on a 344-pair subset: +1.3 pp [−0.1, +2.7], not significant.
+- Null-edit control (the unedited source against the best human-voted edit, 62 prompts): R1.1 picks the edit 96.8%,
+  R1 94.4%.
+- Elo from R1.1 verdicts vs Elo from the votes: Spearman 0.95. R1.1 spreads the ratings 1.35× wider.
+- Order splits 12.1%; the first-shown video wins 53.4%.
+
+**Status.** R1 stays the Ref2VA rubric for now. Before R1.1 replaces it, re-run the section-2 tests (swap, decoys,
+order flips) with R1.1. The edit probes are not run yet either: partial edits (the change stops after 3 s) and
+mirrored edits (the change is made but the framing no longer matches the source).
